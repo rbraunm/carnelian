@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# The identity providers Carnelian is tested against. Prepare the files first
+# (testbed/prepare.py); the validation workflow starts these for one run, a development
+# host keeps them running.
+name: carnelian-testbed
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    command:
+      - start-dev
+      - --import-realm
+      - --https-port=8443
+      - --http-enabled=false
+      - --https-certificate-file=/certificates/server.crt
+      - --https-certificate-key-file=/certificates/server.key
+      - --hostname=https://${CARNELIAN_TESTBED_HOST:?run testbed/prepare.py}:8443
+    env_file: generated/keycloak.env
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+    volumes:
+      - ./generated/certificates:/certificates:ro
+      - ./generated/realm:/opt/keycloak/data/import:ro
+    ports:
+      - "8443:8443"

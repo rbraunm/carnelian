@@ -97,9 +97,8 @@ def readHeader(token: str) -> dict:
   return header
 
 
-def verifyCompact(token: str, key: RSAPublicKey | ECPublicKey, allowedAlgorithms: frozenset[str] = supportedAlgorithms) -> VerifiedJWS:
-  """Verify a compact JWS with a public key; returns its header and payload."""
-  header = readHeader(token)
+def acceptedAlgorithm(header: dict, allowedAlgorithms: frozenset[str] = supportedAlgorithms) -> str:
+  """The header's algorithm, if it is accepted; checked before any key is looked for."""
   algorithm = header.get("alg")
   if algorithm == "none" or (isinstance(algorithm, str) and algorithm.startswith("HS")):
     raise JOSEError(f"algorithm '{algorithm}' is refused")
@@ -107,6 +106,13 @@ def verifyCompact(token: str, key: RSAPublicKey | ECPublicKey, allowedAlgorithms
     raise JOSEError(f"algorithm '{algorithm}' is not one of {sorted(allowedAlgorithms & supportedAlgorithms)}")
   if "crit" in header:
     raise JOSEError(f"critical header extensions {header['crit']} are not understood")
+  return algorithm
+
+
+def verifyCompact(token: str, key: RSAPublicKey | ECPublicKey, allowedAlgorithms: frozenset[str] = supportedAlgorithms) -> VerifiedJWS:
+  """Verify a compact JWS with a public key; returns its header and payload."""
+  header = readHeader(token)
+  algorithm = acceptedAlgorithm(header, allowedAlgorithms)
   headerPart, payloadPart, signaturePart = token.split(".")
   signingInput = f"{headerPart}.{payloadPart}".encode("ascii")
   signature = base64urlDecode(signaturePart)
