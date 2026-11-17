@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carnelian"
+dynamic = ["version"]
+description = "Sign-in for Python on the standard library alone: OpenID Connect, SAML 2.0, LDAP and SCIM 2.0."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+# Test oracles only: they check Carnelian's answers and never run in an application.
+test = [
+  "pytest>=8",
+  "cryptography>=44",
+]
+
+[tool.setuptools.packages.find]
+include = ["carnelian*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "carnelian.version.softwareVersion"}
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test*.py"]
+python_functions = ["test*"]
