@@ -61,6 +61,19 @@ class Fetcher:
       raise HTTPFailure(f"{request.full_url} answered with JSON that is not an object")
     return document
 
+  def getBytes(self, url: str, accept: str) -> bytes:
+    """A document that is not JSON (SAML metadata), as bytes; any status but 200 is refused."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+      raise HTTPFailure(f"only https is fetched, not {url}")
+    try:
+      with self._opener.open(urllib.request.Request(url, headers={"Accept": accept}), timeout=self.timeoutSeconds) as response:
+        body = response.read(self.maximumBytes + 1)
+    except (urllib.error.URLError, OSError) as error:
+      raise HTTPFailure(f"{url}: {error}") from None
+    if len(body) > self.maximumBytes:
+      raise HTTPFailure(f"{url} answered with more than {self.maximumBytes} bytes")
+    return body
+
   def getJSON(self, url: str, headers: dict[str, str] | None = None) -> dict:
     return self._send(urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})}))
 

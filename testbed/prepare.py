@@ -33,6 +33,8 @@ generated = here / "generated"
 realmName = "carnelian"
 clientID = "carnelian-oidc"
 redirectURI = "http://127.0.0.1:53682/callback"
+samlConsumerURL = "https://sp.carnelian.test/acs"
+samlEntities = {"response": "https://sp.carnelian.test/signs-response", "assertion": "https://sp.carnelian.test/signs-assertion"}
 keycloakPort = 8443
 
 
@@ -90,7 +92,7 @@ def realm(secret: str, host: str) -> tuple[dict, list[dict]]:
     accounts.append({**user, "groups": memberOf, "password": password})
   document = {
     "realm": realmName, "enabled": True, "sslRequired": "all", "groups": groups, "users": users,
-    "clients": [{
+    "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()] + [{
       "clientId": clientID, "enabled": True, "protocol": "openid-connect", "publicClient": False,
       "secret": derived(secret, "client:oidc"), "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
       "redirectUris": [redirectURI], "attributes": {"pkce.code.challenge.method": "S256"},
@@ -102,6 +104,28 @@ def realm(secret: str, host: str) -> tuple[dict, list[dict]]:
     }],
   }
   return document, accounts
+
+
+def samlClient(entityID: str, signs: str) -> dict:
+  """A SAML client that signs its responses, or only its assertions; never encrypts or wants signed requests."""
+  def mapper(name, kind, config):
+    return {"name": name, "protocol": "saml", "protocolMapper": kind, "config": config}
+  return {
+    "clientId": entityID, "enabled": True, "protocol": "saml", "redirectUris": [samlConsumerURL],
+    "attributes": {
+      "saml.server.signature": "true" if signs == "response" else "false",
+      "saml.assertion.signature": "true" if signs == "assertion" else "false",
+      "saml.client.signature": "false", "saml.encrypt": "false", "saml.authnstatement": "true",
+      "saml.signature.algorithm": "RSA_SHA256", "saml_signature_canonicalization_method": "http://www.w3.org/2001/10/xml-exc-c14n#",
+      "saml_name_id_format": "username", "saml.force.name.id.format": "true",
+      "saml_assertion_consumer_url_post": samlConsumerURL,
+    },
+    "protocolMappers": [
+      mapper("groups", "saml-group-membership-mapper", {"full.path": "true", "attribute.name": "groups", "single": "true"}),
+      mapper("email", "saml-user-property-mapper", {"user.attribute": "email", "attribute.name": "email"}),
+      mapper("givenName", "saml-user-property-mapper", {"user.attribute": "firstName", "attribute.name": "givenName"}),
+    ],
+  }
 
 
 def prepare(host: str, secret: str) -> None:
@@ -116,6 +140,8 @@ def prepare(host: str, secret: str) -> None:
     "certificateAuthority": str((generated / "certificates" / "ca.crt").resolve()),
     "openIDConnect": {"issuer": issuer, "clientID": clientID, "clientSecret": derived(secret, "client:oidc"),
                       "redirectURI": redirectURI},
+    "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
+             "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
     "accounts": accounts,
   }, indent=2, ensure_ascii=False), encoding="utf-8")
   print(f"prepared the testbed for {host} in {generated}")
