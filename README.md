@@ -7,7 +7,10 @@ Sign-in for Python applications on the standard library alone:
 - **SAML 2.0** service provider (requests, responses, XML signatures with exclusive
   canonicalization, protection against signature wrapping);
 - **LDAP** client for Active Directory and other directories (bind and search over TLS);
-- **SCIM 2.0** service provider (users, groups, filters, PATCH, deactivation).
+- **SCIM 2.0** service provider (users with the enterprise extension, groups, the full
+  filter grammar, PATCH, paging, attribute selection, discovery), behind the application's
+  own store and web server; checked against the RFC examples and Microsoft Entra ID's
+  documented requests.
 
 No third-party packages, so nothing but its own MIT licence governs where it can be used.
 Its cryptography only *verifies* signatures with public keys -- it never signs or decrypts
