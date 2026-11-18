@@ -24,6 +24,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -40,6 +41,8 @@ samlConsumerURL = "https://sp.carnelian.test/acs"
 samlEntities = {"response": "https://sp.carnelian.test/signs-response", "assertion": "https://sp.carnelian.test/signs-assertion"}
 keycloakPort = 8443
 mdqPort = 8444
+casPort = 8445
+casServiceURL = "https://sp.carnelian.test/cas"
 federationScope = "carnelian.test"
 federationAuthority = "https://federation.carnelian.test"
 directoryRealm = "CARNELIAN.TEST"
@@ -211,6 +214,44 @@ def federationEntity(issuer: str, realmCertificate: str, federationKey: tuple[st
   return etree.tostring(signed, xml_declaration=True, encoding="UTF-8")
 
 
+def casFiles(secret: str, host: str, accounts: list[dict]) -> None:
+  """Apereo CAS: its TLS keystore, its properties, the one service it serves, and the users with their attributes."""
+  from cryptography import x509
+  from cryptography.hazmat.primitives import serialization
+  from cryptography.hazmat.primitives.serialization import pkcs12
+
+  folder = generated / "cas"
+  (folder / "services").mkdir(parents=True, exist_ok=True)
+  certificates = generated / "certificates"
+  key = serialization.load_pem_private_key((certificates / "server.key").read_bytes(), password=None)
+  certificate = x509.load_pem_x509_certificate((certificates / "server.crt").read_bytes())
+  storePassword = derived(secret, "cas:keystore")
+  (folder / "keystore.p12").write_bytes(pkcs12.serialize_key_and_certificates(
+    b"cas", key, certificate, None, serialization.BestAvailableEncryption(storePassword.encode("ascii"))))
+  os.chmod(folder / "keystore.p12", 0o644)
+  users = ",".join(f"{account['userName']}::{account['password']}" for account in accounts if account["enabled"])
+  # Java may read a .properties file as Latin-1; \uXXXX escapes mean the same under either reading.
+  (folder / "cas.properties").write_text("\n".join([
+    f"server.port={casPort}", "server.ssl.enabled=true", "server.ssl.key-store=file:/etc/cas/keystore.p12",
+    f"server.ssl.key-store-password={storePassword}", f"server.ssl.key-password={storePassword}", "server.ssl.key-store-type=PKCS12", "server.ssl.key-alias=cas",
+    f"cas.server.name=https://{host}:{casPort}", "cas.server.prefix=${cas.server.name}/cas",
+    "cas.authn.accept.enabled=true", f"cas.authn.accept.users={users}", "cas.authn.accept.name=Testbed",
+    "cas.service-registry.core.init-from-json=true", "cas.service-registry.json.location=file:/etc/cas/services",
+    "cas.authn.attribute-repository.json[0].location=file:/etc/cas/config/attributes.json",
+    "cas.authn.attribute-repository.json[0].id=testbed",
+  ]).encode("ascii", "backslashreplace").decode("ascii") + "\n", encoding="ascii")
+  (folder / "services" / "carnelian-1.json").write_text(json.dumps({
+    "@class": "org.apereo.cas.services.CasRegisteredService", "serviceId": f"^{re.escape(casServiceURL)}(\\?.*)?$",
+    "name": "carnelian", "id": 1, "evaluationOrder": 1,
+    "attributeReleasePolicy": {"@class": "org.apereo.cas.services.ReturnAllAttributeReleasePolicy"},
+  }, indent=2), encoding="utf-8")
+  (folder / "attributes.json").write_text(json.dumps({
+    account["userName"]: {"mail": [account["email"]], "displayName": [f"{account['firstName']} {account['lastName']}"],
+                          "memberOf": account["groups"]}
+    for account in accounts if account["enabled"]
+  }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def sambaSeed(secret: str, accounts: list[dict]) -> str:
   """samba-tool commands that load the dataset: nested groups, accounts, memberships, the service account."""
   dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
@@ -251,6 +292,7 @@ def prepare(host: str, secret: str) -> None:
   (generated / "mdq" / f"{hashlib.sha256(issuer.encode('utf-8')).hexdigest()}.xml").write_bytes(
     federationEntity(issuer, realmKey[1], federationKey))
   (generated / "certificates" / "federation.crt").write_text(federationKey[1], encoding="ascii")
+  casFiles(secret, host, accounts)
   (generated / "realm").mkdir(parents=True, exist_ok=True)
   (generated / "realm" / "carnelian.json").write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
   (generated / "samba").mkdir(parents=True, exist_ok=True)
@@ -266,6 +308,7 @@ def prepare(host: str, secret: str) -> None:
                       "redirectURI": redirectURI},
     "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
              "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
+    "cas": {"serverURL": f"https://{host}:{casPort}/cas", "serviceURL": casServiceURL},
     "federation": {"mdqURL": f"https://{host}:{mdqPort}", "institution": issuer, "scope": federationScope,
                    "registrationAuthority": federationAuthority,
                    "signingCertificate": str((generated / "certificates" / "federation.crt").resolve())},
@@ -324,6 +367,22 @@ def waitForFederation(host: str, timeoutSeconds: int) -> None:
     time.sleep(3)
 
 
+def waitForCAS(host: str, timeoutSeconds: int) -> None:
+  context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
+  address = f"https://{host}:{casPort}/cas/login"
+  deadline = time.monotonic() + timeoutSeconds
+  while True:
+    try:
+      with urllib.request.urlopen(address, context=context, timeout=5) as response:
+        if response.status == 200:
+          print(f"CAS serves {address}")
+          return
+    except OSError as error:
+      if time.monotonic() > deadline:
+        raise SystemExit(f"CAS did not answer at {address} within {timeoutSeconds} s: {error}")
+    time.sleep(5)
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--host", required=True)
@@ -334,6 +393,7 @@ def main() -> None:
   if arguments.wait:
     waitForKeycloak(arguments.host, arguments.timeout)
     waitForFederation(arguments.host, arguments.timeout)
+    waitForCAS(arguments.host, arguments.timeout)
     if arguments.directory:
       waitForDirectory(arguments.host, arguments.timeout)
     return

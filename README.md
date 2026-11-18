@@ -10,6 +10,8 @@ Sign-in for Python applications on the standard library alone:
   institutions' signed metadata by the Metadata Query protocol, their scopes, scoped
   identifiers (subject-id, pairwise-id, eduPersonPrincipalName), and the service provider's
   own metadata to register;
+- **CAS** client (Apereo CAS protocol 3.0), the sign-in many universities in France, Spain
+  and Latin America run;
 - **LDAP** client for Active Directory and other directories (bind and search over TLS);
 - **SCIM 2.0** service provider (users with the enterprise extension, groups, the full
   filter grammar, PATCH, paging, attribute selection, discovery), behind the application's

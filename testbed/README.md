@@ -10,6 +10,8 @@ and a development host can keep them running.
   Keycloak's metadata with its scope and names, signed by the testbed federation's key, as
   InCommon's MDQ serves its members'. Keycloak signs with a realm key `prepare.py` makes,
   and sends each user's scoped `subject-id`.
+- **Apereo CAS** 8 over HTTPS on port 8445, with the dataset's users and their attributes
+  (mail, displayName, memberOf) released to the one service it serves.
 - **Samba Active Directory** (the compose profile `directory`) on 389 (StartTLS) and 636
   (LDAPS). It needs a privileged container, so it runs on Docker in a VM or on a CI runner,
   not inside an unprivileged LXC container.

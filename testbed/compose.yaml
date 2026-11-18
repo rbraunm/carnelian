@@ -35,6 +35,19 @@ services:
     ports:
       - "8444:8444"
 
+  # Apereo CAS, the sign-in many universities in France, Spain and Latin America run.
+  cas:
+    image: apereo/cas:8.0.2
+    environment:
+      JVM_MEM_OPTS: "-Xms256m -Xmx1024m"
+    volumes:
+      - ./generated/cas/cas.properties:/etc/cas/config/cas.properties:ro
+      - ./generated/cas/attributes.json:/etc/cas/config/attributes.json:ro
+      - ./generated/cas/services:/etc/cas/services:ro
+      - ./generated/cas/keystore.p12:/etc/cas/keystore.p12:ro
+    ports:
+      - "8445:8445"
+
   # An Active Directory domain controller. It needs a host whose kernel lets it set
   # security extended attributes (a VM or the workflow's runner, not an unprivileged
   # container), so it is a profile of its own: --profile directory.
