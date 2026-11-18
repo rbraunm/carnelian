@@ -200,7 +200,7 @@ def federationEntity(issuer: str, realmCertificate: str, federationKey: tuple[st
     '<md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:Extensions>'
     f'<shibmd:Scope regexp="false">{federationScope}</shibmd:Scope><mdui:UIInfo>'
     '<mdui:DisplayName xml:lang="en">Carnelian Testbed University</mdui:DisplayName>'
-    '<mdui:DisplayName xml:lang="ar">\\u062c\\u0627\\u0645\\u0639\\u0629 \\u0643\\u0627\\u0631\\u0646\\u064a\\u0644\\u064a\\u0627\\u0646</mdui:DisplayName>'
+    '<mdui:DisplayName xml:lang="ar">\u062c\u0627\u0645\u0639\u0629 \u0643\u0627\u0631\u0646\u064a\u0644\u064a\u0627\u0646</mdui:DisplayName>'
     '</mdui:UIInfo></md:Extensions><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data>'
     f'<ds:X509Certificate>{body}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>'
     '<md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" '
