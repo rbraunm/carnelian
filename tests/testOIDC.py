@@ -116,6 +116,21 @@ def testTheSignInAddressCarriesPKCEAndTheNonce():
 
 # ---- against the testbed's Keycloak ----------------------------------------
 
+def testAnUnknownKeyCannotMakeEverySignInFetchTheKeysAgain():
+  ticks = [now]
+  provider = Provider(issuer=issuer, authorizationEndpoint=f"{issuer}/auth", tokenEndpoint=f"{issuer}/token",
+                      jwksURI=f"{issuer}/keys", userinfoEndpoint=None, signingAlgorithms=frozenset({"RS256"}))
+  relyingParty = RelyingParty(provider, "app", "secret", "https://app.example.org/callback", StandInNetwork(),
+                              clock=lambda: ticks[0])
+  for _ in range(5):
+    with pytest.raises(SignInRefused, match="kid 'k9'"):
+      relyingParty.checkIDToken(idToken(good, {"alg": "RS256", "kid": "k9"}), "n-1")
+  assert relyingParty.fetcher.fetched == 1
+  ticks[0] = now + 60
+  with pytest.raises(SignInRefused, match="kid 'k9'"):
+    relyingParty.checkIDToken(idToken(good | {"exp": now + 400}, {"alg": "RS256", "kid": "k9"}), "n-1")
+  assert relyingParty.fetcher.fetched == 2
+
 class StandInProvider(StandInNetwork):
   """A provider's discovery document and token endpoint, served without a network."""
 

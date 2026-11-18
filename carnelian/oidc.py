@@ -27,6 +27,8 @@ from carnelian.jose import JOSEError, KeySet, acceptedAlgorithm, readHeader, sup
 
 __all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty"]
 
+minimumKeyRefreshSeconds = 60
+
 
 class SignInRefused(ValueError):
   """A sign-in that did not complete, with why."""
@@ -125,6 +127,7 @@ class RelyingParty:
     self.pendingSeconds = pendingSeconds
     self.clock = clock
     self._keys: KeySet | None = None
+    self._keysFetchedAt = float("-inf")
 
   def beginSignIn(self) -> tuple[str, Pending]:
     pending = Pending(state=secrets.token_urlsafe(32), nonce=secrets.token_urlsafe(32),
@@ -170,8 +173,10 @@ class RelyingParty:
     )
 
   def _keySet(self, refresh: bool) -> KeySet:
-    if self._keys is None or refresh:
+    # A token naming an unknown key must not make every sign-in fetch the provider's keys again.
+    if self._keys is None or (refresh and self.clock() - self._keysFetchedAt >= minimumKeyRefreshSeconds):
       self._keys = KeySet(self.fetcher.getJSON(self.provider.jwksURI))
+      self._keysFetchedAt = self.clock()
     return self._keys
 
   def checkIDToken(self, idToken: str, nonce: str) -> JSON:

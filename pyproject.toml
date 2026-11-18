@@ -37,6 +37,7 @@ test = [
   "cryptography>=44",
   "lxml>=5",
   "signxml>=4",
+  "hypothesis>=6.170",
   "mypy>=2.4",
 ]
 

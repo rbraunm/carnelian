@@ -28,6 +28,7 @@ import urllib.parse
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from carnelian.der import publicKeyFromCertificate
 from carnelian.signatures import ECPublicKey, RSAPublicKey
@@ -35,7 +36,7 @@ from carnelian.xmldsig import SignatureRefused, dsig, verifyEnveloped
 from carnelian.xmlTree import Element, XMLRefused, parse
 
 __all__ = ["SAMLRefused", "IdentityProvider", "identityProviderFromMetadata", "Pending", "SAMLIdentity",
-           "ReplayCache", "ServiceProvider"]
+           "ReplayStore", "ReplayCache", "ServiceProvider"]
 
 assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
 protocolNamespace = "urn:oasis:names:tc:SAML:2.0:protocol"
@@ -111,6 +112,14 @@ class SAMLIdentity:
   attributes: dict[str, tuple[str, ...]] = field(repr=False)
 
 
+class ReplayStore(Protocol):
+  """Where assertion IDs are remembered. Behind several processes, one shared store (a database table with
+  the ID as its unique key, say) so an assertion used on one process is refused on all."""
+
+  def admit(self, assertionID: str, until: float, now: float) -> None:
+    """Remember the ID until `until`; raise SAMLRefused if it is already remembered."""
+
+
 class ReplayCache:
   """Assertion IDs seen, kept until their assertion could no longer be accepted anyway."""
 
@@ -138,7 +147,7 @@ def _time(text: str | None, what: str) -> float:
 
 class ServiceProvider:
   def __init__(self, entityID: str, assertionConsumerURL: str, identityProvider: IdentityProvider,
-               leewaySeconds: int = 60, pendingSeconds: int = 600, replayCache: ReplayCache | None = None,
+               leewaySeconds: int = 60, pendingSeconds: int = 600, replayCache: ReplayStore | None = None,
                clock: Callable[[], float] = time.time) -> None:
     self.entityID = entityID
     self.assertionConsumerURL = assertionConsumerURL
