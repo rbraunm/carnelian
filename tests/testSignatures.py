@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.x509.oid import NameOID
 
-from carnelian.der import DERError, publicKeyFromCertificate, publicKeyFromInfo, readElement
+from carnelian.der import DERError, publicKeyFromCertificate, publicKeyFromInfo, readAll, readElement, readOne
 from carnelian.signatures import ECPublicKey, RSAPublicKey, SignatureError
 
 message = b"the plot values of trial 42"
@@ -109,6 +109,83 @@ def testKeysAreReadFromCertificatesAndKeyInfo(private):
     assert found == expected
   info = private.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
   assert publicKeyFromInfo(info) == publicKeyFromCertificate(made.public_bytes(serialization.Encoding.DER))
+
+
+def tlv(tag, content):
+  length = len(content)
+  encoded = bytes([length]) if length < 0x80 else bytes([0x80 | 2]) + length.to_bytes(2, "big")
+  return bytes([tag]) + encoded + content
+
+
+rsaPublic = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key()
+rsaInfo = rsaPublic.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+rsaKeyBits = readAll(readOne(rsaInfo).content)[1]
+rsaOID = tlv(0x06, bytes.fromhex("2a864886f70d010101"))
+ecOID = tlv(0x06, bytes.fromhex("2a8648ce3d0201"))
+
+
+def infoWith(algorithmParts):
+  return tlv(0x30, tlv(0x30, b"".join(algorithmParts)) + tlv(rsaKeyBits.tag, rsaKeyBits.content))
+
+
+def testAnRSAKeyIsReadWithNullOrAbsentParameters():
+  expected = rsaPublic.public_numbers()
+  for parts in ([rsaOID, tlv(0x05, b"")], [rsaOID]):
+    key = publicKeyFromInfo(infoWith(parts))
+    assert (key.modulus, key.exponent) == (expected.n, expected.e)
+
+
+@pytest.mark.parametrize("parts, message", [
+  ([], "at most one parameter, not 0 parts"),
+  ([rsaOID, tlv(0x05, b""), tlv(0x05, b"")], "at most one parameter, not 3 parts"),
+  ([rsaOID, tlv(0x02, b"\x00")], "parameters are NULL or absent"),
+  ([rsaOID, tlv(0x05, b"\x00")], "parameters are NULL or absent"),
+  ([ecOID], "names its curve"),
+  ([tlv(0x06, b"\x2a" + b"\x81" * 2200 + b"\x01")], "longer than 128 bits"),
+])
+def testAnAlgorithmIdentifierOfTheWrongShapeIsADERError(parts, message):
+  with pytest.raises(DERError, match=message):
+    publicKeyFromInfo(infoWith(parts))
+
+
+@pytest.mark.parametrize("text", [
+  "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----",
+  "-----BEGIN CERTIFICATE-----\nMIIB\u00e9\n-----END CERTIFICATE-----",
+  "-----BEGIN CERTIFICATE-----\nMIIBa\n-----END CERTIFICATE-----",
+])
+def testPEMThatIsNotBase64IsADERError(text):
+  with pytest.raises(DERError, match="is not base64"):
+    publicKeyFromCertificate(text)
+
+
+def oddNumberOfBits(bits):
+  return (1 << (bits - 1)) | 1
+
+
+@pytest.mark.parametrize("modulus, exponent, message", [
+  (-oddNumberOfBits(2048), 65537, "positive odd number"),
+  (oddNumberOfBits(2048) + 1, 65537, "positive odd number"),
+  (oddNumberOfBits(16385), 65537, "an RSA key of 16385 bits is refused; 2048 to 16384"),
+  (oddNumberOfBits(2048), 65536, "exponent 65536 is not"),
+  (oddNumberOfBits(2048), 1, "exponent 1 is not"),
+  (oddNumberOfBits(2048), 2**256 + 1, r"is not an odd number from 3 to below 2\*\*256"),
+  (oddNumberOfBits(2048), oddNumberOfBits(2048) + 2, r"is not an odd number from 3 to below 2\*\*256"),
+], ids=["negative", "even", "tooLarge", "evenExponent", "exponentOne", "exponentTooLarge", "exponentAboveModulus"])
+def testRSAKeyNumbersOutOfBoundsAreRefused(modulus, exponent, message):
+  with pytest.raises(SignatureError, match=message):
+    RSAPublicKey(modulus, exponent)
+
+
+def testTheLargestKeyAndExponentAreAccepted():
+  key = RSAPublicKey(oddNumberOfBits(16384), 2**256 - 1)
+  assert (key.length, key.exponent) == (2048, 2**256 - 1)
+
+
+@pytest.mark.parametrize("saltLength", [-1, -1000, 256 - 32 - 1, 10**6])
+def testAPSSSaltLengthThatCannotFitIsRefusedByName(saltLength):
+  _, public = rsaKey(2048)
+  with pytest.raises(SignatureError, match=f"salt of {saltLength} bytes does not fit"):
+    public.verifyPSS(message, b"\x01" * 256, "sha256", saltLength)
 
 
 @pytest.mark.parametrize("data, message", [

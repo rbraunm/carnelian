@@ -105,10 +105,78 @@ def testKeysAreChosenStrictly():
     keyFromJWK(jwkOf(rsaKey, "a") | {"d": "AQAB"})
 
 
+smallKey = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+
+
 @pytest.mark.parametrize("jwk, message", [
   ({"kty": "EC", "crv": "P-256", "x": 5, "y": "AAAA"}, "has no 'x'"),
   ({"kty": "RSA", "n": ["AQAB"], "e": "AQAB"}, "has no 'n'"),
+  ({"kty": ["RSA"], "n": "AQAB", "e": "AQAB"}, "has no 'kty' as text"),
+  ({"kty": 1, "n": "AQAB", "e": "AQAB"}, "has no 'kty' as text"),
+  ({"kty": "EC", "crv": ["P-256"], "x": "AA", "y": "AA"}, "has no 'crv' as text"),
+  (jwkOf(smallKey, "s"), "key is refused: an RSA key of 1024 bits"),
+  (jwkOf(ecKeys["ES256"], "e") | {"y": base64urlEncode(b"\x01" * 32)}, "key is refused: the EC public point is not on P-256"),
 ])
 def testAJWKMemberOfTheWrongKindIsRefusedByName(jwk, message):
   with pytest.raises(JOSEError, match=message):
     keyFromJWK(jwk)
+
+
+@pytest.mark.parametrize("header, message", [
+  ({"alg": ["RS256"], "kid": "r"}, r"'alg' is not a name: \['RS256'\]"),
+  ({"alg": 256, "kid": "r"}, "'alg' is not a name: 256"),
+])
+def testAnAlgorithmOfTheWrongKindIsRefusedByName(header, message):
+  token = f"{base64urlEncode(json.dumps(header).encode())}.{base64urlEncode(b'{}')}.{base64urlEncode(b'x' * 256)}"
+  with pytest.raises(JOSEError, match=message):
+    verifyCompact(token, keyFromJWK(jwkOf(rsaKey, "r")))
+
+
+@pytest.mark.parametrize("header, message", [
+  ({"kid": ["r"], "alg": "RS256"}, r"'kid' is not text: \['r'\]"),
+  ({"kid": 7, "alg": "RS256"}, "'kid' is not text: 7"),
+  ({"alg": "RS256"}, r"names no key \('kid'\)"),
+])
+def testAKeyIDOfTheWrongKindIsRefusedByName(header, message):
+  with pytest.raises(JOSEError, match=message):
+    KeySet({"keys": [jwkOf(rsaKey, "r")]}).keyFor(header)
+
+
+@pytest.mark.parametrize("members, chosen", [
+  ({"key_ops": ["verify"]}, True), ({"key_ops": ["sign", "verify"]}, True), ({"key_ops": ["encrypt"]}, False),
+  ({"key_ops": []}, False), ({"use": "sig"}, True), ({"use": "enc"}, False),
+])
+def testOnlyAKeyForVerifyingIsChosen(members, chosen):
+  keys = KeySet({"keys": [jwkOf(rsaKey, "r") | members]})
+  if chosen:
+    assert keys.keyFor({"kid": "r", "alg": "RS256"}) == keyFromJWK(jwkOf(rsaKey, "r"))
+  else:
+    with pytest.raises(JOSEError, match="has 0 signing keys with kid 'r'"):
+      keys.keyFor({"kid": "r", "alg": "RS256"})
+
+
+@pytest.mark.parametrize("members, message", [
+  ({"key_ops": "verify"}, "'key_ops' is not a list of names"),
+  ({"key_ops": [1]}, "'key_ops' is not a list of names"),
+  ({"use": ["sig"]}, "'use' is not text"),
+])
+def testKeyUsesOfTheWrongKindAreRefusedByName(members, message):
+  with pytest.raises(JOSEError, match=message):
+    KeySet({"keys": [jwkOf(rsaKey, "r") | members]}).keyFor({"kid": "r", "alg": "RS256"})
+
+
+def testANonASCIIPayloadSegmentIsRefusedByName():
+  header, _, signature = signed({"alg": "RS256", "kid": "r"}, {}, rsaKey).split(".")
+  with pytest.raises(JOSEError, match="not unpadded base64url"):
+    verifyCompact(f"{header}.e30\u00e9.{signature}", keyFromJWK(jwkOf(rsaKey, "r")))
+
+
+@pytest.mark.parametrize("headerText, message", [
+  ('{"alg": "RS256", "x": NaN}', "NaN is not a JSON number"),
+  ('{"alg": "RS256", "x": 1e999}', "too large for a number"),
+  ('{"alg": "RS256", "x": ' + "[" * 50_000 + "]" * 50_000 + "}", "nested too deeply"),
+])
+def testAHeaderThatIsNotStrictJSONIsRefusedByName(headerText, message):
+  token = f"{base64urlEncode(headerText.encode())}.{base64urlEncode(b'{}')}.{base64urlEncode(b'x' * 256)}"
+  with pytest.raises(JOSEError, match=message):
+    verifyCompact(token, keyFromJWK(jwkOf(rsaKey, "r")))

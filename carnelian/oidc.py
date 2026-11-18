@@ -5,9 +5,16 @@ Sign-in has two halves. `beginSignIn` gives the address to send the person to an
 Pending record the application keeps server-side; `finishSignIn` takes that record and the
 query the provider sent back, exchanges the code, and returns the Identity once the ID
 token passes every check of Core section 3.1.3.7: signature by a key from the provider's
-JWK set, issuer, audience and authorized party, an accepted algorithm, expiry and issue
-time (with a small leeway), and the nonce. The state is compared in constant time, a
-pending sign-in expires, and a provider error is raised with its own words.
+JWK set, issuer, audience and authorized party, an accepted algorithm, expiry, issue and
+not-before times (with a small leeway), and the nonce. A pending sign-in belongs to the
+provider and client that began it, and the issuer the provider names in its answer (RFC
+9207) must be that provider, so an answer meant for one provider is never taken to another
+(mix-up). The state is compared in constant time, a pending sign-in expires, and a
+provider error is raised with its own words.
+
+The provider's keys are kept for at most a day; a token whose key is not known, or whose
+signature does not verify with the known key (a key rotated under the same 'kid'), fetches
+them again, at most once a minute.
 """
 
 from __future__ import annotations
@@ -15,7 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
+import math
 import secrets
 import time
 import urllib.parse
@@ -23,11 +30,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from carnelian.fetching import JSON, JSONFetcher
-from carnelian.jose import JOSEError, KeySet, acceptedAlgorithm, readHeader, supportedAlgorithms, verifyCompact
+from carnelian.jose import JOSEError, KeySet, acceptedAlgorithm, readHeader, readJSON, supportedAlgorithms, verifyCompact
 
 __all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty"]
 
 minimumKeyRefreshSeconds = 60
+maximumKeyAgeSeconds = 24 * 60 * 60
 
 
 class SignInRefused(ValueError):
@@ -42,6 +50,7 @@ class Provider:
   jwksURI: str
   userinfoEndpoint: str | None
   signingAlgorithms: frozenset[str]
+  issuerInResponseRequired: bool
 
 
 def _names(document: JSON, member: str) -> list[str]:
@@ -62,10 +71,31 @@ def _optionalHTTPSURL(document: JSON, member: str) -> str | None:
   return None if document.get(member) is None else _httpsURL(document, member)
 
 
+def _isHTTPSURL(value: object) -> bool:
+  if not isinstance(value, str):
+    return False
+  try:
+    parts = urllib.parse.urlsplit(value)
+  except ValueError:
+    return False
+  return parts.scheme == "https" and bool(parts.hostname)
+
+
 def _httpsURL(document: JSON, member: str) -> str:
   value = document.get(member)
-  if not isinstance(value, str) or not value.startswith("https://"):
+  if not isinstance(value, str) or not _isHTTPSURL(value):
     raise SignInRefused(f"the provider's '{member}' is not an https URL: {value!r}")
+  return value
+
+
+def _sameText(given: object, expected: str) -> bool:
+  return isinstance(given, str) and hmac.compare_digest(given.encode("utf-8", "surrogatepass"), expected.encode("utf-8"))
+
+
+def _numericDate(claims: JSON, member: str) -> float:
+  value = claims.get(member)
+  if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+    raise SignInRefused(f"the ID token's '{member}' is not a finite number: {value!r}")
   return value
 
 
@@ -83,10 +113,14 @@ def discover(issuer: str, fetcher: JSONFetcher) -> Provider:
   # Some providers (Entra ID among them) support PKCE without announcing it; the challenge is sent either way.
   if "code_challenge_methods_supported" in document and "S256" not in _names(document, "code_challenge_methods_supported"):
     raise SignInRefused("the provider does not offer PKCE with S256")
+  issuerInResponse = document.get("authorization_response_iss_parameter_supported", False)
+  if not isinstance(issuerInResponse, bool):
+    raise SignInRefused(f"the provider's 'authorization_response_iss_parameter_supported' is not true or false: {issuerInResponse!r}")
   return Provider(
     issuer=issuer, authorizationEndpoint=_httpsURL(document, "authorization_endpoint"),
     tokenEndpoint=_httpsURL(document, "token_endpoint"), jwksURI=_httpsURL(document, "jwks_uri"),
     userinfoEndpoint=_optionalHTTPSURL(document, "userinfo_endpoint"), signingAlgorithms=accepted,
+    issuerInResponseRequired=issuerInResponse,
   )
 
 
@@ -94,6 +128,8 @@ def discover(issuer: str, fetcher: JSONFetcher) -> Provider:
 class Pending:
   """What the application keeps, server-side, between sending the person away and their return."""
 
+  issuer: str
+  clientID: str
   state: str
   nonce: str
   codeVerifier: str
@@ -106,6 +142,7 @@ class Identity:
   subject: str
   userName: str | None
   email: str | None
+  emailVerified: bool
   displayName: str | None
   groups: tuple[str, ...]
   claims: JSON = field(repr=False)
@@ -117,6 +154,12 @@ class RelyingParty:
                pendingSeconds: int = 600, clock: Callable[[], float] = time.time) -> None:
     if "openid" not in scopes:
       raise SignInRefused("the scopes must include 'openid'")
+    endpoints = {"authorization": provider.authorizationEndpoint, "token": provider.tokenEndpoint, "JWK set": provider.jwksURI}
+    if provider.userinfoEndpoint is not None:
+      endpoints["userinfo"] = provider.userinfoEndpoint
+    for name, address in endpoints.items():
+      if not _isHTTPSURL(address):
+        raise SignInRefused(f"the provider's {name} endpoint is not an https URL: {address!r}")
     self.provider = provider
     self.clientID = clientID
     self._clientSecret = clientSecret
@@ -130,8 +173,8 @@ class RelyingParty:
     self._keysFetchedAt = float("-inf")
 
   def beginSignIn(self) -> tuple[str, Pending]:
-    pending = Pending(state=secrets.token_urlsafe(32), nonce=secrets.token_urlsafe(32),
-                      codeVerifier=secrets.token_urlsafe(64), startedAt=self.clock())
+    pending = Pending(issuer=self.provider.issuer, clientID=self.clientID, state=secrets.token_urlsafe(32),
+                      nonce=secrets.token_urlsafe(32), codeVerifier=secrets.token_urlsafe(64), startedAt=self.clock())
     challenge = base64.urlsafe_b64encode(hashlib.sha256(pending.codeVerifier.encode("ascii")).digest()).rstrip(b"=").decode()
     query = urllib.parse.urlencode({
       "response_type": "code", "client_id": self.clientID, "redirect_uri": self.redirectURI,
@@ -142,10 +185,18 @@ class RelyingParty:
     return f"{self.provider.authorizationEndpoint}{separator}{query}", pending
 
   def finishSignIn(self, pending: Pending, query: dict[str, str]) -> Identity:
+    if pending.issuer != self.provider.issuer or pending.clientID != self.clientID:
+      raise SignInRefused(f"the sign-in was begun with {pending.issuer!r} for client {pending.clientID!r}, "
+                          f"not with {self.provider.issuer!r} for {self.clientID!r}")
     if self.clock() - pending.startedAt > self.pendingSeconds:
       raise SignInRefused("the sign-in took too long; start again")
-    if not hmac.compare_digest(str(query.get("state", "")), pending.state):
+    if not _sameText(query.get("state"), pending.state):
       raise SignInRefused("the sign-in's state does not match")
+    if "iss" in query:
+      if not _sameText(query["iss"], self.provider.issuer):
+        raise SignInRefused(f"the answer comes from issuer {query['iss']!r}, not {self.provider.issuer!r}")
+    elif self.provider.issuerInResponseRequired:
+      raise SignInRefused("the provider announces that it names itself in its answer ('iss'), and this answer does not")
     if "error" in query:
       raise SignInRefused(f"the provider refused: {query.get('error_description') or query['error']}")
     code = query.get("code")
@@ -168,29 +219,35 @@ class RelyingParty:
     if not isinstance(groups, list) or not all(isinstance(group, str) for group in groups):
       raise SignInRefused("the ID token's groups are not a list of names")
     return Identity(
-      issuer=claims["iss"], subject=claims["sub"], userName=_optionalText(claims, "preferred_username"), email=_optionalText(claims, "email"),
+      issuer=claims["iss"], subject=claims["sub"], userName=_optionalText(claims, "preferred_username"),
+      email=_optionalText(claims, "email"), emailVerified=claims.get("email_verified") is True,
       displayName=_optionalText(claims, "name"), groups=tuple(groups), claims=claims,
     )
 
-  def _keySet(self, refresh: bool) -> KeySet:
-    # A token naming an unknown key must not make every sign-in fetch the provider's keys again.
-    if self._keys is None or (refresh and self.clock() - self._keysFetchedAt >= minimumKeyRefreshSeconds):
-      self._keys = KeySet(self.fetcher.getJSON(self.provider.jwksURI))
-      self._keysFetchedAt = self.clock()
-    return self._keys
+  def _fetchKeys(self) -> KeySet:
+    keys = KeySet(self.fetcher.getJSON(self.provider.jwksURI))
+    self._keys, self._keysFetchedAt = keys, self.clock()
+    return keys
+
+  def _verifiedPayload(self, idToken: str) -> bytes:
+    header = readHeader(idToken)
+    acceptedAlgorithm(header, self.provider.signingAlgorithms)
+    keys = self._keys
+    if keys is None or self.clock() - self._keysFetchedAt >= maximumKeyAgeSeconds:
+      keys = self._fetchKeys()
+    try:
+      return verifyCompact(idToken, keys.keyFor(header), self.provider.signingAlgorithms).payload
+    except JOSEError:
+      # Bounded so that tokens naming unknown keys cannot make every sign-in fetch the provider's keys.
+      if self.clock() - self._keysFetchedAt < minimumKeyRefreshSeconds:
+        raise
+    return verifyCompact(idToken, self._fetchKeys().keyFor(header), self.provider.signingAlgorithms).payload
 
   def checkIDToken(self, idToken: str, nonce: str) -> JSON:
     """The claims of an ID token that passes every check, or SignInRefused saying which failed."""
     try:
-      header = readHeader(idToken)
-      acceptedAlgorithm(header, self.provider.signingAlgorithms)
-      try:
-        key = self._keySet(refresh=False).keyFor(header)
-      except JOSEError:
-        key = self._keySet(refresh=True).keyFor(header)
-      payload = verifyCompact(idToken, key, self.provider.signingAlgorithms).payload
-      claims = json.loads(payload)
-    except (JOSEError, UnicodeDecodeError, json.JSONDecodeError) as error:
+      claims = readJSON(self._verifiedPayload(idToken), "the ID token's claims")
+    except JOSEError as error:
       raise SignInRefused(f"the ID token is refused: {error}") from None
     if not isinstance(claims, dict):
       raise SignInRefused("the ID token's claims are not an object")
@@ -199,18 +256,21 @@ class RelyingParty:
       raise SignInRefused(f"the ID token's issuer {claims.get('iss')!r} is not {self.provider.issuer!r}")
     audience = claims.get("aud")
     audiences = [audience] if isinstance(audience, str) else audience
-    if not isinstance(audiences, list) or self.clientID not in audiences:
+    if not isinstance(audiences, list) or not audiences or not all(isinstance(name, str) and name for name in audiences):
+      raise SignInRefused(f"the ID token's audience is not a name or a list of names: {audience!r}")
+    if self.clientID not in audiences:
       raise SignInRefused(f"the ID token is not for client {self.clientID!r}")
     if (len(audiences) > 1 or "azp" in claims) and claims.get("azp") != self.clientID:
       raise SignInRefused(f"the ID token's authorized party is {claims.get('azp')!r}, not {self.clientID!r}")
-    for member in ("exp", "iat"):
-      if not isinstance(claims.get(member), (int, float)) or isinstance(claims.get(member), bool):
-        raise SignInRefused(f"the ID token has no numeric '{member}'")
-    if claims["exp"] <= now - self.leewaySeconds:
+    if _numericDate(claims, "exp") <= now - self.leewaySeconds:
       raise SignInRefused("the ID token has expired")
-    if claims["iat"] > now + self.leewaySeconds:
+    if _numericDate(claims, "iat") > now + self.leewaySeconds:
       raise SignInRefused("the ID token is issued in the future")
-    if not hmac.compare_digest(str(claims.get("nonce", "")), nonce):
+    if "nbf" in claims and _numericDate(claims, "nbf") > now + self.leewaySeconds:
+      raise SignInRefused("the ID token is not valid yet ('nbf')")
+    if not isinstance(claims.get("nonce"), str):
+      raise SignInRefused("the ID token has no nonce as text")
+    if not _sameText(claims["nonce"], nonce):
       raise SignInRefused("the ID token's nonce does not match")
     if not isinstance(claims.get("sub"), str) or not claims["sub"]:
       raise SignInRefused("the ID token names no subject")

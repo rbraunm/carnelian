@@ -81,6 +81,10 @@ def readInteger(element: Element) -> int:
   return int.from_bytes(content, "big", signed=True)
 
 
+# Wide enough for the UUID arcs under 2.25.
+maximumOIDComponentBits = 128
+
+
 def readOID(element: Element) -> str:
   content = _expect(element, 0x06, "OBJECT IDENTIFIER").content
   if not content:
@@ -90,6 +94,8 @@ def readOID(element: Element) -> str:
     if current == 0 and byte == 0x80:
       raise DERError("OBJECT IDENTIFIER is not minimally encoded")
     current = (current << 7) | (byte & 0x7F)
+    if current.bit_length() > maximumOIDComponentBits:
+      raise DERError(f"an OBJECT IDENTIFIER component is longer than {maximumOIDComponentBits} bits")
     if not byte & 0x80:
       values.append(current)
       current = 0
@@ -117,14 +123,20 @@ def publicKeyFromInfo(info: bytes) -> RSAPublicKey | ECPublicKey:
   if len(elements) != 2:
     raise DERError("a SubjectPublicKeyInfo has two parts")
   parts = readAll(_expect(elements[0], 0x30, "AlgorithmIdentifier").content)
+  if not 1 <= len(parts) <= 2:
+    raise DERError(f"an AlgorithmIdentifier has an algorithm and at most one parameter, not {len(parts)} parts")
   kind = readOID(parts[0])
   keyBytes = readBitString(elements[1])
   if kind == rsaEncryption:
+    if len(parts) == 2 and parts[1] != Element(0x05, b""):
+      raise DERError("rsaEncryption's parameters are NULL or absent")
     numbers = readAll(_expect(readOne(keyBytes), 0x30, "RSAPublicKey").content)
     if len(numbers) != 2:
       raise DERError("an RSAPublicKey has two integers")
     return RSAPublicKey(readInteger(numbers[0]), readInteger(numbers[1]))
   if kind == ecPublicKey:
+    if len(parts) != 2:
+      raise DERError("an ecPublicKey AlgorithmIdentifier names its curve")
     curveOID = readOID(parts[1])
     if curveOID not in curveForOID:
       raise DERError(f"EC curve {curveOID} is not supported")
@@ -165,7 +177,10 @@ def fromPEM(text: str, label: str) -> bytes:
   blocks = [(found, body) for found, body in _pemBlock.findall(text) if found == label]
   if len(blocks) != 1:
     raise DERError(f"expected one PEM block '{label}', found {len(blocks)}")
-  return base64.b64decode("".join(blocks[0][1].split()), validate=True)
+  try:
+    return base64.b64decode("".join(blocks[0][1].split()), validate=True)
+  except ValueError as error:
+    raise DERError(f"the PEM block '{label}' is not base64: {error}") from None
 
 
 def publicKeyFromCertificate(certificate: bytes | str) -> RSAPublicKey | ECPublicKey:
