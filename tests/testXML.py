@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: MIT
 """Reading XML safely, and Exclusive XML Canonicalization against libxml2 (through lxml)."""
 
+import sys
+import time
+import tracemalloc
+
 import pytest
 from lxml import etree
 
-from carnelian.xmlTree import XMLRefused, canonical, parse
+from carnelian import xmlTree
+from carnelian.xmlTree import XMLRefused, canonical, parse, writeCanonical
 
 documents = {
   "saml-like": b"""<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="r1" Version="2.0">
@@ -75,3 +80,171 @@ def testTextRunsThroughComments():
   root = parse(b"<NameID>admin@example.org<!---->.evil.example</NameID>")
   assert root.text == "admin@example.org.evil.example"
   assert canonical(root) == b"<NameID>admin@example.org.evil.example</NameID>"
+
+
+def peakParseMemory(data):
+  tracemalloc.start()
+  try:
+    parse(data)
+    return tracemalloc.get_traced_memory()[1]
+  finally:
+    tracemalloc.stop()
+
+
+def testNamespaceDeclarationsAreNotCopiedIntoEveryElement():
+  children = b"<b/>" * 9000
+  declared = b"<r " + b" ".join(b'xmlns:p%d="urn:p%d"' % (index, index) for index in range(64)) + b">" + children + b"</r>"
+  plain = b"<r>" + children + b"</r>"
+  assert peakParseMemory(declared) - peakParseMemory(plain) < 1_000_000
+
+
+def testPrefixesResolveThroughTheAncestors():
+  root = parse(b'<p:a xmlns:p="urn:one"><p:b><p:c xmlns:p="urn:two"><p:d q:x="1" xmlns:q="urn:q"/></p:c></p:b></p:a>')
+  b = root.elements()[0]
+  c = b.elements()[0]
+  d = c.elements()[0]
+  assert (b.namespaceURI, c.namespaceURI, d.namespaceURI) == ("urn:one", "urn:two", "urn:two")
+  assert d.plainAttributes() == (("urn:q", "x", "q:x", "1"),)
+
+
+def nested(depth):
+  return b"<a>" * depth + b"</a>" * depth
+
+
+def testDepthUpToTheBudgetIsRead():
+  root = parse(nested(xmlTree.maximumDepth))
+  assert len(list(root.descendants())) == xmlTree.maximumDepth - 1
+  assert canonical(root) == nested(xmlTree.maximumDepth)
+
+
+@pytest.mark.parametrize("data, message", [
+  (nested(xmlTree.maximumDepth + 1), "nested deeper than 64 elements"),
+  (nested(5000), "nested deeper than 64 elements"),
+  (b"<r>" + b"<b/>" * xmlTree.maximumElements + b"</r>", "more than 10000 elements"),
+  (b"<r " + b" ".join(b'a%d="1"' % index for index in range(xmlTree.maximumAttributes + 1)) + b"/>",
+   "more than 64 attributes"),
+  (b"<r " + b" ".join(b'xmlns:p%d="urn:p"' % index for index in range(xmlTree.maximumDeclarations + 1)) + b"/>",
+   "more than 64 namespace declarations"),
+  (b"<r>" + (b"<b " + b" ".join(b'a%d="1"' % index for index in range(50)) + b"/>") * 401 + b"</r>",
+   "the XML has more than 20000 attributes"),
+  (b"<r>" + (b"<b " + b" ".join(b'xmlns:p%d="urn:p"' % index for index in range(50)) + b"/>") * 21 + b"</r>",
+   "the XML has more than 1000 namespace declarations"),
+  (b'<r xmlns:p="urn:' + b"x" * 1021 + b'"/>', "a namespace name is longer than 1024 characters"),
+])
+def testParseBudgetsAreRefusedByName(data, message):
+  with pytest.raises(XMLRefused, match=message):
+    parse(data)
+
+
+def testTheXMLPrefixAlwaysMeansTheXMLNamespace():
+  root = parse(b'<xml:a xmlns:xml="http://www.w3.org/XML/1998/namespace" xml:lang="en"/>')
+  assert root.isA("http://www.w3.org/XML/1998/namespace", "a")
+  assert root.attribute("lang", "http://www.w3.org/XML/1998/namespace") == "en"
+  assert parse(b"<xml:a/>").namespaceURI == "http://www.w3.org/XML/1998/namespace"
+
+
+@pytest.mark.parametrize("data, message", [
+  (b'<a xmlns:xml="urn:evil"/>', "the xml prefix cannot be bound to another namespace"),
+  (b'<p:a xmlns:p="http://www.w3.org/XML/1998/namespace"/>', "reserved namespace .* cannot be bound to another prefix"),
+  (b'<a xmlns="http://www.w3.org/XML/1998/namespace"/>', "reserved namespace .* cannot be bound to another prefix"),
+  (b'<a xmlns:p="http://www.w3.org/2000/xmlns/"/>', "reserved namespace .* cannot be bound to another prefix"),
+  (b'<a xmlns:xmlns="urn:x"/>', "the xmlns prefix cannot be declared"),
+  (b"<xmlns:a/>", "an element cannot use the xmlns prefix"),
+  (b'<p:a:b xmlns:p="urn:p"/>', "'p:a:b' is not a well-formed qualified name"),
+  (b'<a p:x:y="1" xmlns:p="urn:p"/>', "'p:x:y' is not a well-formed qualified name"),
+  (b"<:a/>", "':a' is not a well-formed qualified name"),
+  (b'<a: xmlns:a="urn:a"/>', "'a:' is not a well-formed qualified name"),
+  (b'<a xmlns:="urn:a"/>', "'xmlns:' is not a well-formed qualified name"),
+])
+def testReservedPrefixesAndMalformedNamesAreRefused(data, message):
+  with pytest.raises(XMLRefused, match=message):
+    parse(data)
+
+
+def testSimpleTextRefusesChildElementsAndInstructions():
+  assert parse(b"<NameID>ad<!---->min</NameID>").simpleText == "admin"
+  with pytest.raises(XMLRefused, match="<NameID> must hold text only"):
+    parse(b"<NameID>ad<b>m</b>in</NameID>").simpleText
+  with pytest.raises(XMLRefused, match="<NameID> must hold text only"):
+    parse(b"<NameID>ad<?x?>min</NameID>").simpleText
+
+
+namespacedAttributes = " ".join(f"a:{chr(65 + index // 26)}{chr(65 + index % 26)}=''" for index in range(64))
+
+
+def attributeHeavy(depth, leaves):
+  """The review's proof shape: leaves at a depth, each with 64 attributes in a namespace declared at the root."""
+  return ("<r xmlns:a='urn:a'>" + "<e>" * depth + f"<e {namespacedAttributes}/>" * leaves + "</e>" * depth + "</r>").encode()
+
+
+def testTheAttributeFloodIsRefusedQuickly():
+  document = attributeHeavy(62, 1930)
+  started = time.process_time()
+  with pytest.raises(XMLRefused, match="the XML has more than 20000 attributes"):
+    parse(document)
+  assert len(document) > 990_000 and time.process_time() - started < 1.0
+
+
+def executedLines(work):
+  """Lines of xmlTree run by `work`: a count of the work done that does not depend on the machine's speed."""
+  counted = [0]
+
+  def local(frame, event, argument):
+    if event == "line":
+      counted[0] += 1
+    return local
+
+  def tracer(frame, event, argument):
+    return local if frame.f_code.co_filename == xmlTree.__file__ else None
+
+  sys.settrace(tracer)
+  try:
+    work()
+  finally:
+    sys.settrace(None)
+  return counted[0]
+
+
+def readAll(document):
+  root = parse(document)
+  canonical(root)
+  for element in root.descendants():
+    element.attribute("ZZ", "urn:a")
+
+
+def testNamespacesAreResolvedOnceWhateverTheDepth():
+  deep = ("<r xmlns:a='urn:a'>" + "<e>" * 62 + f"<e {namespacedAttributes}/>" * 20 + "</e>" * 62 + "</r>").encode()
+  shallow = ("<r xmlns:a='urn:a'>" + "<e></e>" * 62 + f"<e {namespacedAttributes}/>" * 20 + "</r>").encode()
+  assert executedLines(lambda: readAll(deep)) < executedLines(lambda: readAll(shallow)) * 1.1
+  leaf = list(parse(deep).descendants())[-1]
+  assert leaf.plainAttributes() is leaf.plainAttributes() and len(leaf.plainAttributes()) == 64
+
+
+def testTheLargestAdmittedAttributeFloodIsCanonicalizedQuickly():
+  root = parse(attributeHeavy(62, 312))
+  started = time.process_time()
+  output = canonical(root)
+  assert time.process_time() - started < 0.3 and output.count(b' a:A') == 312 * 26
+
+
+def testALongNamespaceReemittedAtEverySiblingIsRefusedByName():
+  uri = "urn:" + "x" * 1000
+  data = f'<r xmlns:p="{uri}">'.encode() + b"<p:e/>" * 8000 + b"</r>"
+  with pytest.raises(XMLRefused, match="the canonical form is longer than 8000000 bytes"):
+    canonical(parse(data))
+
+
+def testTheCanonicalFormIsWrittenInBoundedSegments():
+  uri = "urn:" + "x" * 1000
+  data = f'<r xmlns:p="{uri}">'.encode() + b"<p:e/>" * 7000 + b"</r>"
+  segments = []
+  writeCanonical(parse(data), segments.append)
+  assert b"".join(segments) == lxmlCanonical(data, None)
+  assert len(segments) > 100 and max(len(segment) for segment in segments) < 70_000
+
+
+def testTheInclusivePrefixListIsBounded():
+  root = parse(b'<r xmlns:p="urn:p"/>')
+  assert canonical(root, tuple(f"q{index}" for index in range(64))) == b"<r></r>"
+  with pytest.raises(XMLRefused, match="the inclusive prefix list has more than 64 prefixes"):
+    canonical(root, tuple(f"q{index}" for index in range(65)))

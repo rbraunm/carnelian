@@ -6,7 +6,8 @@
 Every password and the client secret are derived from CARNELIAN_TESTBED_SECRET, so the
 same secret always gives the same files and nothing secret is committed. Output goes to
 testbed/generated (git-ignored): certificates/ (a test CA and the server's certificate for
-the host, localhost and 127.0.0.1), realm/carnelian.json for Keycloak to import, keycloak.env
+the host, localhost and 127.0.0.1), serviceProvider/ (the SAML service provider's signing and
+encryption keys), realm/carnelian.json for Keycloak to import, keycloak.env
 for compose, and testbed.json, which the tests read through `pytest --testbed`. Run with the
 test extras installed (it uses `cryptography` to make the certificates).
 
@@ -16,6 +17,7 @@ test extras installed (it uses `cryptography` to make the certificates).
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import shlex
 import socket
@@ -39,10 +41,19 @@ clientID = "carnelian-oidc"
 redirectURI = "http://127.0.0.1:53682/callback"
 samlConsumerURL = "https://sp.carnelian.test/acs"
 samlEntities = {"response": "https://sp.carnelian.test/signs-response", "assertion": "https://sp.carnelian.test/signs-assertion"}
+samlKeyedEntities = {
+  "encryptsGCM": "https://sp.carnelian.test/encrypts-gcm", "encryptsCBC": "https://sp.carnelian.test/encrypts-cbc",
+  "signsRequests": "https://sp.carnelian.test/signs-requests",
+  "logsOut": "https://sp.carnelian.test/logs-out", "logsOutToo": "https://sp.carnelian.test/logs-out-too",
+}
+samlLogoutURLs = {"logsOut": "https://sp.carnelian.test/slo/logs-out", "logsOutToo": "https://sp.carnelian.test/slo/logs-out-too"}
 keycloakPort = 8443
 mdqPort = 8444
 casPort = 8445
 casServiceURL = "https://sp.carnelian.test/cas"
+openLDAPBase = "dc=carnelian,dc=test"
+openLDAPService = f"cn=service,ou=services,{openLDAPBase}"
+openLDAPPorts = (1389, 1636)
 federationScope = "carnelian.test"
 federationAuthority = "https://federation.carnelian.test"
 directoryRealm = "CARNELIAN.TEST"
@@ -120,7 +131,7 @@ def userProfile() -> str:
   })
 
 
-def realm(secret: str, host: str, realmKey: tuple[str, str]) -> tuple[dict, list[dict]]:
+def realm(secret: str, host: str, realmKey: tuple[str, str], serviceProviderKeys: dict[str, tuple[str, str]]) -> tuple[dict, list[dict]]:
   dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
   many = [f"/{dataset['manyGroupsPrefix']}{index:02d}" for index in range(dataset["manyGroupsCount"])]
   groups = dataset["groups"] + [{"name": path[1:]} for path in many]
@@ -149,10 +160,11 @@ def realm(secret: str, host: str, realmKey: tuple[str, str]) -> tuple[dict, list
         "providerId": "declarative-user-profile", "subComponents": {}, "config": {"kc.user.profile.config": [userProfile()]},
       }],
     },
-    "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()] + [{
+    "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()]
+               + [keyedSAMLClient(kind, serviceProviderKeys) for kind in samlKeyedEntities] + [{
       "clientId": clientID, "enabled": True, "protocol": "openid-connect", "publicClient": False,
       "secret": derived(secret, "client:oidc"), "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
-      "redirectUris": [redirectURI], "attributes": {"pkce.code.challenge.method": "S256"},
+      "redirectUris": [redirectURI], "attributes": {"pkce.code.challenge.method": "S256", "post.logout.redirect.uris": "+"},
       "protocolMappers": [{
         "name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
         "config": {"full.path": "true", "id.token.claim": "true", "access.token.claim": "false",
@@ -188,12 +200,49 @@ def samlClient(entityID: str, signs: str) -> dict:
   }
 
 
+def certificateBody(certificatePEM: str) -> str:
+  return "".join(line for line in certificatePEM.splitlines() if "CERTIFICATE" not in line)
+
+
+def keyedSAMLClient(kind: str, serviceProviderKeys: dict[str, tuple[str, str]]) -> dict:
+  """A SAML client that needs the service provider's keys: it encrypts assertions (AES-256-GCM with RSA-OAEP, or
+  AES-128-CBC under a signed response), wants signed requests, or logs out by the Redirect binding."""
+  signing, encryption = certificateBody(serviceProviderKeys["signing"][1]), certificateBody(serviceProviderKeys["encryption"][1])
+  if kind == "encryptsGCM":
+    client = samlClient(samlKeyedEntities[kind], "assertion")
+    client["attributes"].update({
+      "saml.encrypt": "true", "saml.encryption.certificate": encryption,
+      "saml.encryption.algorithm": "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+      "saml.encryption.keyAlgorithm": "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+      "saml.encryption.digestMethod": "http://www.w3.org/2001/04/xmlenc#sha256",
+      "saml.encryption.maskGenerationFunction": "http://www.w3.org/2009/xmlenc11#mgf1sha256",
+    })
+    return client
+  if kind == "encryptsCBC":
+    client = samlClient(samlKeyedEntities[kind], "response")
+    client["attributes"].update({
+      "saml.encrypt": "true", "saml.encryption.certificate": encryption,
+      "saml.encryption.algorithm": "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
+      "saml.encryption.keyAlgorithm": "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+      "saml.encryption.digestMethod": "http://www.w3.org/2000/09/xmldsig#sha1",
+    })
+    return client
+  client = samlClient(samlKeyedEntities[kind], "response")
+  client["attributes"].update({"saml.client.signature": "true", "saml.signing.certificate": signing})
+  if kind in samlLogoutURLs:
+    client["frontchannelLogout"] = True
+    client["redirectUris"] = [samlConsumerURL, samlLogoutURLs[kind]]
+    client["attributes"].update({"saml.force.post.binding": "false",
+                                 "saml_single_logout_service_url_redirect": samlLogoutURLs[kind]})
+  return client
+
+
 def federationEntity(issuer: str, realmCertificate: str, federationKey: tuple[str, str]) -> bytes:
   """Keycloak as an institution of the testbed federation: its metadata with scope and names, signed by the federation."""
   from lxml import etree
   from signxml import XMLSigner
 
-  body = "".join(line for line in realmCertificate.splitlines() if "CERTIFICATE" not in line)
+  body = certificateBody(realmCertificate)
   until = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
   entity = etree.fromstring(
     f'<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" '
@@ -235,7 +284,7 @@ def casFiles(secret: str, host: str, accounts: list[dict]) -> None:
     f"server.port={casPort}", "server.ssl.enabled=true", "server.ssl.key-store=file:/etc/cas/keystore.p12",
     f"server.ssl.key-store-password={storePassword}", f"server.ssl.key-password={storePassword}", "server.ssl.key-store-type=PKCS12", "server.ssl.key-alias=cas",
     f"cas.server.name=https://{host}:{casPort}", "cas.server.prefix=${cas.server.name}/cas",
-    "cas.authn.accept.enabled=true", f"cas.authn.accept.users={users}", "cas.authn.accept.name=Testbed",
+    "cas.authn.accept.enabled=true", "cas.logout.follow-service-redirects=true", f"cas.authn.accept.users={users}", "cas.authn.accept.name=Testbed",
     "cas.service-registry.core.init-from-json=true", "cas.service-registry.json.location=file:/etc/cas/services",
     "cas.authn.attribute-repository.json[0].location=file:/etc/cas/config/attributes.json",
     "cas.authn.attribute-repository.json[0].id=testbed",
@@ -250,6 +299,81 @@ def casFiles(secret: str, host: str, accounts: list[dict]) -> None:
                           "memberOf": account["groups"]}
     for account in accounts if account["enabled"]
   }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def ldif(name: str, value: str) -> str:
+  """One LDIF line; a value that is not plain ASCII, or starts with a space, colon or '<', goes in base64."""
+  plain = value.isascii() and value.isprintable() and not value.startswith((" ", ":", "<"))
+  return f"{name}: {value}" if plain else f"{name}:: {base64.b64encode(value.encode('utf-8')).decode('ascii')}"
+
+
+def openLDAPFiles(secret: str, accounts: list[dict]) -> None:
+  """OpenLDAP's configuration and the dataset: people, nested groupOfNames in one container, a locked account."""
+  dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
+  folder = generated / "openldap"
+  folder.mkdir(parents=True, exist_ok=True)
+  (folder / "config.ldif").write_text("\n".join([
+    "dn: cn=config", "objectClass: olcGlobal", "cn: config",
+    "olcTLSCertificateFile: /etc/ldap/tls/server.crt", "olcTLSCertificateKeyFile: /etc/ldap/tls/server.key",
+    "olcTLSCACertificateFile: /etc/ldap/tls/ca.crt", "",
+    "dn: cn=module{0},cn=config", "objectClass: olcModuleList", "cn: module{0}", "olcModulePath: /usr/lib/ldap",
+    "olcModuleLoad: back_mdb", "olcModuleLoad: ppolicy", "",
+    "dn: cn=schema,cn=config", "objectClass: olcSchemaConfig", "cn: schema", "",
+    "include: file:///etc/ldap/schema/core.ldif", "",
+    "include: file:///etc/ldap/schema/cosine.ldif", "",
+    "include: file:///etc/ldap/schema/inetorgperson.ldif", "",
+    "dn: olcDatabase={-1}frontend,cn=config", "objectClass: olcDatabaseConfig", "objectClass: olcFrontendConfig",
+    "olcDatabase: {-1}frontend", "",
+    "dn: olcDatabase={0}config,cn=config", "objectClass: olcDatabaseConfig", "olcDatabase: {0}config",
+    "olcAccess: {0}to * by * none", "",
+    "dn: olcDatabase={1}mdb,cn=config", "objectClass: olcDatabaseConfig", "objectClass: olcMdbConfig",
+    "olcDatabase: {1}mdb", "olcDbDirectory: /var/lib/ldap", f"olcSuffix: {openLDAPBase}",
+    "olcDbIndex: objectClass eq", "olcDbIndex: uid,member eq",
+    "olcAccess: {0}to attrs=userPassword by self write by anonymous auth by * none",
+    f'olcAccess: {{1}}to * by dn.exact="{openLDAPService}" read by self read by * none', "",
+    "dn: olcOverlay={0}ppolicy,olcDatabase={1}mdb,cn=config", "objectClass: olcOverlayConfig",
+    "objectClass: olcPPolicyConfig", "olcOverlay: {0}ppolicy", f"olcPPolicyDefault: cn=default,ou=policies,{openLDAPBase}",
+  ]) + "\n", encoding="ascii", newline="\n")
+
+  members: dict[str, list[str]] = {}
+
+  def groupDN(name: str) -> str:
+    return f"cn={name},ou=groups,{openLDAPBase}"
+
+  def walk(tree: list[dict]) -> None:
+    for group in tree:
+      members.setdefault(group["name"], [])
+      for child in group.get("subGroups", []):
+        members[group["name"]].append(groupDN(child["name"]))
+      walk(group.get("subGroups", []))
+
+  walk(dataset["groups"])
+  for index in range(dataset["manyGroupsCount"]):
+    members[f"{dataset['manyGroupsPrefix']}{index:02d}"] = []
+  entries = [
+    [f"dn: {openLDAPBase}", "objectClass: dcObject", "objectClass: organization", "dc: carnelian", "o: Carnelian testbed"],
+    *[[f"dn: ou={unit},{openLDAPBase}", "objectClass: organizationalUnit", f"ou: {unit}"]
+      for unit in ("people", "groups", "services", "policies")],
+    [f"dn: cn=default,ou=policies,{openLDAPBase}", "objectClass: device", "objectClass: pwdPolicy", "cn: default",
+     "pwdAttribute: userPassword", "pwdLockout: TRUE"],
+    [f"dn: {openLDAPService}", "objectClass: organizationalRole", "objectClass: simpleSecurityObject", "cn: service",
+     f"userPassword: {derived(secret, 'openldap:service')}"],
+  ]
+  for account in accounts:
+    dn = f"uid={account['userName']},ou=people,{openLDAPBase}"
+    entry = [ldif("dn", dn), "objectClass: inetOrgPerson", ldif("uid", account["userName"]),
+             ldif("cn", f"{account['firstName']} {account['lastName']}"), ldif("sn", account["lastName"]),
+             ldif("givenName", account["firstName"]), ldif("displayName", f"{account['firstName']} {account['lastName']}"),
+             ldif("mail", account["email"]), ldif("userPassword", account["password"])]
+    if not account["enabled"]:
+      entry.append("pwdAccountLockedTime: 000001010000Z")
+    entries.append(entry)
+    for path in account["groups"]:
+      members[path.rsplit("/", 1)[1]].append(dn)
+  for name, memberDNs in members.items():
+    entries.append([ldif("dn", groupDN(name)), "objectClass: groupOfNames", ldif("cn", name),
+                    *(ldif("member", member) for member in memberDNs)])
+  (folder / "data.ldif").write_text("\n\n".join("\n".join(entry) for entry in entries) + "\n", encoding="ascii", newline="\n")
 
 
 def sambaSeed(secret: str, accounts: list[dict]) -> str:
@@ -284,7 +408,13 @@ def sambaSeed(secret: str, accounts: list[dict]) -> str:
 def prepare(host: str, secret: str) -> None:
   makeCertificates(host)
   realmKey, federationKey = signingKey("Carnelian testbed realm"), signingKey("Carnelian testbed federation")
-  document, accounts = realm(secret, host, realmKey)
+  serviceProviderKeys = {use: signingKey(f"Carnelian testbed service provider {use}") for use in ("signing", "encryption")}
+  keyFolder = generated / "serviceProvider"
+  keyFolder.mkdir(parents=True, exist_ok=True)
+  for use, (privateKey, certificate) in serviceProviderKeys.items():
+    (keyFolder / f"{use}.key").write_text(privateKey, encoding="ascii")
+    (keyFolder / f"{use}.crt").write_text(certificate, encoding="ascii")
+  document, accounts = realm(secret, host, realmKey, serviceProviderKeys)
   issuer = f"https://{host}:{keycloakPort}/realms/{realmName}"
   (generated / "mdq").mkdir(parents=True, exist_ok=True)
   for stale in (generated / "mdq").glob("*.xml"):
@@ -293,6 +423,7 @@ def prepare(host: str, secret: str) -> None:
     federationEntity(issuer, realmKey[1], federationKey))
   (generated / "certificates" / "federation.crt").write_text(federationKey[1], encoding="ascii")
   casFiles(secret, host, accounts)
+  openLDAPFiles(secret, accounts)
   (generated / "realm").mkdir(parents=True, exist_ok=True)
   (generated / "realm" / "carnelian.json").write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
   (generated / "samba").mkdir(parents=True, exist_ok=True)
@@ -307,7 +438,13 @@ def prepare(host: str, secret: str) -> None:
     "openIDConnect": {"issuer": issuer, "clientID": clientID, "clientSecret": derived(secret, "client:oidc"),
                       "redirectURI": redirectURI},
     "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
-             "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
+             "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities,
+             "keyed": {"entities": samlKeyedEntities, "singleLogoutURLs": samlLogoutURLs,
+                       **{f"{use}{part}": str((keyFolder / f"{use}.{suffix}").resolve())
+                          for use in ("signing", "encryption") for part, suffix in (("Key", "key"), ("Certificate", "crt"))}}},
+    "openLDAP": {"host": host, "ldapPort": openLDAPPorts[0], "ldapsPort": openLDAPPorts[1], "baseDN": openLDAPBase,
+                 "groupsBaseDN": f"ou=groups,{openLDAPBase}", "serviceDN": openLDAPService,
+                 "servicePassword": derived(secret, "openldap:service")},
     "cas": {"serverURL": f"https://{host}:{casPort}/cas", "serviceURL": casServiceURL},
     "federation": {"mdqURL": f"https://{host}:{mdqPort}", "institution": issuer, "scope": federationScope,
                    "registrationAuthority": federationAuthority,
@@ -333,6 +470,20 @@ def waitForKeycloak(host: str, timeoutSeconds: int) -> None:
     except OSError as error:
       if time.monotonic() > deadline:
         raise SystemExit(f"Keycloak did not answer at {address} within {timeoutSeconds} s: {error}")
+    time.sleep(3)
+
+
+def waitForTLS(host: str, port: int, what: str, timeoutSeconds: int) -> None:
+  context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
+  deadline = time.monotonic() + timeoutSeconds
+  while True:
+    try:
+      with socket.create_connection((host, port), timeout=5) as raw, context.wrap_socket(raw, server_hostname=host):
+        print(f"{what} answers TLS at {host}:{port}")
+        return
+    except OSError as error:
+      if time.monotonic() > deadline:
+        raise SystemExit(f"{what} did not answer TLS at {host}:{port} within {timeoutSeconds} s: {error}")
     time.sleep(3)
 
 
@@ -394,6 +545,7 @@ def main() -> None:
     waitForKeycloak(arguments.host, arguments.timeout)
     waitForFederation(arguments.host, arguments.timeout)
     waitForCAS(arguments.host, arguments.timeout)
+    waitForTLS(arguments.host, openLDAPPorts[1], "OpenLDAP", arguments.timeout)
     if arguments.directory:
       waitForDirectory(arguments.host, arguments.timeout)
     return

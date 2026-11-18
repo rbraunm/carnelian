@@ -48,6 +48,22 @@ services:
     ports:
       - "8445:8445"
 
+  # OpenLDAP, the directory many Linux shops and universities run: people, nested groupOfNames,
+  # a password policy that locks the disabled account.
+  openldap:
+    build: ./openldap
+    # slapd sizes its connection table by the open-file limit, which Docker sets near a billion.
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    volumes:
+      - ./generated/certificates:/certificates:ro
+      - ./generated/openldap:/seed:ro
+    ports:
+      - "1389:389"
+      - "1636:636"
+
   # An Active Directory domain controller. It needs a host whose kernel lets it set
   # security extended attributes (a VM or the workflow's runner, not an unprivileged
   # container), so it is a profile of its own: --profile directory.

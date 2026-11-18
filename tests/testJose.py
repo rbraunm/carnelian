@@ -2,6 +2,8 @@
 """JSON Web Signatures: RFC 7515's own examples, and tokens signed by OpenSSL."""
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,10 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-from carnelian.jose import JOSEError, KeySet, base64urlDecode, base64urlEncode, keyFromJWK, verifyCompact
+from carnelian.fetching import HTTPFailure
+from carnelian.jose import (JOSEError, KeyCache, KeySet, base64urlDecode, base64urlEncode, keyFromJWK, maximumKeyAgeSeconds,
+                            maximumKeyRetrySeconds, minimumKeyRefreshSeconds, numericDate, supportedAlgorithms,
+                            verifyCompact)
 
 vectors = json.loads((Path(__file__).parent / "vectors" / "rfc7515.json").read_text(encoding="ascii"))
 
@@ -103,3 +108,179 @@ def testKeysAreChosenStrictly():
     keys.keyFor({"kid": "b", "alg": "RS256"})
   with pytest.raises(JOSEError, match=r"private members \['d'\]"):
     keyFromJWK(jwkOf(rsaKey, "a") | {"d": "AQAB"})
+
+
+smallKey = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+
+
+@pytest.mark.parametrize("jwk, message", [
+  ({"kty": "EC", "crv": "P-256", "x": 5, "y": "AAAA"}, "has no 'x'"),
+  ({"kty": "RSA", "n": ["AQAB"], "e": "AQAB"}, "has no 'n'"),
+  ({"kty": ["RSA"], "n": "AQAB", "e": "AQAB"}, "has no 'kty' as text"),
+  ({"kty": 1, "n": "AQAB", "e": "AQAB"}, "has no 'kty' as text"),
+  ({"kty": "EC", "crv": ["P-256"], "x": "AA", "y": "AA"}, "has no 'crv' as text"),
+  (jwkOf(smallKey, "s"), "key is refused: an RSA key of 1024 bits"),
+  (jwkOf(ecKeys["ES256"], "e") | {"y": base64urlEncode(b"\x01" * 32)}, "key is refused: the EC public point is not on P-256"),
+])
+def testAJWKMemberOfTheWrongKindIsRefusedByName(jwk, message):
+  with pytest.raises(JOSEError, match=message):
+    keyFromJWK(jwk)
+
+
+@pytest.mark.parametrize("header, message", [
+  ({"alg": ["RS256"], "kid": "r"}, r"'alg' is not a name: \['RS256'\]"),
+  ({"alg": 256, "kid": "r"}, "'alg' is not a name: 256"),
+])
+def testAnAlgorithmOfTheWrongKindIsRefusedByName(header, message):
+  token = f"{base64urlEncode(json.dumps(header).encode())}.{base64urlEncode(b'{}')}.{base64urlEncode(b'x' * 256)}"
+  with pytest.raises(JOSEError, match=message):
+    verifyCompact(token, keyFromJWK(jwkOf(rsaKey, "r")))
+
+
+@pytest.mark.parametrize("header, message", [
+  ({"kid": ["r"], "alg": "RS256"}, r"'kid' is not text: \['r'\]"),
+  ({"kid": 7, "alg": "RS256"}, "'kid' is not text: 7"),
+  ({"alg": "RS256"}, r"names no key \('kid'\)"),
+])
+def testAKeyIDOfTheWrongKindIsRefusedByName(header, message):
+  with pytest.raises(JOSEError, match=message):
+    KeySet({"keys": [jwkOf(rsaKey, "r")]}).keyFor(header)
+
+
+@pytest.mark.parametrize("members, chosen", [
+  ({"key_ops": ["verify"]}, True), ({"key_ops": ["sign", "verify"]}, True), ({"key_ops": ["encrypt"]}, False),
+  ({"key_ops": []}, False), ({"use": "sig"}, True), ({"use": "enc"}, False),
+])
+def testOnlyAKeyForVerifyingIsChosen(members, chosen):
+  keys = KeySet({"keys": [jwkOf(rsaKey, "r") | members]})
+  if chosen:
+    assert keys.keyFor({"kid": "r", "alg": "RS256"}) == keyFromJWK(jwkOf(rsaKey, "r"))
+  else:
+    with pytest.raises(JOSEError, match="has 0 signing keys with kid 'r'"):
+      keys.keyFor({"kid": "r", "alg": "RS256"})
+
+
+@pytest.mark.parametrize("members, message", [
+  ({"key_ops": "verify"}, "'key_ops' is not a list of names"),
+  ({"key_ops": [1]}, "'key_ops' is not a list of names"),
+  ({"use": ["sig"]}, "'use' is not text"),
+])
+def testKeyUsesOfTheWrongKindAreRefusedByName(members, message):
+  with pytest.raises(JOSEError, match=message):
+    KeySet({"keys": [jwkOf(rsaKey, "r") | members]}).keyFor({"kid": "r", "alg": "RS256"})
+
+
+def testANonASCIIPayloadSegmentIsRefusedByName():
+  header, _, signature = signed({"alg": "RS256", "kid": "r"}, {}, rsaKey).split(".")
+  with pytest.raises(JOSEError, match="not unpadded base64url"):
+    verifyCompact(f"{header}.e30\u00e9.{signature}", keyFromJWK(jwkOf(rsaKey, "r")))
+
+
+@pytest.mark.parametrize("headerText, message", [
+  ('{"alg": "RS256", "x": NaN}', "NaN is not a JSON number"),
+  ('{"alg": "RS256", "x": 1e999}', "too large for a number"),
+  ('{"alg": "RS256", "x": ' + "[" * 50_000 + "]" * 50_000 + "}", "nests deeper than 32"),
+])
+def testAHeaderThatIsNotStrictJSONIsRefusedByName(headerText, message):
+  token = f"{base64urlEncode(headerText.encode())}.{base64urlEncode(b'{}')}.{base64urlEncode(b'x' * 256)}"
+  with pytest.raises(JOSEError, match=message):
+    verifyCompact(token, keyFromJWK(jwkOf(rsaKey, "r")))
+
+
+@pytest.mark.parametrize("value", [10 ** 400, -(10 ** 400), 253_402_300_800, 1e300])
+def testATimeBeyondTheYear9999IsRefusedByName(value):
+  with pytest.raises(JOSEError, match="'exp' is not a time between the years 1 and 9999"):
+    numericDate({"exp": value}, "exp")
+
+
+def testATimeIsReadAsSeconds():
+  assert numericDate({"iat": 1_800_000_000}, "iat") == 1_800_000_000.0
+  with pytest.raises(JOSEError, match="'iat' is not a finite number: True"):
+    numericDate({"iat": True}, "iat")
+
+
+class KeyEndpoint:
+  """The issuer's JWK set endpoint as a function: a double for the network boundary only."""
+
+  def __init__(self, answer, pause=0.0):
+    self.answer, self.pause, self.fetched = answer, pause, 0
+
+  def __call__(self):
+    self.fetched += 1
+    time.sleep(self.pause)
+    if isinstance(self.answer, Exception):
+      raise self.answer
+    return self.answer
+
+
+keySet = {"keys": [jwkOf(rsaKey, "r")]}
+knownKey = signed({"alg": "RS256", "kid": "r"}, {"sub": "ana"}, rsaKey)
+unknownKey = signed({"alg": "RS256", "kid": "k9"}, {"sub": "ana"}, rsaKey)
+start = 1_800_000_000
+
+
+@pytest.mark.parametrize("answer", [HTTPFailure("https://id.example.org/keys: ConnectionRefusedError"), {"keys": "none"}],
+                         ids=["unreachable", "malformed"])
+def testAFailingKeyFetchIsRetriedOnlyAfterAGrowingWait(answer):
+  ticks = [start]
+  endpoint = KeyEndpoint(answer)
+  cache = KeyCache(endpoint, lambda: ticks[0])
+  for _ in range(5):
+    with pytest.raises(JOSEError, match="keys could not be fetched"):
+      cache.verify(knownKey, supportedAlgorithms)
+  assert endpoint.fetched == 1
+  for moment, fetched in [(119, 1), (120, 2), (120 + 239, 2), (120 + 240, 3), (360 + 479, 3), (360 + 480, 4)]:
+    ticks[0] = start + moment
+    with pytest.raises(JOSEError, match="keys could not be fetched"):
+      cache.verify(knownKey, supportedAlgorithms)
+    assert endpoint.fetched == fetched
+  endpoint.answer = keySet
+  ticks[0] = start + 840 + maximumKeyRetrySeconds
+  assert json.loads(cache.verify(knownKey, supportedAlgorithms).payload) == {"sub": "ana"}
+  assert endpoint.fetched == 5
+
+
+def testCachedKeysOutliveAFailedRefreshUntilADayAfterTheirFetch():
+  ticks = [start]
+  endpoint = KeyEndpoint(keySet)
+  cache = KeyCache(endpoint, lambda: ticks[0])
+  cache.verify(knownKey, supportedAlgorithms)
+  endpoint.answer = HTTPFailure("https://id.example.org/keys: ConnectionRefusedError")
+  ticks[0] = start + minimumKeyRefreshSeconds
+  with pytest.raises(JOSEError, match="kid 'k9'; the issuer's keys could not be fetched"):
+    cache.verify(unknownKey, supportedAlgorithms)
+  assert endpoint.fetched == 2
+  ticks[0] = start + maximumKeyAgeSeconds - 1
+  assert json.loads(cache.verify(knownKey, supportedAlgorithms).payload) == {"sub": "ana"}
+  assert endpoint.fetched == 2
+  ticks[0] = start + maximumKeyAgeSeconds
+  with pytest.raises(JOSEError, match="keys could not be fetched"):
+    cache.verify(knownKey, supportedAlgorithms)
+  assert endpoint.fetched == 3
+  ticks[0] = start + maximumKeyAgeSeconds + 1
+  with pytest.raises(JOSEError, match="the next fetch is in 239 seconds"):
+    cache.verify(knownKey, supportedAlgorithms)
+  assert endpoint.fetched == 3
+
+
+def testTokensArrivingTogetherStartOneFetch():
+  endpoint = KeyEndpoint(keySet, pause=0.3)
+  cache = KeyCache(endpoint, lambda: start)
+  outcomes = []
+  gate = threading.Barrier(8)
+
+  def check():
+    gate.wait()
+    try:
+      cache.verify(unknownKey, supportedAlgorithms)
+      outcomes.append("verified")
+    except JOSEError as error:
+      outcomes.append(str(error))
+
+  threads = [threading.Thread(target=check) for _ in range(8)]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  assert endpoint.fetched == 1
+  assert len(outcomes) == 8 and all("kid 'k9'" in outcome for outcome in outcomes)

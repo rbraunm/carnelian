@@ -6,24 +6,30 @@ Breadth is where XML signature attacks live, so only one shape is accepted: one
 '#' and that element's ID, an ID no other element in the document carries; exactly the
 transforms enveloped-signature then Exclusive Canonicalization; exclusive canonicalization
 for <ds:SignedInfo>; SHA-256/384/512 digests; RSA (PKCS #1 v1.5 or PSS) or ECDSA. SHA-1,
-other transforms, other canonicalizations and empty or external URIs are refused by name.
+other transforms, other canonicalizations and missing, empty or external URIs are refused by name.
 <ds:KeyInfo> is never trusted: the signature must verify with a key the caller already
 trusts (the identity provider's, from its metadata). On success the very element that was
 verified is returned, so the caller reads nothing that the signature did not cover.
+
+`signatureShape`, `checkDigest` and `checkSignatureValue` are the same checks in pieces, for
+a document too large for a tree whose digest is computed as it streams by. Such a caller
+may also accept the transform exclusive c14n WithComments: a same-document reference
+removes comments before any transform runs, so it canonicalizes exactly as without them.
 """
 
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import hmac
+from dataclasses import dataclass
 
 from carnelian.signatures import ECPublicKey, RSAPublicKey, SignatureError
-from carnelian.xmlTree import Element, XMLRefused, canonical
+from carnelian.xmlTree import Element, XMLRefused, canonical, writeCanonical
 
 dsig = "http://www.w3.org/2000/09/xmldsig#"
 exclusiveC14N = "http://www.w3.org/2001/10/xml-exc-c14n#"
+exclusiveC14NWithComments = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments"
 envelopedSignature = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
 
 _digests = {
@@ -65,7 +71,7 @@ def _algorithm(element: Element) -> str:
 def _base64(text: str) -> bytes:
   try:
     return base64.b64decode("".join(text.split()), validate=True)
-  except binascii.Error:
+  except ValueError:
     raise SignatureRefused("a signature or digest value is not base64") from None
 
 
@@ -83,45 +89,68 @@ def _documentRoot(element: Element) -> Element:
   return element
 
 
-def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKey]) -> Element:
-  """Verify the enveloped signature of `signed`; returns `signed` itself when it verifies."""
-  if not trustedKeys:
-    raise SignatureRefused("no trusted key to verify with")
+@dataclass(frozen=True)
+class SignatureShape:
+  """A <ds:Signature> of the accepted shape, read but not yet verified."""
+  referenceURI: str
+  digestName: str
+  inclusivePrefixes: tuple[str, ...]
+  digestValue: bytes
+  signedInfo: bytes
+  signatureValue: bytes
+  signatureMethod: str
+
+
+def signatureShape(signature: Element, canonicalizations: tuple[str, ...] = (exclusiveC14N,)) -> SignatureShape:
+  """The signature's single reference and values, its algorithms and transforms checked; the URI is the caller's to check."""
   try:
-    signature = signed.only(dsig, "Signature")
     signedInfo = signature.only(dsig, "SignedInfo")
     method = signedInfo.only(dsig, "CanonicalizationMethod")
     if _algorithm(method) != exclusiveC14N:
       raise SignatureRefused(f"SignedInfo canonicalization {_algorithm(method)} is refused; only exclusive c14n")
     signatureMethod = _algorithm(signedInfo.only(dsig, "SignatureMethod"))
-    if signatureMethod not in _signatureMethods:
-      raise SignatureRefused(f"signature method {signatureMethod} is not supported")
     references = signedInfo.childrenNamed(dsig, "Reference")
     if len(references) != 1:
       raise SignatureRefused(f"SignedInfo has {len(references)} references; exactly one is accepted")
     reference = references[0]
-    identifier = signed.attribute("ID")
-    uri = reference.attribute("URI")
-    if not identifier or uri != f"#{identifier}":
-      raise SignatureRefused(f"the reference {uri!r} is not to the signed element's ID {identifier!r}")
-    carriers = [element for element in [_documentRoot(signed), *_documentRoot(signed).descendants()]
-                if any(local == "ID" and value == identifier for _, local, _, value in element.plainAttributes())]
-    if len(carriers) != 1:
-      raise SignatureRefused(f"{len(carriers)} elements carry ID {identifier!r}; it must be exactly one")
     transforms = reference.only(dsig, "Transforms").childrenNamed(dsig, "Transform")
-    if [_algorithm(transform) for transform in transforms] != [envelopedSignature, exclusiveC14N]:
+    algorithms = [_algorithm(transform) for transform in transforms]
+    if len(algorithms) != 2 or algorithms[0] != envelopedSignature or algorithms[1] not in canonicalizations:
       raise SignatureRefused("the transforms must be exactly enveloped-signature, then exclusive c14n")
     digestMethod = _algorithm(reference.only(dsig, "DigestMethod"))
     if digestMethod not in _digests:
       raise SignatureRefused(f"digest method {digestMethod} is not supported")
-    digest = hashlib.new(_digests[digestMethod],
-                         canonical(signed, _inclusivePrefixes(transforms[1]), leaveOut=signature)).digest()
-    if not hmac.compare_digest(digest, _base64(reference.only(dsig, "DigestValue").text)):
-      raise SignatureRefused("the signed element's digest does not match: it was changed after signing")
-    signedBytes = canonical(signedInfo, _inclusivePrefixes(method))
-    value = _base64(signature.only(dsig, "SignatureValue").text)
+    referenceURI = reference.attribute("URI")
+    if referenceURI is None:
+      raise SignatureRefused("the Reference has no URI; a same-document URI is required")
+    return SignatureShape(referenceURI=referenceURI, digestName=_digests[digestMethod],
+                          inclusivePrefixes=_inclusivePrefixes(transforms[1]),
+                          digestValue=_base64(reference.only(dsig, "DigestValue").text),
+                          signedInfo=canonical(signedInfo, _inclusivePrefixes(method)),
+                          signatureValue=_base64(signature.only(dsig, "SignatureValue").text),
+                          signatureMethod=signatureMethod)
   except XMLRefused as error:
     raise SignatureRefused(str(error)) from None
+
+
+def checkDigest(shape: SignatureShape, digest: bytes) -> None:
+  if not hmac.compare_digest(digest, shape.digestValue):
+    raise SignatureRefused("the signed element's digest does not match: it was changed after signing")
+
+
+def checkSignatureValue(shape: SignatureShape, trustedKeys: list[RSAPublicKey | ECPublicKey]) -> None:
+  verifySignatureValue(shape.signedInfo, shape.signatureValue, shape.signatureMethod, trustedKeys)
+
+
+def verifySignatureValue(signedBytes: bytes, value: bytes, signatureMethod: str,
+                         trustedKeys: list[RSAPublicKey | ECPublicKey]) -> None:
+  """Verify a signature value made by `signatureMethod` (an XML-DSig URI) over bytes, as the Redirect binding signs."""
+  if not trustedKeys:
+    raise SignatureRefused("no trusted key to verify with")
+  if signatureMethod in _refusedByName:
+    raise SignatureRefused(_refusedByName[signatureMethod])
+  if signatureMethod not in _signatureMethods:
+    raise SignatureRefused(f"signature method {signatureMethod} is not supported")
   kind, hashName = _signatureMethods[signatureMethod]
   for key in trustedKeys:
     try:
@@ -136,7 +165,34 @@ def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKe
           key.verifyPKCS1v15(signedBytes, value, hashName)
         else:
           key.verifyPSS(signedBytes, value, hashName, hashlib.new(hashName).digest_size)
-      return signed
+      return
     except SignatureError:
       continue
   raise SignatureRefused("the signature does not verify with any trusted key")
+
+
+def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKey]) -> Element:
+  """Verify the enveloped signature of `signed`; returns `signed` itself when it verifies."""
+  if not trustedKeys:
+    raise SignatureRefused("no trusted key to verify with")
+  try:
+    signature = signed.only(dsig, "Signature")
+  except XMLRefused as error:
+    raise SignatureRefused(str(error)) from None
+  shape = signatureShape(signature)
+  identifier = signed.attribute("ID")
+  if not identifier or shape.referenceURI != f"#{identifier}":
+    raise SignatureRefused(f"the reference {shape.referenceURI!r} is not to the signed element's ID {identifier!r}")
+  root = _documentRoot(signed)
+  carriers = sum(1 for element in [root, *root.descendants()]
+                 if any(local == "ID" and value == identifier for _, local, _, value in element.plainAttributes()))
+  if carriers != 1:
+    raise SignatureRefused(f"{carriers} elements carry ID {identifier!r}; it must be exactly one")
+  digest = hashlib.new(shape.digestName)
+  try:
+    writeCanonical(signed, digest.update, shape.inclusivePrefixes, leaveOut=signature)
+  except XMLRefused as error:
+    raise SignatureRefused(str(error)) from None
+  checkDigest(shape, digest.digest())
+  checkSignatureValue(shape, trustedKeys)
+  return signed

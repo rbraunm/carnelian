@@ -3,7 +3,6 @@
 scopes, scoped identifiers, the service provider's metadata, and InCommon's real MDQ service."""
 
 import base64
-import copy
 import datetime
 from pathlib import Path
 
@@ -17,7 +16,7 @@ from signxml import XMLSigner
 
 from carnelian.federation import (Federation, eduPersonPrincipalName, pairwiseID, researchAndScholarship, scopedIdentifier,
                                   serviceProviderMetadata, subjectID)
-from carnelian.fetching import Fetcher, secureContext
+from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 from carnelian.saml import SAMLIdentity, SAMLRefused, ServiceProvider
 
 from testOIDC import account, signInAtKeycloak
@@ -100,6 +99,51 @@ def testInstitutionsAreAskedForByMDQAndKeptUntilValidUntil():
     source.institution(entity)
 
 
+class Unknown:
+  """An MDQ service that knows no entity: every lookup fails as the fetcher reports a 404."""
+
+  def __init__(self):
+    self.asked = []
+
+  def getBytes(self, address, accept):
+    self.asked.append(address)
+    raise HTTPFailure(f"{address} answered 404, not 200")
+
+
+def testAFailedLookupIsRefusedByNameAndRememberedForAWhile():
+  ticks = [now]
+  unknown = "https://unknown.example.edu/idp"
+  source = Federation("Example", mdq, federationCertificate, Unknown(), refusalCacheSeconds=60, clock=lambda: ticks[0])
+  why = (f"Example's metadata for {unknown} could not be fetched: "
+         f"{mdq}/entities/https%3A%2F%2Funknown.example.edu%2Fidp answered 404, not 200")
+  for tick in (now, now + 59):
+    ticks[0] = tick
+    with pytest.raises(SAMLRefused) as refused:
+      source.institution(unknown)
+    assert str(refused.value) == why
+  assert len(source.fetcher.asked) == 1
+  ticks[0] = now + 60
+  with pytest.raises(SAMLRefused):
+    source.institution(unknown)
+  assert len(source.fetcher.asked) == 2
+
+
+def testMetadataThatIsRefusedIsNotFetchedAgainAtOnce():
+  source = federation(signed(metadata()).replace(b"Example University", b"Evil University"))
+  for _ in range(3):
+    with pytest.raises(SAMLRefused, match="digest"):
+      source.institution(entity)
+  assert len(source.fetcher.asked) == 1
+
+
+@pytest.mark.parametrize("entityID", ["", "https://idp.example.edu/" + "a" * 1001])
+def testAnEntityIDOutsideSAMLsLengthIsRefusedWithoutAFetch(entityID):
+  source = federation()
+  with pytest.raises(SAMLRefused, match="an entity ID is 1 to 1024 characters"):
+    source.institution(entityID)
+  assert source.fetcher.asked == []
+
+
 def tampered():
   document = signed(metadata()).replace(b"Example University", b"Evil University")
   return document
@@ -116,6 +160,25 @@ def tampered():
   (lambda: signed(metadata(scopes="")), "has no scope"),
 ])
 def testMetadataThatCannotBeTrustedIsRefused(document, why):
+  with pytest.raises(SAMLRefused, match=why):
+    federation().read(document(), entity)
+
+
+def categoryWithChild():
+  root = metadata()
+  value = root.find(".//{urn:oasis:names:tc:SAML:2.0:assertion}Attribute[@Name='http://macedir.org/entity-category']/"
+                    "{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue")
+  value.text = "http://refeds.org/category/"
+  etree.SubElement(value, "{urn:x}b").tail = "hide-from-discovery"
+  return signed(root)
+
+
+@pytest.mark.parametrize("document, why", [
+  (lambda: signed(metadata(scopes='<shibmd:Scope regexp="false">example<x:b xmlns:x="urn:x"/>.edu</shibmd:Scope>')),
+   "<Scope> must hold text only"),
+  (categoryWithChild, "<AttributeValue> must hold text only"),
+])
+def testSignedMetadataTextFieldsMustBeTextOnly(document, why):
   with pytest.raises(SAMLRefused, match=why):
     federation().read(document(), entity)
 
@@ -172,6 +235,19 @@ def testTheServiceProvidersMetadataIsWhatAFederationRegisters():
   with pytest.raises(ValueError, match="https"):
     serviceProviderMetadata("x", "http://openfurrow.example.org/back", {}, "https://a", "https://b", "o", "a@b")
 
+
+def testFederationMetadataCarriesTheServiceProvidersKeysAndLogout():
+  certificate = x509.load_pem_x509_certificate(federationCertificate.encode("ascii")).public_bytes(serialization.Encoding.DER)
+  document = etree.fromstring(serviceProviderMetadata(
+    "https://openfurrow.example.org/saml", "https://openfurrow.example.org/signin/with/incommon/return", {"en": "OpenFurrow"},
+    "https://openfurrow.example.org/about", "https://openfurrow.example.org/privacy", "Example Station", "it@example.org",
+    signingCertificate=certificate, encryptionCertificates=(certificate,),
+    singleLogoutURL="https://openfurrow.example.org/signout/saml"))
+  names = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
+  assert [key.get("use") for key in document.findall("md:SPSSODescriptor/md:KeyDescriptor", names)] == ["signing", "encryption"]
+  assert {service.get("Location") for service in document.findall("md:SPSSODescriptor/md:SingleLogoutService", names)} == {
+    "https://openfurrow.example.org/signout/saml"}
+  assert document.find("md:SPSSODescriptor", names).get("AuthnRequestsSigned") == "true"
 
 # ---- InCommon's real MDQ service, which also serves eduGAIN's institutions ----
 

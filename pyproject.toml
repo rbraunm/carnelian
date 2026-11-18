@@ -31,16 +31,24 @@ Source = "https://github.com/rbraunm/carnelian"
 Issues = "https://github.com/rbraunm/carnelian/issues"
 
 [project.optional-dependencies]
-# Test oracles only: they check Carnelian's answers and never run in an application.
+# Operations with a private key (decrypting assertions, signing requests and logout), only through carnelian.keys.
+keys = ["cryptography>=44"]
+# Test oracles, the type checker and the linter: they check Carnelian and never run in an application.
 test = [
   "pytest>=8",
   "cryptography>=44",
   "lxml>=5",
   "signxml>=4",
+  "hypothesis>=6.170",
+  "mypy>=2.4",
+  "ruff>=0.17",
 ]
 
 [tool.setuptools.packages.find]
 include = ["carnelian*"]
+
+[tool.setuptools.package-data]
+carnelian = ["py.typed"]
 
 [tool.setuptools.dynamic]
 version = {attr = "carnelian.version.softwareVersion"}

@@ -2,6 +2,7 @@
 """Enveloped XML Signatures made by signxml (an independent implementation), verified, and attacked."""
 
 import copy
+import time
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
@@ -96,3 +97,31 @@ def testExtraTransformsAreRefused():
   extra.set("Algorithm", "http://www.w3.org/TR/1999/REC-xslt-19991116")
   with pytest.raises(SignatureRefused, match="exactly enveloped-signature, then exclusive c14n"):
     verifyEnveloped(assertionOf(root)[1], [rsaPublic])
+
+
+@pytest.mark.parametrize("name", ["DigestValue", "SignatureValue"])
+def testNonASCIIBase64IsRefusedByName(name):
+  root = signedResponse()
+  value = root.find(f".//{{http://www.w3.org/2000/09/xmldsig#}}{name}")
+  value.text = value.text + "\u00e9"
+  with pytest.raises(SignatureRefused, match="a signature or digest value is not base64"):
+    verifyEnveloped(assertionOf(root)[1], [rsaPublic])
+
+
+def testAReferenceWithoutURIIsRefusedByName():
+  root = signedResponse()
+  del root.find(".//{http://www.w3.org/2000/09/xmldsig#}Reference").attrib["URI"]
+  with pytest.raises(SignatureRefused, match="the Reference has no URI; a same-document URI is required"):
+    verifyEnveloped(assertionOf(root)[1], [rsaPublic])
+
+
+def testTheLargestAdmittedAttributeFloodIsRefusedQuickly():
+  attributes = " ".join(f"a:{chr(65 + index // 26)}{chr(65 + index % 26)}=''" for index in range(64))
+  signature = etree.tostring(signedResponse()[0].find("{http://www.w3.org/2000/09/xmldsig#}Signature")).decode()
+  document = (f"<saml:Assertion xmlns:saml='{samlAssertion}' xmlns:a='urn:a' ID='a1'>{signature}" + "<e>" * 62
+              + f"<e {attributes}/>" * 312 + "</e>" * 62 + "</saml:Assertion>").encode()
+  root = parse(document)
+  started = time.process_time()
+  with pytest.raises(SignatureRefused, match="digest does not match"):
+    verifyEnveloped(root, [rsaPublic])
+  assert time.process_time() - started < 0.3

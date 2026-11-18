@@ -5,16 +5,23 @@ import base64
 import copy
 import datetime
 import html.parser
+import sys
+import threading
 import urllib.parse
 import zlib
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from lxml import etree
 from signxml import XMLSigner
 
 from carnelian.fetching import Fetcher, secureContext
-from carnelian.saml import IdentityProvider, Pending, ReplayCache, SAMLRefused, ServiceProvider, identityProviderFromMetadata
+from carnelian.saml import (IdentityProvider, Pending, ReplayCache, SAMLRefused, ServiceProvider, identityProviderFromMetadata,
+                            serviceProviderMetadata,
+                            maximumResponseLength)
 from carnelian.signatures import RSAPublicKey
 from carnelian.xmlTree import parse
 
@@ -163,6 +170,185 @@ def testTheRedirectCarriesADeflatedRequestForThisProvider():
     "AuthnRequest", started.requestID, acs)
   assert query["RelayState"] == "state-1"
 
+
+def signedEdited(edit, **changes):
+  root = response(**changes)
+  edit(root.find(f"{{{saml}}}Assertion"))
+  return posted(signAssertion(root))
+
+
+def first(assertion, path):
+  return assertion.find(path, {"saml": saml})
+
+
+def withChild(element):
+  element.text = "ad"
+  etree.SubElement(element, "{urn:x}b").tail = "min"
+
+
+def addCondition(name):
+  return lambda assertion: etree.SubElement(first(assertion, "saml:Conditions"), name)
+
+
+@pytest.mark.parametrize("edit, message", [
+  (lambda assertion: setattr(first(assertion, "saml:Subject/saml:NameID"), "text", "  "), "the assertion's NameID is blank"),
+  (lambda assertion: withChild(first(assertion, "saml:Subject/saml:NameID")), "<NameID> must hold text only"),
+  (lambda assertion: withChild(first(assertion, "saml:Issuer")), "<Issuer> must hold text only"),
+  (lambda assertion: withChild(first(assertion, "saml:Conditions/saml:AudienceRestriction/saml:Audience")),
+   "<Audience> must hold text only"),
+  (lambda assertion: withChild(first(assertion, ".//saml:AttributeValue")), "<AttributeValue> must hold text only"),
+  (lambda assertion: assertion.remove(first(assertion, "saml:AuthnStatement")), "has 0 AuthnStatements"),
+  (addCondition(f"{{{saml}}}OneTimeUse"), "the condition <OneTimeUse> is not supported"),
+  (addCondition(f"{{{saml}}}ProxyRestriction"), "the condition <ProxyRestriction> is not supported"),
+  (addCondition("{urn:x}Unknown"), "the condition <Unknown> is not supported"),
+  (lambda assertion: first(assertion, "saml:AuthnStatement").set("SessionNotOnOrAfter", instant(-61)),
+   "session has already ended"),
+  (lambda assertion: first(assertion, "saml:Conditions").set("NotOnOrAfter", "2027-13-01T00:00:00Z"),
+   "Conditions NotOnOrAfter '2027-13-01T00:00:00Z' is not a valid instant"),
+])
+def testSignedAssertionsOutsideTheProfileAreRefused(edit, message):
+  with pytest.raises(SAMLRefused, match=message):
+    provider().finishSignIn(pending, signedEdited(edit))
+
+
+@pytest.mark.parametrize("address, why", [
+  (f"{idp}/sso#top", "carries a fragment"),
+  (f"{idp}/sso?SAMLRequest=x", r"already carries \['SAMLRequest'\]"),
+  (f"{idp}/sso?tenant=a&Relay%53tate=x", r"already carries \['RelayState'\]"),
+  (f"{idp}/sso?Signature", r"already carries \['Signature'\]"),
+])
+def testAnIdentityProviderAddressTheBindingCannotExtendIsRefused(address, why):
+  with pytest.raises(SAMLRefused, match=why):
+    IdentityProvider(idp, address, (public,))
+  with pytest.raises(SAMLRefused, match=why):
+    IdentityProvider(idp, f"{idp}/sso", (public,), singleLogoutURL=address)
+
+
+def testAnIdentityProvidersOwnQueryIsKept():
+  serviceProvider = ServiceProvider(sp, acs, IdentityProvider(idp, f"{idp}/sso?tenant=a", (public,)), clock=lambda: now)
+  assert serviceProvider.beginSignIn()[0].startswith(f"{idp}/sso?tenant=a&SAMLRequest=")
+
+
+def testTheSessionEndIsReturned():
+  posting = signedEdited(lambda assertion: first(assertion, "saml:AuthnStatement").set("SessionNotOnOrAfter", instant(3600)))
+  assert provider().finishSignIn(pending, posting).sessionNotOnOrAfter == now + 3600
+  assert provider().finishSignIn(pending, posted(signAssertion(response()))).sessionNotOnOrAfter is None
+
+
+def testAnOversizedSAMLResponseIsRefusedBeforeDecoding():
+  padded = " " * maximumResponseLength + posted(signAssertion(response()))
+  with pytest.raises(SAMLRefused, match=f"longer than {maximumResponseLength} characters"):
+    provider().finishSignIn(pending, padded)
+
+
+def testANonASCIISAMLResponseIsRefusedByName():
+  with pytest.raises(SAMLRefused, match="not base64"):
+    provider().finishSignIn(pending, "é" + posted(response()))
+
+
+def testADeeplyNestedUnsignedResponseIsRefusedByName():
+  document = etree.tostring(response()).replace(
+    f"<saml:Issuer>{idp}</saml:Issuer>".encode(), b"<saml:Issuer>" + b"<a>" * 5000 + b"</a>" * 5000 + b"</saml:Issuer>", 1)
+  with pytest.raises(SAMLRefused, match="nested deeper than 64 elements"):
+    provider().finishSignIn(pending, base64.b64encode(document).decode())
+
+
+def testReplayIsKeptPerIssuer():
+  cache = ReplayCache()
+  cache.admit("https://one.example.org", "a1", now + 60, now)
+  cache.admit("https://two.example.org", "a1", now + 60, now)
+  with pytest.raises(SAMLRefused, match="assertion 'a1' was already used"):
+    cache.admit("https://one.example.org", "a1", now + 60, now)
+  cache.admit("https://one.example.org", "a1", now + 120, now + 60)
+
+
+def testConcurrentClaimsOfOneAssertionAdmitOnlyOne():
+  cache = ReplayCache()
+  for index in range(2_000):
+    cache.admit(idp, f"older-{index}", now + 600, now)
+  threads, rounds = 4, 10
+  admitted = [0] * rounds
+  barrier = threading.Barrier(threads)
+
+  def claim():
+    for turn in range(rounds):
+      barrier.wait()
+      try:
+        cache.admit(idp, f"raced-{turn}", now + 600, now)
+        admitted[turn] += 1
+      except SAMLRefused:
+        pass
+
+  interval = sys.getswitchinterval()
+  sys.setswitchinterval(1e-4)
+  try:
+    workers = [threading.Thread(target=claim) for _ in range(threads)]
+    for worker in workers:
+      worker.start()
+    for worker in workers:
+      worker.join()
+  finally:
+    sys.setswitchinterval(interval)
+  assert admitted == [1] * rounds
+
+
+def certificateMetadata(certificateText):
+  return f"""<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="{dsigNS}" entityID="{idp}"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{certificateText}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="{idp}/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>""".encode()
+
+
+def certificateFor(signingKey):
+  subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "idp")])
+  start = datetime.datetime.fromtimestamp(now - 86400, datetime.UTC)
+  built = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(signingKey.public_key())
+           .serial_number(1).not_valid_before(start).not_valid_after(start + datetime.timedelta(days=30))
+           .sign(signingKey, hashes.SHA256()))
+  return base64.b64encode(built.public_bytes(serialization.Encoding.DER)).decode()
+
+
+def testMetadataWithAGoodCertificateGivesItsKey():
+  identityProvider = identityProviderFromMetadata(certificateMetadata(certificateFor(key)), idp)
+  assert identityProvider.signingKeys[0].modulus == public.modulus
+
+
+@pytest.mark.parametrize("certificateText, message", [
+  (lambda: certificateFor(rsa.generate_private_key(public_exponent=65537, key_size=1024)), "1024 bits is refused"),
+  (lambda: base64.b64encode(b"\x30\x03\x02\x01\x00").decode(), "the metadata is refused"),
+  (lambda: "é" + certificateFor(key), "the metadata is refused"),
+])
+def testMetadataCertificatesThatCannotBeReadAreRefused(certificateText, message):
+  with pytest.raises(SAMLRefused, match=message):
+    identityProviderFromMetadata(certificateMetadata(certificateText()), idp)
+
+
+@pytest.mark.parametrize("inner, expected", [
+  ('<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">tid-1</saml:NameID>', ("tid-1",)),
+  ('<saml:Subject/>', None),
+  ('text <saml:NameID>tid-1</saml:NameID>', None),
+])
+def testAnAttributeValueIsTextOrEduPersonTargetedIDsNameID(inner, expected):
+  root = response()
+  statement = root.find(f"{{{saml}}}Assertion/{{{saml}}}AttributeStatement")
+  statement.append(etree.fromstring(f'<saml:Attribute xmlns:saml="{saml}" Name="urn:oid:1.3.6.1.4.1.5923.1.1.1.10">'
+                                    f"<saml:AttributeValue>{inner}</saml:AttributeValue></saml:Attribute>"))
+  if expected is None:
+    with pytest.raises(SAMLRefused, match="text only"):
+      provider().finishSignIn(pending, posted(signAssertion(root)))
+  else:
+    identity = provider().finishSignIn(pending, posted(signAssertion(root)))
+    assert identity.attributes["urn:oid:1.3.6.1.4.1.5923.1.1.1.10"] == expected
+
+def testPlainServiceProviderMetadataNeedsOnlyTheEntityAndTheConsumerAddress():
+  document = etree.fromstring(serviceProviderMetadata(sp, acs))
+  names = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
+  assert document.get("entityID") == sp
+  assert document.find("md:SPSSODescriptor/md:AssertionConsumerService", names).get("Location") == acs
+  assert document.find("md:SPSSODescriptor", names).get("WantAssertionsSigned") == "true"
+  assert document.find("md:Extensions", names) is None and document.find("md:Organization", names) is None
+  assert document.find("md:ContactPerson", names) is None
+  with pytest.raises(ValueError, match="needs its informationURL"):
+    serviceProviderMetadata(sp, acs, organizationName="Example")
+  with pytest.raises(ValueError, match="https"):
+    serviceProviderMetadata(sp, "http://sp.example.org/acs")
 
 # ---- against the testbed's Keycloak ----------------------------------------
 

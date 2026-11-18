@@ -4,9 +4,10 @@
 Only verification: no secret key is ever handled, so the timing of these computations
 reveals nothing worth protecting. RSA PKCS #1 v1.5 is checked by building the one encoding
 a valid signature must decrypt to and comparing it whole (RFC 8017 section 8.2.2), never by
-parsing what the signature decrypts to -- parsing is where signature forgeries live. RSA
-keys below 2048 bits and unknown hashes are refused; an ECDSA public point must lie on its
-curve and signatures must be in range.
+parsing what the signature decrypts to -- parsing is where signature forgeries live. An RSA
+modulus is a positive odd number of 2048 to 16384 bits, its exponent odd, from 3 to below
+2**256; unknown hashes are refused; an ECDSA public point must lie on its curve and
+signatures must be in range.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ class SignatureError(ValueError):
 
 
 minimumRSABits = 2048
+maximumRSABits = 16384
+maximumRSAExponent = 2**256
 
 # DER DigestInfo prefixes, RFC 8017 section 9.2 note 1.
 _digestInfoPrefix = {
@@ -41,11 +44,13 @@ class RSAPublicKey:
   modulus: int
   exponent: int
 
-  def __post_init__(self):
-    if self.modulus.bit_length() < minimumRSABits:
-      raise SignatureError(f"an RSA key of {self.modulus.bit_length()} bits is refused; {minimumRSABits} or more")
-    if self.exponent < 3 or self.exponent % 2 == 0:
-      raise SignatureError(f"RSA exponent {self.exponent} is not a valid public exponent")
+  def __post_init__(self) -> None:
+    if self.modulus <= 0 or self.modulus % 2 == 0:
+      raise SignatureError("an RSA modulus is a positive odd number")
+    if not minimumRSABits <= self.modulus.bit_length() <= maximumRSABits:
+      raise SignatureError(f"an RSA key of {self.modulus.bit_length()} bits is refused; {minimumRSABits} to {maximumRSABits}")
+    if self.exponent % 2 == 0 or not 3 <= self.exponent < maximumRSAExponent:
+      raise SignatureError(f"RSA exponent {self.exponent} is not an odd number from 3 to below 2**256 (and so the modulus)")
 
   @property
   def length(self) -> int:
@@ -74,13 +79,15 @@ class RSAPublicKey:
     hashLength = len(messageHash)
     emBits = self.modulus.bit_length() - 1
     emLength = (emBits + 7) // 8
+    if not 0 <= saltLength <= emLength - hashLength - 2:
+      raise SignatureError(f"an RSA-PSS salt of {saltLength} bytes does not fit this key and hash")
     opened = self._opened(signature)
     if len(opened) > emLength:
       if opened[0] != 0:
         raise SignatureError("the RSA-PSS signature does not verify")
       opened = opened[1:]
     encoded = opened
-    if emLength < hashLength + saltLength + 2 or encoded[-1] != 0xBC:
+    if encoded[-1] != 0xBC:
       raise SignatureError("the RSA-PSS signature does not verify")
     maskedDB, hashed = encoded[:emLength - hashLength - 1], encoded[emLength - hashLength - 1:-1]
     unusedBits = 8 * emLength - emBits
@@ -157,7 +164,7 @@ curves = {
 }
 
 
-def _add(curve: Curve, first, second):
+def _add(curve: Curve, first: tuple[int, int] | None, second: tuple[int, int] | None) -> tuple[int, int] | None:
   if first is None:
     return second
   if second is None:
@@ -174,9 +181,9 @@ def _add(curve: Curve, first, second):
   return x3, (slope * (x1 - x3) - y1) % p
 
 
-def _multiply(curve: Curve, scalar: int, point):
+def _multiply(curve: Curve, scalar: int, point: tuple[int, int]) -> tuple[int, int] | None:
   result = None
-  addend = point
+  addend: tuple[int, int] | None = point
   while scalar:
     if scalar & 1:
       result = _add(curve, result, addend)
@@ -191,7 +198,7 @@ class ECPublicKey:
   x: int
   y: int
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.curveName not in curves:
       raise SignatureError(f"curve '{self.curveName}' is not one of {sorted(curves)}")
     curve = curves[self.curveName]

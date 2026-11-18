@@ -4,16 +4,22 @@
 A federation vouches for its institutions by signing their metadata. Each institution's
 metadata is fetched by the Metadata Query protocol (MDQ: one small signed document per
 entity, as InCommon serves its own and eduGAIN's), its signature checked against the
-federation's signing certificate, and its validUntil required and honoured. What is read:
+federation's signing certificate, and its validUntil required and honoured. An institution is
+cached until its validUntil (at most `maximumCacheSeconds`); a refusal, an unknown entity ID
+among them, is cached for `refusalCacheSeconds`, so a discovery form cannot make repeated
+requests for one entity ID fetch each time. A failed fetch is a SAMLRefused like any other. What is read:
 the identity provider (its single sign-on address and signing keys), its display names, the
-federation that registered it, its entity categories, and its scopes.
+federation that registered it, its entity categories, and its scopes. A whole federation's
+aggregate, every member in one document, is read by `carnelian.aggregate`.
 
 A federation's identity is a scoped identifier, `value@scope`: SAML's subject-id or
 pairwise-id (the SAML V2.0 Subject Identifier Attributes profile) or eduPersonPrincipalName.
 An institution may only vouch for identifiers in the scopes its federation registered for
 it, so one university cannot sign in another's people; a scope written as a regular
-expression is refused by name. The service provider's own metadata, which the federation
-registers, is written by `serviceProviderMetadata`.
+expression is refused by name. Only `scopedIdentifier` checks a scope: the NameID and every
+other attribute are whatever the institution asserts. Scopes and entity categories must be
+text only. The service provider's own metadata, which the federation registers, is written
+by `serviceProviderMetadata`.
 """
 
 from __future__ import annotations
@@ -21,23 +27,28 @@ from __future__ import annotations
 import re
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from carnelian.der import publicKeyFromCertificate
-from carnelian.fetching import Fetcher
-from carnelian.saml import IdentityProvider, SAMLIdentity, SAMLRefused, _attribute, _time, identityProviderFromDescriptor, metadataNamespace
+from carnelian.fetching import DocumentFetcher, HTTPFailure
+from carnelian.saml import (EncryptionPolicy, IdentityProvider, SAMLIdentity, SAMLRefused, _time, assertionNamespace, entityAttributeNamespace,
+                            entityCategoryName, identityProviderFromDescriptor, metadataNamespace, uiNamespace)
+from carnelian.saml import serviceProviderMetadata as samlServiceProviderMetadata
 from carnelian.xmldsig import SignatureRefused, verifyEnveloped
-from carnelian.xmlTree import XMLRefused, parse
+from carnelian.xmlTree import Element, XMLRefused, parse
+
+__all__ = ["Federation", "Institution", "scopedIdentifier", "serviceProviderMetadata", "subjectID", "pairwiseID",
+           "eduPersonPrincipalName", "mail", "displayName", "givenName", "surname", "researchAndScholarship",
+           "hideFromDiscovery"]
 
 shibbolethMetadata = "urn:mace:shibboleth:metadata:1.0"
-uiNamespace = "urn:oasis:names:tc:SAML:metadata:ui"
 registrationNamespace = "urn:oasis:names:tc:SAML:metadata:rpi"
-entityAttributeNamespace = "urn:oasis:names:tc:SAML:metadata:attribute"
-assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
-entityCategory = "http://macedir.org/entity-category"
 hideFromDiscovery = "http://refeds.org/category/hide-from-discovery"
 researchAndScholarship = "http://refeds.org/category/research-and-scholarship"
 metadataMediaType = "application/samlmetadata+xml"
+maximumEntityIDLength = 1024
+maximumRefusals = 10_000
 
 subjectID = "urn:oasis:names:tc:SAML:attribute:subject-id"
 pairwiseID = "urn:oasis:names:tc:SAML:attribute:pairwise-id"
@@ -77,35 +88,36 @@ class Institution:
     return hideFromDiscovery in self.entityCategories
 
 
-def _institution(root, signedBy: str) -> Institution:
+def _institution(root: Element, signedBy: str, validUntil: float) -> Institution:
   identityProvider = identityProviderFromDescriptor(root)
-  validUntil = _time(root.attribute("validUntil"), "the metadata's validUntil")
   descriptor = root.only(metadataNamespace, "IDPSSODescriptor")
-  scopes, names = [], {}
-  extensions = descriptor.only(metadataNamespace, "Extensions", required=False)
+  scopes: list[str] = []
+  names: dict[str, str] = {}
+  extensions = descriptor.optional(metadataNamespace, "Extensions")
   if extensions is not None:
     for scope in extensions.childrenNamed(shibbolethMetadata, "Scope"):
       if scope.attribute("regexp") not in (None, "false", "0"):
         raise SAMLRefused(f"{root.attribute('entityID')} has a scope written as a regular expression, which is refused")
-      if scope.text.strip().lower() not in scopes:
-        scopes.append(scope.text.strip().lower())
-    information = extensions.only(uiNamespace, "UIInfo", required=False)
+      if scope.simpleText.strip().lower() not in scopes:
+        scopes.append(scope.simpleText.strip().lower())
+    information = extensions.optional(uiNamespace, "UIInfo")
     if information is not None:
       for name in information.childrenNamed(uiNamespace, "DisplayName"):
         names[name.attribute("lang", "http://www.w3.org/XML/1998/namespace") or ""] = name.text.strip()
-  authority, categories = None, []
-  entityExtensions = root.only(metadataNamespace, "Extensions", required=False)
+  authority: str | None = None
+  categories: list[str] = []
+  entityExtensions = root.optional(metadataNamespace, "Extensions")
   if entityExtensions is not None:
-    registration = entityExtensions.only(registrationNamespace, "RegistrationInfo", required=False)
+    registration = entityExtensions.optional(registrationNamespace, "RegistrationInfo")
     authority = registration.attribute("registrationAuthority") if registration is not None else None
-    attributes = entityExtensions.only(entityAttributeNamespace, "EntityAttributes", required=False)
+    attributes = entityExtensions.optional(entityAttributeNamespace, "EntityAttributes")
     if attributes is not None:
       for attribute in attributes.childrenNamed(assertionNamespace, "Attribute"):
-        if attribute.attribute("Name") == entityCategory:
-          categories += [value.text.strip() for value in attribute.childrenNamed(assertionNamespace, "AttributeValue")]
+        if attribute.attribute("Name") == entityCategoryName:
+          categories += [value.simpleText.strip() for value in attribute.childrenNamed(assertionNamespace, "AttributeValue")]
   if not scopes:
     raise SAMLRefused(f"{root.attribute('entityID')} has no scope in {signedBy}'s metadata, so it can vouch for no one")
-  return Institution(entityID=root.attribute("entityID"), displayNames=names, registrationAuthority=authority,
+  return Institution(entityID=root.required("entityID"), displayNames=names, registrationAuthority=authority,
                      entityCategories=tuple(categories), scopes=tuple(scopes), identityProvider=identityProvider,
                      validUntil=validUntil)
 
@@ -113,24 +125,50 @@ def _institution(root, signedBy: str) -> Institution:
 class Federation:
   """A federation's institutions, fetched one by one from its MDQ service and checked against its signing certificate."""
 
-  def __init__(self, name: str, mdqURL: str, signingCertificate: str | bytes, fetcher: Fetcher,
-               maximumCacheSeconds: float = 6 * 3600, clock=time.time):
+  def __init__(self, name: str, mdqURL: str, signingCertificate: str | bytes, fetcher: DocumentFetcher,
+               maximumCacheSeconds: float = 6 * 3600, refusalCacheSeconds: float = 60,
+               clock: Callable[[], float] = time.time) -> None:
     if not mdqURL.startswith("https://") or mdqURL.endswith("/"):
       raise ValueError("mdqURL must be an https address without a trailing slash")
+    if refusalCacheSeconds <= 0:
+      raise ValueError("refusalCacheSeconds must be positive")
     self.name, self.mdqURL, self.fetcher = name, mdqURL, fetcher
     self.signingKey = publicKeyFromCertificate(signingCertificate)
-    self.maximumCacheSeconds, self.clock = maximumCacheSeconds, clock
+    self.maximumCacheSeconds, self.refusalCacheSeconds, self.clock = maximumCacheSeconds, refusalCacheSeconds, clock
     self._cache: dict[str, tuple[float, Institution]] = {}
+    self._refusals: dict[str, tuple[float, str]] = {}
 
   def institution(self, entityID: str) -> Institution:
+    """The institution of this entity ID, cached or fetched; a refusal is remembered for refusalCacheSeconds."""
+    if not entityID or len(entityID) > maximumEntityIDLength:
+      raise SAMLRefused(f"an entity ID is 1 to {maximumEntityIDLength} characters")
     now = self.clock()
     cached = self._cache.get(entityID)
     if cached is not None and cached[0] > now:
       return cached[1]
+    refused = self._refusals.get(entityID)
+    if refused is not None and refused[0] > now:
+      raise SAMLRefused(refused[1])
     address = f"{self.mdqURL}/entities/{urllib.parse.quote(entityID, safe='')}"
-    institution = self.read(self.fetcher.getBytes(address, metadataMediaType), entityID)
+    try:
+      try:
+        metadata = self.fetcher.getBytes(address, metadataMediaType)
+      except HTTPFailure as error:
+        raise SAMLRefused(f"{self.name}'s metadata for {entityID} could not be fetched: {error}") from None
+      institution = self.read(metadata, entityID)
+    except SAMLRefused as refusal:
+      self._remember(entityID, str(refusal), now)
+      raise
+    self._refusals.pop(entityID, None)
     self._cache[entityID] = (min(institution.validUntil, now + self.maximumCacheSeconds), institution)
     return institution
+
+  def _remember(self, entityID: str, refusal: str, now: float) -> None:
+    if len(self._refusals) >= maximumRefusals:
+      self._refusals = {known: entry for known, entry in self._refusals.items() if entry[0] > now}
+    while len(self._refusals) >= maximumRefusals:
+      del self._refusals[next(iter(self._refusals))]
+    self._refusals[entityID] = (now + self.refusalCacheSeconds, refusal)
 
   def read(self, metadata: bytes, entityID: str) -> Institution:
     """One entity's signed metadata, as the MDQ service answers it, checked."""
@@ -144,7 +182,10 @@ class Federation:
       raise SAMLRefused(f"{self.name}'s metadata for {entityID} is refused: {error}") from None
     if root.attribute("entityID") != entityID:
       raise SAMLRefused(f"{self.name} answered for {root.attribute('entityID')!r}, not {entityID!r}")
-    institution = _institution(root, self.name)
+    try:
+      institution = _institution(root, self.name, _time(root.attribute("validUntil"), "the metadata's validUntil"))
+    except XMLRefused as error:
+      raise SAMLRefused(f"{self.name}'s metadata for {entityID} is refused: {error}") from None
     if institution.validUntil <= self.clock():
       raise SAMLRefused(f"{self.name}'s metadata for {entityID} expired")
     return institution
@@ -173,41 +214,11 @@ def scopedIdentifier(identity: SAMLIdentity, institution: Institution, attribute
 def serviceProviderMetadata(entityID: str, assertionConsumerURL: str, displayNames: dict[str, str],
                             informationURL: str, privacyStatementURL: str, organizationName: str,
                             technicalContact: str, securityContact: str | None = None,
-                            entityCategories: tuple[str, ...] = (researchAndScholarship,)) -> bytes:
-  """The service provider's metadata for its federation to register: unsigned (the federation signs what it publishes)."""
-  for address in (assertionConsumerURL, informationURL, privacyStatementURL):
-    if not address.startswith("https://"):
-      raise ValueError(f"{address} must be an https address")
-  for contact in (technicalContact, securityContact):
-    if contact is not None and not re.match(r"^[^@\s]+@[^@\s]+$", contact):
-      raise ValueError(f"{contact} is not an e-mail address")
-  names = "".join(f'<mdui:DisplayName xml:lang="{_attribute(language)}">{_attribute(text)}</mdui:DisplayName>'
-                  for language, text in sorted(displayNames.items()))
-  categories = "".join(f"<saml:AttributeValue>{_attribute(category)}</saml:AttributeValue>" for category in entityCategories)
-  security = ""
-  if securityContact is not None:
-    security = (f'<md:ContactPerson contactType="other" xmlns:remd="http://refeds.org/metadata" '
-                f'remd:contactType="http://refeds.org/metadata/contactType/security">'
-                f"<md:EmailAddress>mailto:{_attribute(securityContact)}</md:EmailAddress></md:ContactPerson>")
-  document = (
-    f'<md:EntityDescriptor xmlns:md="{metadataNamespace}" xmlns:saml="{assertionNamespace}" '
-    f'xmlns:mdui="{uiNamespace}" xmlns:mdattr="{entityAttributeNamespace}" entityID="{_attribute(entityID)}">'
-    + (f'<md:Extensions><mdattr:EntityAttributes><saml:Attribute Name="{entityCategory}" '
-       f'NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">{categories}</saml:Attribute>'
-       f"</mdattr:EntityAttributes></md:Extensions>" if entityCategories else "")
-    + '<md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol" '
-      'AuthnRequestsSigned="false" WantAssertionsSigned="true">'
-      f"<md:Extensions><mdui:UIInfo>{names}"
-      f'<mdui:InformationURL xml:lang="en">{_attribute(informationURL)}</mdui:InformationURL>'
-      f'<mdui:PrivacyStatementURL xml:lang="en">{_attribute(privacyStatementURL)}</mdui:PrivacyStatementURL>'
-      "</mdui:UIInfo></md:Extensions>"
-      f'<md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
-      f'Location="{_attribute(assertionConsumerURL)}" index="0" isDefault="true"/>'
-      "</md:SPSSODescriptor>"
-      f'<md:Organization><md:OrganizationName xml:lang="en">{_attribute(organizationName)}</md:OrganizationName>'
-      f'<md:OrganizationDisplayName xml:lang="en">{_attribute(organizationName)}</md:OrganizationDisplayName>'
-      f'<md:OrganizationURL xml:lang="en">{_attribute(informationURL)}</md:OrganizationURL></md:Organization>'
-      f'<md:ContactPerson contactType="technical"><md:EmailAddress>mailto:{_attribute(technicalContact)}'
-      f"</md:EmailAddress></md:ContactPerson>{security}</md:EntityDescriptor>"
-  )
-  return document.encode("utf-8")
+                            entityCategories: tuple[str, ...] = (researchAndScholarship,),
+                            signingCertificate: bytes | None = None, encryptionCertificates: tuple[bytes, ...] = (),
+                            encryptionPolicy: EncryptionPolicy = EncryptionPolicy(),
+                            singleLogoutURL: str | None = None) -> bytes:
+  """The service provider's metadata for its federation to register, with everything federations ask for."""
+  return samlServiceProviderMetadata(entityID, assertionConsumerURL, displayNames, informationURL, privacyStatementURL,
+                                     organizationName, technicalContact, securityContact, entityCategories,
+                                     signingCertificate, encryptionCertificates, encryptionPolicy, singleLogoutURL)

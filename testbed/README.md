@@ -5,13 +5,18 @@ Real identity providers for the integration tests, defined once and used two way
 and a development host can keep them running.
 
 - **Keycloak** over HTTPS on port 8443: OpenID Connect and SAML 2.0, with one realm loaded
-  from the dataset.
+  from the dataset. Besides SAML clients that sign responses or assertions, it has clients
+  that use the service provider's own keys, which `prepare.py` makes: one encrypts
+  assertions with AES-256-GCM and RSA-OAEP, one with AES-128-CBC under a signed response,
+  one requires signed requests, and two log out by the Redirect binding.
 - **A research federation** of one institution: an MDQ service on port 8444 serving
   Keycloak's metadata with its scope and names, signed by the testbed federation's key, as
   InCommon's MDQ serves its members'. Keycloak signs with a realm key `prepare.py` makes,
   and sends each user's scoped `subject-id`.
 - **Apereo CAS** 8 over HTTPS on port 8445, with the dataset's users and their attributes
   (mail, displayName, memberOf) released to the one service it serves.
+- **OpenLDAP** on 1389 (StartTLS) and 1636 (LDAPS), from Debian's packages: the dataset's
+  people, nested `groupOfNames`, and the disabled account locked by the password policy.
 - **Samba Active Directory** (the compose profile `directory`) on 389 (StartTLS) and 636
   (LDAPS). It needs a privileged container, so it runs on Docker in a VM or on a CI runner,
   not inside an unprivileged LXC container.
