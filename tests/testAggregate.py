@@ -43,7 +43,7 @@ def streamed(data, prefixes=(), leaveOutFirstChild=False, chunkSize=7):
     if leaveOutFirstChild and not pieces:
       holder["stream"].canonicalize(pieces.append, prefixes, leaveOut=child)
 
-  stream = holder["stream"] = DocumentStream(onRoot, onChild, len(data))
+  stream = holder["stream"] = DocumentStream(onRoot, onChild, len(data), 10**8)
   for offset in range(0, len(data), chunkSize):
     stream.feed(data[offset:offset + chunkSize])
   stream.close()
@@ -136,7 +136,7 @@ def testAnyDocumentStreamsToItsTreesCanonicalForm(document, chunkSize, prefixes)
 
 def testTheStreamKeepsNoChildrenOnItsDocumentElement():
   seen = []
-  stream = DocumentStream(lambda root: None, seen.append, 1000)
+  stream = DocumentStream(lambda root: None, seen.append, 1000, 10**8)
   stream.feed(b"<r>x<a><b/>t</a><c/></r>")
   stream.close()
   assert stream.root.children == [] and [child.qualifiedName for child in seen] == ["a", "c"]
@@ -152,7 +152,7 @@ def testTheStreamKeepsNoChildrenOnItsDocumentElement():
   (b"<r><a></b></r>", "not well-formed"),
 ])
 def testTheStreamRefusesWhatParseRefuses(data, why):
-  stream = DocumentStream(lambda root: None, lambda child: None, 1000 if b" " * 2000 in data else 10**7)
+  stream = DocumentStream(lambda root: None, lambda child: None, 1000 if b" " * 2000 in data else 10**7, 10**8)
   with pytest.raises(XMLRefused, match=why):
     stream.feed(data)
     stream.close()
@@ -178,8 +178,8 @@ def identityProvider(number, scopes=None, validUntil=None):
           f'Location="https://idp{number}.example.edu/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>')
 
 
-def serviceProvider(number):
-  return (f'<md:EntityDescriptor entityID="https://sp{number}.example.org/sp"><md:SPSSODescriptor '
+def serviceProvider(number, padding=0):
+  return (f'<md:EntityDescriptor entityID="https://sp{number}.example.org/sp">{" " * padding}<md:SPSSODescriptor '
           'protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:AssertionConsumerService '
           'Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
           f'Location="https://sp{number}.example.org/acs" index="0"/></md:SPSSODescriptor></md:EntityDescriptor>')
@@ -199,8 +199,12 @@ def signed(text, key=federationKey, reference="#aggregate"):
     root, key=key, reference_uri=reference, always_add_key_value=False))
 
 
+def chunked(document, size=4096):
+  return (document[offset:offset + size] for offset in range(0, len(document), size))
+
+
 def read(document, clock=lambda: now, **options):
-  return readAggregate(document, federationCertificate, "Example", clock=clock, **options)
+  return readAggregate(chunked(document), federationCertificate, "Example", clock=clock, **options)
 
 
 members = [identityProvider(1), serviceProvider(1), identityProvider(2), identityProvider(3, scopes=""),
@@ -322,13 +326,41 @@ def testTheBudgetsAreRefusedByName():
     read(document, maximumEntities=19)
   with pytest.raises(SAMLRefused, match=f"the XML is larger than {len(document) - 1} bytes"):
     read(document, maximumBytes=len(document) - 1)
+  with pytest.raises(SAMLRefused, match="the canonical form is longer than 1000 bytes"):
+    read(document, maximumCanonicalBytes=1000)
   assert read(document, maximumEntities=20, maximumBytes=len(document)).institutions == {}
 
 
-def testChunksAreReadLikeTheWholeDocument():
+def testAnyChunkSizeReadsTheSame():
   document = signed(aggregate(members))
-  chunks = (document[offset:offset + 333] for offset in range(0, len(document), 333))
-  assert sorted(read(chunks).institutions) == sorted(read(document).institutions)
+  expected = sorted(read(document).institutions)
+  for size in (1, 333, len(document)):
+    assert sorted(readAggregate(chunked(document, size), federationCertificate, "Example", clock=lambda: now).institutions) == expected
+
+
+def testOneBytesObjectIsRefusedByName():
+  with pytest.raises(TypeError, match="readAggregate reads an iterable of byte chunks, not one bytes object"):
+    readAggregate(signed(aggregate(members)), federationCertificate, "Example", clock=lambda: now)
+
+
+def testDataBeforeTheSignatureIsBounded():
+  document = signed(aggregate(members[:2]))
+  start = document.index(b"<ds:Signature")
+  spaced = document[:start] + b" " * 70_000 + document[start:]
+  with pytest.raises(SAMLRefused, match="more than 65536 characters come before the canonical form starts"):
+    read(spaced, maximumBytes=10**7)
+  instructions = document[:start] + b"<?pi?>" * 65 + document[start:]
+  with pytest.raises(SAMLRefused, match="more than 64 nodes come before the canonical form starts"):
+    read(instructions)
+
+
+@pytest.mark.parametrize("order", ["identity provider first", "service provider first"])
+def testAServiceProviderSharingAnIdentityProvidersEntityIDLeavesItOut(order):
+  impostor = serviceProvider(1).replace("https://sp1.example.org/sp", "https://idp1.example.edu/idp")
+  entities = [identityProvider(1), impostor] if order == "identity provider first" else [impostor, identityProvider(1)]
+  source = read(signed(aggregate([*entities, identityProvider(2)])))
+  assert sorted(source.institutions) == ["https://idp2.example.edu/idp"]
+  assert source.skipped == (("https://idp1.example.edu/idp", "it appears more than once in the aggregate"),)
 
 
 class Recorded:
@@ -348,7 +380,7 @@ def testAnAggregateIsFetched():
   assert fetcher.asked == [("https://federation.example.org/aggregate.xml", "application/samlmetadata+xml")]
 
 
-# ---- memory follows the largest entity, not the document ------------------------------
+# ---- memory follows the largest entity and the entity IDs, not the document -----------
 
 def peakWhileReading(document):
   tracemalloc.start()
@@ -360,13 +392,13 @@ def peakWhileReading(document):
 
 
 def testMemoryFollowsTheLargestEntityNotTheDocument():
-  small = signed(aggregate([identityProvider(1)] + [serviceProvider(number) for number in range(1000)]))
-  large = signed(aggregate([identityProvider(1)] + [serviceProvider(number) for number in range(8000)]))
+  small = signed(aggregate([identityProvider(1)] + [serviceProvider(number, 4000) for number in range(500)]))
+  large = signed(aggregate([identityProvider(1)] + [serviceProvider(number, 4000) for number in range(2000)]))
   smallPeak, _ = peakWhileReading(small)
   largePeak, source = peakWhileReading(large)
-  assert list(source.institutions) == ["https://idp1.example.edu/idp"] and len(large) > 1_900_000
-  assert largePeak < len(large) / 3
-  assert largePeak < smallPeak * 1.5
+  assert list(source.institutions) == ["https://idp1.example.edu/idp"] and len(large) > 8_000_000
+  assert largePeak < len(large) / 8
+  assert largePeak - smallPeak < (len(large) - len(small)) / 8
 
 
 # ---- eduGAIN's real aggregate -----------------------------------------------------
@@ -394,11 +426,11 @@ def eduGAIN(request):
   document = Fetcher(secureContext(), timeoutSeconds=600, maximumBytes=256 * 1024 * 1024).getBytes(
     eduGAINAggregate, "application/samlmetadata+xml")
   started = time.perf_counter()
-  readAggregate(document, certificate, "eduGAIN")
+  readAggregate(chunked(document, 1 << 16), certificate, "eduGAIN")
   readOnly = time.perf_counter() - started
   tracemalloc.start()
   try:
-    readAggregate(document, certificate, "eduGAIN")
+    readAggregate(chunked(document, 1 << 16), certificate, "eduGAIN")
     peak = tracemalloc.get_traced_memory()[1]
   finally:
     tracemalloc.stop()

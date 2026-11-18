@@ -6,7 +6,7 @@ Breadth is where XML signature attacks live, so only one shape is accepted: one
 '#' and that element's ID, an ID no other element in the document carries; exactly the
 transforms enveloped-signature then Exclusive Canonicalization; exclusive canonicalization
 for <ds:SignedInfo>; SHA-256/384/512 digests; RSA (PKCS #1 v1.5 or PSS) or ECDSA. SHA-1,
-other transforms, other canonicalizations and empty or external URIs are refused by name.
+other transforms, other canonicalizations and missing, empty or external URIs are refused by name.
 <ds:KeyInfo> is never trusted: the signature must verify with a key the caller already
 trusts (the identity provider's, from its metadata). On success the very element that was
 verified is returned, so the caller reads nothing that the signature did not cover.
@@ -20,13 +20,12 @@ removes comments before any transform runs, so it canonicalizes exactly as witho
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import hmac
 from dataclasses import dataclass
 
 from carnelian.signatures import ECPublicKey, RSAPublicKey, SignatureError
-from carnelian.xmlTree import Element, XMLRefused, canonical
+from carnelian.xmlTree import Element, XMLRefused, canonical, writeCanonical
 
 dsig = "http://www.w3.org/2000/09/xmldsig#"
 exclusiveC14N = "http://www.w3.org/2001/10/xml-exc-c14n#"
@@ -72,7 +71,7 @@ def _algorithm(element: Element) -> str:
 def _base64(text: str) -> bytes:
   try:
     return base64.b64decode("".join(text.split()), validate=True)
-  except binascii.Error:
+  except ValueError:
     raise SignatureRefused("a signature or digest value is not base64") from None
 
 
@@ -121,7 +120,10 @@ def signatureShape(signature: Element, canonicalizations: tuple[str, ...] = (exc
     digestMethod = _algorithm(reference.only(dsig, "DigestMethod"))
     if digestMethod not in _digests:
       raise SignatureRefused(f"digest method {digestMethod} is not supported")
-    return SignatureShape(referenceURI=reference.attribute("URI") or "", digestName=_digests[digestMethod],
+    referenceURI = reference.attribute("URI")
+    if referenceURI is None:
+      raise SignatureRefused("the Reference has no URI; a same-document URI is required")
+    return SignatureShape(referenceURI=referenceURI, digestName=_digests[digestMethod],
                           inclusivePrefixes=_inclusivePrefixes(transforms[1]),
                           digestValue=_base64(reference.only(dsig, "DigestValue").text),
                           signedInfo=canonical(signedInfo, _inclusivePrefixes(method)),
@@ -129,6 +131,8 @@ def signatureShape(signature: Element, canonicalizations: tuple[str, ...] = (exc
                           signatureMethod=signatureMethod)
   except XMLRefused as error:
     raise SignatureRefused(str(error)) from None
+
+
 def checkDigest(shape: SignatureShape, digest: bytes) -> None:
   if not hmac.compare_digest(digest, shape.digestValue):
     raise SignatureRefused("the signed element's digest does not match: it was changed after signing")
@@ -179,13 +183,16 @@ def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKe
   identifier = signed.attribute("ID")
   if not identifier or shape.referenceURI != f"#{identifier}":
     raise SignatureRefused(f"the reference {shape.referenceURI!r} is not to the signed element's ID {identifier!r}")
-  carriers = [element for element in [_documentRoot(signed), *_documentRoot(signed).descendants()]
-              if any(local == "ID" and value == identifier for _, local, _, value in element.plainAttributes())]
-  if len(carriers) != 1:
-    raise SignatureRefused(f"{len(carriers)} elements carry ID {identifier!r}; it must be exactly one")
+  root = _documentRoot(signed)
+  carriers = sum(1 for element in [root, *root.descendants()]
+                 if any(local == "ID" and value == identifier for _, local, _, value in element.plainAttributes()))
+  if carriers != 1:
+    raise SignatureRefused(f"{carriers} elements carry ID {identifier!r}; it must be exactly one")
+  digest = hashlib.new(shape.digestName)
   try:
-    checkDigest(shape, hashlib.new(shape.digestName, canonical(signed, shape.inclusivePrefixes, leaveOut=signature)).digest())
+    writeCanonical(signed, digest.update, shape.inclusivePrefixes, leaveOut=signature)
   except XMLRefused as error:
     raise SignatureRefused(str(error)) from None
+  checkDigest(shape, digest.digest())
   checkSignatureValue(shape, trustedKeys)
   return signed

@@ -17,9 +17,10 @@ from carnelian.jose import JOSEError, KeySet, readHeader, verifyCompact
 from carnelian.ldap import DirectoryRefused, readAll, readTLV
 from carnelian.saml import SAMLRefused
 from carnelian.scim import SCIMRefused, SCIMService, parseFilter
-from carnelian.signatures import SignatureError
+from carnelian import xmlTree
+from carnelian.signatures import RSAPublicKey, SignatureError
 from carnelian.xmldsig import SignatureRefused, verifyEnveloped
-from carnelian.xmlTree import XMLRefused, parse
+from carnelian.xmlTree import DocumentStream, XMLRefused, parse, writeCanonical
 
 from testOIDC import good, idToken, jwks, now, party
 from testSAML import pending, posted, provider, response, signAssertion
@@ -30,6 +31,7 @@ settings.register_profile("quick", max_examples=300, deadline=None, suppress_hea
 settings.register_profile("deep", max_examples=20_000, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 settings.load_profile(os.environ.get("CARNELIAN_FUZZ", "quick"))
 fuzzed = settings()
+heavy = settings(fuzzed, max_examples=max(fuzzed.max_examples // 10, 10))
 xmlish = strategies.text(alphabet=strategies.sampled_from(list("<>/=\"' :!?-[]&;#xmlnsabcdeSAMLAssertion\n")), max_size=300)
 
 
@@ -57,6 +59,60 @@ def testXMLRefusesByName(data):
     verifyEnveloped(root, [])
   except (SignatureRefused, XMLRefused):
     pass
+
+
+junkSignature = (
+  "<ds:Signature xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><ds:SignedInfo>"
+  "<ds:CanonicalizationMethod Algorithm='http://www.w3.org/2001/10/xml-exc-c14n#'/>"
+  "<ds:SignatureMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#rsa-sha256'/><ds:Reference URI='#r'><ds:Transforms>"
+  "<ds:Transform Algorithm='http://www.w3.org/2000/09/xmldsig#enveloped-signature'/>"
+  "<ds:Transform Algorithm='http://www.w3.org/2001/10/xml-exc-c14n#'/></ds:Transforms>"
+  "<ds:DigestMethod Algorithm='http://www.w3.org/2001/04/xmlenc#sha256'/><ds:DigestValue>AAAA</ds:DigestValue>"
+  "</ds:Reference></ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>")
+anyKey = RSAPublicKey(3 * 2**2047 + 1, 65537)
+
+
+@heavy
+@given(strategies.integers(min_value=1, max_value=70), strategies.integers(min_value=1, max_value=400),
+       strategies.integers(min_value=0, max_value=66), strategies.integers(min_value=1, max_value=4))
+def testDeepWideNamespacedXMLIsRefusedOrVerifiedQuickly(depth, leaves, attributesEach, namespaces):
+  declarations = " ".join(f"xmlns:n{index}='urn:n{index}'" for index in range(namespaces))
+  attributes = " ".join(f"n{index % namespaces}:a{index}=''" for index in range(attributesEach))
+  document = (f"<r {declarations} ID='r'>{junkSignature}" + "<e>" * depth + f"<e {attributes}/>" * leaves
+              + "</e>" * depth + "</r>").encode()
+  started = time.process_time()
+  try:
+    verifyEnveloped(parse(document), [anyKey])
+    raise AssertionError("a junk signature verified")
+  except (XMLRefused, SignatureRefused):
+    pass
+  assert time.process_time() - started < 2.0
+
+
+@heavy
+@given(strategies.integers(min_value=0, max_value=1100), strategies.integers(min_value=1, max_value=9000),
+       strategies.integers(min_value=1, max_value=3))
+def testLongNamespaceNamesBoundTheCanonicalForm(uriLength, siblings, prefixes):
+  declarations = " ".join(f'xmlns:p{index}="urn:{index}{"x" * uriLength}"' for index in range(prefixes))
+  document = f"<r {declarations}>".encode() + b"".join(b"<p%d:e/>" % (index % prefixes) for index in range(siblings)) + b"</r>"
+  started = time.process_time()
+  try:
+    treeSegments: list[bytes] = []
+    writeCanonical(parse(document), treeSegments.append)
+  except XMLRefused:
+    treeSegments = []
+  try:
+    streamSegments: list[bytes] = []
+    stream = DocumentStream(lambda root: stream.canonicalize(streamSegments.append), lambda child: None, len(document),
+                            xmlTree.maximumCanonicalBytes)
+    stream.feed(document)
+    stream.close()
+  except XMLRefused:
+    streamSegments = []
+  assert b"".join(treeSegments) == b"".join(streamSegments)
+  assert sum(len(segment) for segment in treeSegments) <= xmlTree.maximumCanonicalBytes
+  assert all(len(segment) < 70_000 for segment in treeSegments + streamSegments)
+  assert time.process_time() - started < 2.0
 
 
 def testDeepXMLIsRefusedByName():

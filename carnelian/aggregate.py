@@ -4,7 +4,9 @@
 An aggregate (eduGAIN's is about 95 MB, with thousands of identity providers) is too large
 for a tree, so it is read in one pass: each EntityDescriptor is built as a small tree,
 read, and dropped, while the document's exclusive canonical form is hashed as it goes by.
-Memory follows the largest single entity, not the document.
+`readAggregate` takes the document as an iterable of chunks, so its memory follows the
+largest single entity, not the document. `fetchAggregate` downloads the whole body first,
+so its memory follows the document's size.
 
 Only one shape is accepted: an md:EntitiesDescriptor whose first child element is its
 enveloped ds:Signature, whose one Reference names the EntitiesDescriptor's ID (or is "",
@@ -16,9 +18,10 @@ refused by name). No element but the EntitiesDescriptor may carry its ID.
 Each entity with an IDPSSODescriptor is read as `Federation.read` reads one from MDQ (scopes,
 display names, registration authority, entity categories, identity provider); its validity
 is the aggregate's validUntil or its own, whichever is earlier. An entity that fails those
-checks, has expired, or appears twice is left out and listed in `Aggregate.skipped` with
-the reason; entities without an IDPSSODescriptor (service providers) are passed over. The
-institutions are returned only once the signature has verified over the whole document.
+checks, has expired, or shares its entityID with any other entity (a service provider's
+too) is left out and listed in `Aggregate.skipped` with the reason; entities without an
+IDPSSODescriptor (service providers) are passed over. The institutions are returned only
+once the signature has verified over the whole document.
 """
 
 from __future__ import annotations
@@ -59,15 +62,16 @@ class Aggregate:
 
 class _Reader:
   def __init__(self, name: str, signingKey: RSAPublicKey | ECPublicKey, clock: Callable[[], float], maximumBytes: int,
-               maximumEntities: int) -> None:
+               maximumCanonicalBytes: int, maximumEntities: int) -> None:
     self.name, self.signingKey, self.clock, self.maximumEntities = name, signingKey, clock, maximumEntities
-    self.stream = DocumentStream(self.root, self.child, maximumBytes)
+    self.stream = DocumentStream(self.root, self.child, maximumBytes, maximumCanonicalBytes)
     self.identifier: str | None = None
     self.validUntil = 0.0
     self.shape: SignatureShape | None = None
     self.digest: hashlib._Hash | None = None
     self.entityCount = 0
     self.seen: set[str] = set()
+    self.duplicated: set[str] = set()
     self.institutions: dict[str, Institution] = {}
     self.skipped: list[tuple[str, str]] = []
 
@@ -110,14 +114,16 @@ class _Reader:
     self.entityCount += 1
     if self.entityCount > self.maximumEntities:
       raise SAMLRefused(f"it has more than {self.maximumEntities} entities")
-    if not entity.childrenNamed(metadataNamespace, "IDPSSODescriptor"):
-      return
     entityID = entity.attribute("entityID") or ""
     if entityID in self.seen:
-      self.institutions.pop(entityID, None)
-      self.skipped.append((entityID, "it appears more than once in the aggregate"))
+      if entityID not in self.duplicated:
+        self.duplicated.add(entityID)
+        self.institutions.pop(entityID, None)
+        self.skipped.append((entityID, "it appears more than once in the aggregate"))
       return
     self.seen.add(entityID)
+    if not entity.childrenNamed(metadataNamespace, "IDPSSODescriptor"):
+      return
     try:
       own = entity.attribute("validUntil")
       validUntil = self.validUntil if own is None else min(self.validUntil, _time(own, "its validUntil"))
@@ -136,13 +142,14 @@ class _Reader:
     return Aggregate(self.name, self.validUntil, self.institutions, tuple(self.skipped), self.clock)
 
 
-def readAggregate(document: bytes | Iterable[bytes], signingCertificate: str | bytes, name: str,
+def readAggregate(chunks: Iterable[bytes], signingCertificate: str | bytes, name: str,
                   clock: Callable[[], float] = time.time, maximumBytes: int = 256 * 1024 * 1024,
-                  maximumEntities: int = 100_000) -> Aggregate:
-  """A federation's signed aggregate (its bytes, or an iterable of chunks), checked against its signing certificate."""
-  reader = _Reader(name, publicKeyFromCertificate(signingCertificate), clock, maximumBytes, maximumEntities)
-  chunks = ((document[offset:offset + _chunkBytes] for offset in range(0, len(document), _chunkBytes))
-            if isinstance(document, bytes) else document)
+                  maximumCanonicalBytes: int = 512 * 1024 * 1024, maximumEntities: int = 100_000) -> Aggregate:
+  """A federation's signed aggregate, read from an iterable of byte chunks, checked against its signing certificate."""
+  if isinstance(chunks, (bytes, bytearray, memoryview)):
+    raise TypeError("readAggregate reads an iterable of byte chunks, not one bytes object")
+  reader = _Reader(name, publicKeyFromCertificate(signingCertificate), clock, maximumBytes, maximumCanonicalBytes,
+                   maximumEntities)
   try:
     for chunk in chunks:
       reader.stream.feed(chunk)
@@ -153,7 +160,11 @@ def readAggregate(document: bytes | Iterable[bytes], signingCertificate: str | b
 
 def fetchAggregate(url: str, signingCertificate: str | bytes, fetcher: DocumentFetcher, name: str,
                    clock: Callable[[], float] = time.time, maximumBytes: int = 256 * 1024 * 1024,
-                   maximumEntities: int = 100_000) -> Aggregate:
-  """The aggregate at an https address, fetched and read; the fetcher's own maximumBytes must allow its size."""
-  return readAggregate(fetcher.getBytes(url, metadataMediaType), signingCertificate, name, clock, maximumBytes,
-                       maximumEntities)
+                   maximumCanonicalBytes: int = 512 * 1024 * 1024, maximumEntities: int = 100_000) -> Aggregate:
+  """The aggregate at an https address, downloaded whole (held in memory at once) and then read.
+
+  The fetcher's own maximumBytes must allow its size.
+  """
+  document = fetcher.getBytes(url, metadataMediaType)
+  return readAggregate((document[offset:offset + _chunkBytes] for offset in range(0, len(document), _chunkBytes)),
+                       signingCertificate, name, clock, maximumBytes, maximumCanonicalBytes, maximumEntities)
