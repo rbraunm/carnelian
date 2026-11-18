@@ -12,6 +12,8 @@ and a development host can keep them running.
   and sends each user's scoped `subject-id`.
 - **Apereo CAS** 8 over HTTPS on port 8445, with the dataset's users and their attributes
   (mail, displayName, memberOf) released to the one service it serves.
+- **OpenLDAP** on 1389 (StartTLS) and 1636 (LDAPS), from Debian's packages: the dataset's
+  people, nested `groupOfNames`, and the disabled account locked by the password policy.
 - **Samba Active Directory** (the compose profile `directory`) on 389 (StartTLS) and 636
   (LDAPS). It needs a privileged container, so it runs on Docker in a VM or on a CI runner,
   not inside an unprivileged LXC container.

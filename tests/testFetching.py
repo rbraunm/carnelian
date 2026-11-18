@@ -189,3 +189,16 @@ def testStrictJSONKeepsOrdinaryNumbers():
   assert parseJSON('{"a": 1, "b": 2.5, "c": -1e3}') == {"a": 1, "b": 2.5, "c": -1000.0}
   with pytest.raises(ValueError, match="Infinity is not a JSON number"):
     parseJSON('{"a": Infinity}')
+
+
+def headersThenLaterTheBody(tls):
+  body = b"<EntityDescriptor/>" * 200
+  tls.sendall(b"HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Length: %d\r\n\r\n" % len(body))
+  time.sleep(0.3)
+  tls.sendall(body)
+
+
+def testABodyThatComesAfterTheHeadersOfAClosingAnswerIsRead(certificates, serve):
+  port = serve(headersThenLaterTheBody)
+  assert fetcher(certificates).getBytes(f"https://localhost:{port}/entities/x", "application/samlmetadata+xml") == (
+    b"<EntityDescriptor/>" * 200)

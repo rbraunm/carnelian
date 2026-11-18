@@ -112,6 +112,8 @@ class _DeadlineTLS:
     self._socket = socket.create_connection((host, port), timeout=self._remaining())
     self._incoming, self._outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
     self._tls = context.wrap_bio(self._incoming, self._outgoing, server_hostname=host)
+    self._readers = 0
+    self._closing = False
     self._drive(self._tls.do_handshake)
 
   def _remaining(self) -> float:
@@ -152,10 +154,20 @@ class _DeadlineTLS:
       return b""
 
   def makefile(self, mode: str) -> io.BufferedReader:
+    self._readers += 1
     return io.BufferedReader(_DeadlineReader(self))
 
+  # http.client closes the connection as soon as a response that ends the connection has its headers, and reads
+  # the body through the file it made; like a socket's, that file keeps the connection open until it is closed.
   def close(self) -> None:
-    self._socket.close()
+    self._closing = True
+    if self._readers == 0:
+      self._socket.close()
+
+  def release(self) -> None:
+    self._readers -= 1
+    if self._closing and self._readers == 0:
+      self._socket.close()
 
 
 class _DeadlineReader(io.RawIOBase):
@@ -165,6 +177,11 @@ class _DeadlineReader(io.RawIOBase):
 
   def readable(self) -> bool:
     return True
+
+  def close(self) -> None:
+    if not self.closed:
+      self._connection.release()
+    super().close()
 
   def readinto(self, buffer: Buffer) -> int:
     with memoryview(buffer) as view:

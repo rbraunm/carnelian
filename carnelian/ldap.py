@@ -31,8 +31,9 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass
+from enum import Enum
 
-__all__ = ["DirectoryRefused", "Directory", "DirectoryIdentity"]
+__all__ = ["DirectoryRefused", "Directory", "DirectoryKind", "DirectoryIdentity"]
 
 maximumMessageBytes = 4_000_000
 maximumOperationBytes = 16_000_000
@@ -361,12 +362,12 @@ class Connection:
       raise DirectoryRefused("the directory did not answer the bind")
     checkResult(result, "bind", frozenset({0x87}))
 
-  def search(self, base: str, query: Filter, attributes: tuple[str, ...]) -> list[Entry]:
+  def search(self, base: str, query: Filter, attributes: tuple[str, ...], oneLevel: bool = False) -> list[Entry]:
     """Subtree search; refused past maximumEntries entries, at a search reference, or past the budgets."""
     self._begin()
     messageID = self._nextID
     self._send(self._message(sequence(
-      octets(base), integer(2, 0x0A), integer(0, 0x0A), integer(maximumEntries), integer(int(maximumOperationSeconds)),
+      octets(base), integer(1 if oneLevel else 2, 0x0A), integer(0, 0x0A), integer(maximumEntries), integer(int(maximumOperationSeconds)),
       boolean(False), query.encoded(), sequence(*(octets(attribute) for attribute in attributes)), tag=0x63),
       sequence(sequence(octets(domainScopeControl)), tag=0xA0)))
     entries: list[Entry] = []
@@ -415,14 +416,29 @@ def _required(entry: Entry, name: str, owner: str) -> str:
   return value
 
 
+class DirectoryKind(Enum):
+  """How a directory keeps people and groups."""
+
+  activeDirectory = "activeDirectory"  # user objects, userAccountControl, in-chain groups named by sAMAccountName
+  openLDAP = "openLDAP"                # inetOrgPerson, groupOfNames in one container named by cn, password policy
+
+
+maximumGroupNesting = 16
+
+
 class Directory:
-  """Sign-in against Active Directory."""
+  """Sign-in against Active Directory (the default) or OpenLDAP."""
 
   def __init__(self, host: str, context: ssl.SSLContext, baseDN: str, serviceName: str, servicePassword: str,
-               port: int = 636, startTLS: bool = False, userAttribute: str = "sAMAccountName", timeoutSeconds: float = 10.0):
+               port: int = 636, startTLS: bool = False, userAttribute: str | None = None, timeoutSeconds: float = 10.0,
+               kind: DirectoryKind = DirectoryKind.activeDirectory, groupsBaseDN: str | None = None):
     _requireVerification(context)
+    if (kind is DirectoryKind.openLDAP) != (groupsBaseDN is not None):
+      raise ValueError("an OpenLDAP directory needs groupsBaseDN, the one container its groups are in; "
+                       "Active Directory takes none")
     self.host, self.port, self.context, self.startTLS = host, port, context, startTLS
-    self.baseDN, self.userAttribute, self.timeoutSeconds = baseDN, userAttribute, timeoutSeconds
+    self.kind, self.baseDN, self.groupsBaseDN, self.timeoutSeconds = kind, baseDN, groupsBaseDN, timeoutSeconds
+    self.userAttribute = userAttribute or ("sAMAccountName" if kind is DirectoryKind.activeDirectory else "uid")
     self._serviceName, self._servicePassword = serviceName, servicePassword
 
   def _connect(self) -> Connection:
@@ -431,6 +447,8 @@ class Directory:
   def signIn(self, userName: str, password: str) -> DirectoryIdentity:
     if not password:
       raise DirectoryRefused("an empty password is refused: LDAP would take it for an anonymous bind")
+    if self.groupsBaseDN is not None:
+      return self._openLDAPSignIn(userName, password, self.groupsBaseDN)
     with self._connect() as service:
       service.bind(self._serviceName, self._servicePassword)
       found = service.search(
@@ -459,3 +477,40 @@ class Directory:
       displayName=_single(entry, "displayName"), email=_single(entry, "mail"),
       groups=tuple(sorted(_required(group, "sAMAccountName", "a group") for group in groups)),
     )
+
+  def _openLDAPSignIn(self, userName: str, password: str, groupsBaseDN: str) -> DirectoryIdentity:
+    with self._connect() as service:
+      service.bind(self._serviceName, self._servicePassword)
+      found = service.search(self.baseDN, All((Equal("objectClass", "inetOrgPerson"), Equal(self.userAttribute, userName))),
+                             ("displayName", "mail", self.userAttribute))
+      if len(found) != 1:
+        raise DirectoryRefused("the user name or the password is wrong")
+      entry = found[0]
+      if not entry.dn:
+        raise DirectoryRefused("the directory found the user under an empty DN")
+      # A disabled account is the password policy's to refuse: it locks the account, and the bind fails.
+      with self._connect() as person:
+        try:
+          person.bind(entry.dn, password)
+        except DirectoryRefused:
+          raise DirectoryRefused("the user name or the password is wrong") from None
+      names: set[str] = set()
+      seen: set[str] = set()
+      frontier = [entry.dn]
+      for _ in range(maximumGroupNesting):
+        reached = []
+        for member in frontier:
+          for group in service.search(groupsBaseDN, All((Equal("objectClass", "groupOfNames"), Equal("member", member))),
+                                      ("cn",), oneLevel=True):
+            if group.dn.lower() not in seen:
+              seen.add(group.dn.lower())
+              names.add(_required(group, "cn", "a group"))
+              reached.append(group.dn)
+        if not reached:
+          break
+        frontier = reached
+      else:
+        raise DirectoryRefused(f"the groups nest deeper than {maximumGroupNesting}")
+    return DirectoryIdentity(dn=entry.dn, userName=_required(entry, self.userAttribute, "the user"),
+                             displayName=_single(entry, "displayName"), email=_single(entry, "mail"),
+                             groups=tuple(sorted(names)))

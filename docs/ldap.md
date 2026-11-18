@@ -1,7 +1,7 @@
-# LDAP and Active Directory
+# LDAP: Active Directory and OpenLDAP
 
-Check a user name and password against a directory: Active Directory, Samba, or another
-LDAP server. Carnelian finds the person's entry with a service account, checks the
+Check a user name and password against a directory: Active Directory (or Samba), or
+OpenLDAP. Carnelian finds the person's entry with a service account, checks the
 password by binding as that entry on a separate connection, refuses a disabled Active
 Directory account, and returns the groups the person belongs to, nested ones included.
 Every connection is TLS: LDAPS, or StartTLS before anything else is said.
@@ -39,6 +39,22 @@ Only people are found (`objectCategory=person`), not computer accounts; searches
 Directory to stay in the domain (its domain-scope control), and any referral that still
 arrives is refused rather than followed or ignored. Every operation is bounded in time,
 bytes and entries.
+
+## OpenLDAP
+
+Pass `kind=DirectoryKind.openLDAP` and `groupsBaseDN`, the one container the groups are in:
+
+```python
+from carnelian.ldap import Directory, DirectoryKind
+
+directory = Directory("ldap.example.edu", secureContext(), "dc=example,dc=edu", "cn=service,ou=services,dc=example,dc=edu",
+                      servicePassword, kind=DirectoryKind.openLDAP, groupsBaseDN="ou=groups,dc=example,dc=edu")
+```
+
+People are `inetOrgPerson` entries found by `uid` (or the `userAttribute` you give); groups
+are `groupOfNames` in `groupsBaseDN`, named by `cn` (unique there), nested groups followed to
+a depth of 16. A disabled account is the server's password policy's to refuse: lock it
+(`pwdAccountLockedTime`) and the bind fails.
 
 ## What is refused
 

@@ -16,6 +16,7 @@ test extras installed (it uses `cryptography` to make the certificates).
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import shlex
 import socket
@@ -43,6 +44,9 @@ keycloakPort = 8443
 mdqPort = 8444
 casPort = 8445
 casServiceURL = "https://sp.carnelian.test/cas"
+openLDAPBase = "dc=carnelian,dc=test"
+openLDAPService = f"cn=service,ou=services,{openLDAPBase}"
+openLDAPPorts = (1389, 1636)
 federationScope = "carnelian.test"
 federationAuthority = "https://federation.carnelian.test"
 directoryRealm = "CARNELIAN.TEST"
@@ -252,6 +256,81 @@ def casFiles(secret: str, host: str, accounts: list[dict]) -> None:
   }, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def ldif(name: str, value: str) -> str:
+  """One LDIF line; a value that is not plain ASCII, or starts with a space, colon or '<', goes in base64."""
+  plain = value.isascii() and value.isprintable() and not value.startswith((" ", ":", "<"))
+  return f"{name}: {value}" if plain else f"{name}:: {base64.b64encode(value.encode('utf-8')).decode('ascii')}"
+
+
+def openLDAPFiles(secret: str, accounts: list[dict]) -> None:
+  """OpenLDAP's configuration and the dataset: people, nested groupOfNames in one container, a locked account."""
+  dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
+  folder = generated / "openldap"
+  folder.mkdir(parents=True, exist_ok=True)
+  (folder / "config.ldif").write_text("\n".join([
+    "dn: cn=config", "objectClass: olcGlobal", "cn: config",
+    "olcTLSCertificateFile: /etc/ldap/tls/server.crt", "olcTLSCertificateKeyFile: /etc/ldap/tls/server.key",
+    "olcTLSCACertificateFile: /etc/ldap/tls/ca.crt", "",
+    "dn: cn=module{0},cn=config", "objectClass: olcModuleList", "cn: module{0}", "olcModulePath: /usr/lib/ldap",
+    "olcModuleLoad: back_mdb", "olcModuleLoad: ppolicy", "",
+    "dn: cn=schema,cn=config", "objectClass: olcSchemaConfig", "cn: schema", "",
+    "include: file:///etc/ldap/schema/core.ldif", "",
+    "include: file:///etc/ldap/schema/cosine.ldif", "",
+    "include: file:///etc/ldap/schema/inetorgperson.ldif", "",
+    "dn: olcDatabase={-1}frontend,cn=config", "objectClass: olcDatabaseConfig", "objectClass: olcFrontendConfig",
+    "olcDatabase: {-1}frontend", "",
+    "dn: olcDatabase={0}config,cn=config", "objectClass: olcDatabaseConfig", "olcDatabase: {0}config",
+    "olcAccess: {0}to * by * none", "",
+    "dn: olcDatabase={1}mdb,cn=config", "objectClass: olcDatabaseConfig", "objectClass: olcMdbConfig",
+    "olcDatabase: {1}mdb", "olcDbDirectory: /var/lib/ldap", f"olcSuffix: {openLDAPBase}",
+    "olcDbIndex: objectClass eq", "olcDbIndex: uid,member eq",
+    "olcAccess: {0}to attrs=userPassword by self write by anonymous auth by * none",
+    f'olcAccess: {{1}}to * by dn.exact="{openLDAPService}" read by self read by * none', "",
+    "dn: olcOverlay={0}ppolicy,olcDatabase={1}mdb,cn=config", "objectClass: olcOverlayConfig",
+    "objectClass: olcPPolicyConfig", "olcOverlay: {0}ppolicy", f"olcPPolicyDefault: cn=default,ou=policies,{openLDAPBase}",
+  ]) + "\n", encoding="ascii", newline="\n")
+
+  members: dict[str, list[str]] = {}
+
+  def groupDN(name: str) -> str:
+    return f"cn={name},ou=groups,{openLDAPBase}"
+
+  def walk(tree: list[dict]) -> None:
+    for group in tree:
+      members.setdefault(group["name"], [])
+      for child in group.get("subGroups", []):
+        members[group["name"]].append(groupDN(child["name"]))
+      walk(group.get("subGroups", []))
+
+  walk(dataset["groups"])
+  for index in range(dataset["manyGroupsCount"]):
+    members[f"{dataset['manyGroupsPrefix']}{index:02d}"] = []
+  entries = [
+    [f"dn: {openLDAPBase}", "objectClass: dcObject", "objectClass: organization", "dc: carnelian", "o: Carnelian testbed"],
+    *[[f"dn: ou={unit},{openLDAPBase}", "objectClass: organizationalUnit", f"ou: {unit}"]
+      for unit in ("people", "groups", "services", "policies")],
+    [f"dn: cn=default,ou=policies,{openLDAPBase}", "objectClass: device", "objectClass: pwdPolicy", "cn: default",
+     "pwdAttribute: userPassword", "pwdLockout: TRUE"],
+    [f"dn: {openLDAPService}", "objectClass: organizationalRole", "objectClass: simpleSecurityObject", "cn: service",
+     f"userPassword: {derived(secret, 'openldap:service')}"],
+  ]
+  for account in accounts:
+    dn = f"uid={account['userName']},ou=people,{openLDAPBase}"
+    entry = [ldif("dn", dn), "objectClass: inetOrgPerson", ldif("uid", account["userName"]),
+             ldif("cn", f"{account['firstName']} {account['lastName']}"), ldif("sn", account["lastName"]),
+             ldif("givenName", account["firstName"]), ldif("displayName", f"{account['firstName']} {account['lastName']}"),
+             ldif("mail", account["email"]), ldif("userPassword", account["password"])]
+    if not account["enabled"]:
+      entry.append("pwdAccountLockedTime: 000001010000Z")
+    entries.append(entry)
+    for path in account["groups"]:
+      members[path.rsplit("/", 1)[1]].append(dn)
+  for name, memberDNs in members.items():
+    entries.append([ldif("dn", groupDN(name)), "objectClass: groupOfNames", ldif("cn", name),
+                    *(ldif("member", member) for member in memberDNs)])
+  (folder / "data.ldif").write_text("\n\n".join("\n".join(entry) for entry in entries) + "\n", encoding="ascii", newline="\n")
+
+
 def sambaSeed(secret: str, accounts: list[dict]) -> str:
   """samba-tool commands that load the dataset: nested groups, accounts, memberships, the service account."""
   dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
@@ -293,6 +372,7 @@ def prepare(host: str, secret: str) -> None:
     federationEntity(issuer, realmKey[1], federationKey))
   (generated / "certificates" / "federation.crt").write_text(federationKey[1], encoding="ascii")
   casFiles(secret, host, accounts)
+  openLDAPFiles(secret, accounts)
   (generated / "realm").mkdir(parents=True, exist_ok=True)
   (generated / "realm" / "carnelian.json").write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
   (generated / "samba").mkdir(parents=True, exist_ok=True)
@@ -308,6 +388,9 @@ def prepare(host: str, secret: str) -> None:
                       "redirectURI": redirectURI},
     "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
              "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
+    "openLDAP": {"host": host, "ldapPort": openLDAPPorts[0], "ldapsPort": openLDAPPorts[1], "baseDN": openLDAPBase,
+                 "groupsBaseDN": f"ou=groups,{openLDAPBase}", "serviceDN": openLDAPService,
+                 "servicePassword": derived(secret, "openldap:service")},
     "cas": {"serverURL": f"https://{host}:{casPort}/cas", "serviceURL": casServiceURL},
     "federation": {"mdqURL": f"https://{host}:{mdqPort}", "institution": issuer, "scope": federationScope,
                    "registrationAuthority": federationAuthority,
@@ -333,6 +416,20 @@ def waitForKeycloak(host: str, timeoutSeconds: int) -> None:
     except OSError as error:
       if time.monotonic() > deadline:
         raise SystemExit(f"Keycloak did not answer at {address} within {timeoutSeconds} s: {error}")
+    time.sleep(3)
+
+
+def waitForTLS(host: str, port: int, what: str, timeoutSeconds: int) -> None:
+  context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
+  deadline = time.monotonic() + timeoutSeconds
+  while True:
+    try:
+      with socket.create_connection((host, port), timeout=5) as raw, context.wrap_socket(raw, server_hostname=host):
+        print(f"{what} answers TLS at {host}:{port}")
+        return
+    except OSError as error:
+      if time.monotonic() > deadline:
+        raise SystemExit(f"{what} did not answer TLS at {host}:{port} within {timeoutSeconds} s: {error}")
     time.sleep(3)
 
 
@@ -394,6 +491,7 @@ def main() -> None:
     waitForKeycloak(arguments.host, arguments.timeout)
     waitForFederation(arguments.host, arguments.timeout)
     waitForCAS(arguments.host, arguments.timeout)
+    waitForTLS(arguments.host, openLDAPPorts[1], "OpenLDAP", arguments.timeout)
     if arguments.directory:
       waitForDirectory(arguments.host, arguments.timeout)
     return

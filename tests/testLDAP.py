@@ -16,7 +16,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from carnelian import ldap
 from carnelian.fetching import secureContext
-from carnelian.ldap import (All, Connection, Directory, DirectoryRefused, Equal, InChain, Present, checkResult,
+from carnelian.ldap import (DirectoryKind, All, Connection, Directory, DirectoryRefused, Equal, InChain, Present, checkResult,
                             integer, octets, readAll, readEntry, readTLV, sequence, tlv)
 
 from testOIDC import account
@@ -450,16 +450,32 @@ def testAWrongPasswordIsRefused(standInDirectory):
 
 # ---- against the testbed's Samba Active Directory --------------------------
 
-@pytest.fixture(scope="module", params=["ldaps", "startTLS"])
+def testEachKindOfDirectoryTakesItsOwnSettings():
+  with pytest.raises(ValueError, match="needs groupsBaseDN"):
+    Directory("directory.invalid", secureContext(), "dc=x", "cn=svc", "secret", kind=DirectoryKind.openLDAP)
+  with pytest.raises(ValueError, match="Active Directory takes none"):
+    Directory("directory.invalid", secureContext(), "DC=x", "svc", "secret", groupsBaseDN="ou=groups,DC=x")
+  openLDAP = Directory("directory.invalid", secureContext(), "dc=x", "cn=svc", "secret", kind=DirectoryKind.openLDAP,
+                       groupsBaseDN="ou=groups,dc=x")
+  assert (openLDAP.userAttribute, Directory("directory.invalid", secureContext(), "DC=x", "svc", "s").userAttribute) == (
+    "uid", "sAMAccountName")
+
+@pytest.fixture(scope="module", params=["activeDirectory-ldaps", "activeDirectory-startTLS", "openLDAP-ldaps", "openLDAP-startTLS"])
 def directory(request, testbed):
-  if not request.config.getoption("--directory"):
-    pytest.skip("directory test: run with --directory against a testbed whose Samba is running")
-  settings = testbed["directory"]
-  startTLS = request.param == "startTLS"
+  kind, transport = request.param.split("-")
+  startTLS = transport == "startTLS"
+  if kind == "activeDirectory":
+    if not request.config.getoption("--directory"):
+      pytest.skip("directory test: run with --directory against a testbed whose Samba is running")
+    settings = testbed["directory"]
+    return Directory(settings["host"], secureContext(testbed["certificateAuthority"]), settings["baseDN"],
+                     settings["serviceDN"], settings["servicePassword"],
+                     port=settings["ldapPort"] if startTLS else settings["ldapsPort"], startTLS=startTLS)
+  settings = testbed["openLDAP"]
   return Directory(settings["host"], secureContext(testbed["certificateAuthority"]), settings["baseDN"],
                    settings["serviceDN"], settings["servicePassword"],
-                   port=settings["ldapPort"] if startTLS else settings["ldapsPort"], startTLS=startTLS)
-
+                   port=settings["ldapPort"] if startTLS else settings["ldapsPort"], startTLS=startTLS,
+                   kind=DirectoryKind.openLDAP, groupsBaseDN=settings["groupsBaseDN"])
 
 def expectedGroups(paths):
   return tuple(sorted({segment for path in paths for segment in path.strip("/").split("/")}))
