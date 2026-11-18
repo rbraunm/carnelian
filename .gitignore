@@ -6,3 +6,4 @@ dist/
 *.egg-info/
 .pytest_cache/
 testbed/generated/
+.claude/worktrees/

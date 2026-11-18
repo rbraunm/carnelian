@@ -36,6 +36,7 @@ keys = ["cryptography>=44"]
 # Test oracles, the type checker and the linter: they check Carnelian and never run in an application.
 test = [
   "pytest>=8",
+  "pytest-xdist>=3.6",
   "cryptography>=44",
   "lxml>=5",
   "signxml>=4",
@@ -58,3 +59,5 @@ pythonpath = ["."]
 testpaths = ["tests"]
 python_files = ["test*.py"]
 python_functions = ["test*"]
+# Tests run on every core (pytest-xdist); those marked with one xdist_group share a worker. -n0 runs them in one process.
+addopts = "-n auto --dist loadgroup"

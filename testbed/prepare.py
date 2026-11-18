@@ -23,6 +23,8 @@ import shlex
 import socket
 import hashlib
 import hmac
+import html.parser
+import http.cookiejar
 import ipaddress
 import json
 import os
@@ -30,6 +32,7 @@ import re
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -255,6 +258,8 @@ def federationEntity(issuer: str, realmCertificate: str, federationKey: tuple[st
     '<mdui:DisplayName xml:lang="ar">\u062c\u0627\u0645\u0639\u0629 \u0643\u0627\u0631\u0646\u064a\u0644\u064a\u0627\u0646</mdui:DisplayName>'
     '</mdui:UIInfo></md:Extensions><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data>'
     f'<ds:X509Certificate>{body}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>'
+    '<md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" '
+    f'Location="{issuer}/protocol/saml"/>'
     '<md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" '
     f'Location="{issuer}/protocol/saml"/></md:IDPSSODescriptor></md:EntityDescriptor>')
   signed = XMLSigner(signature_algorithm="rsa-sha256", digest_algorithm="sha256",
@@ -473,6 +478,62 @@ def waitForKeycloak(host: str, timeoutSeconds: int) -> None:
     time.sleep(3)
 
 
+class _LoginForm(html.parser.HTMLParser):
+  def __init__(self) -> None:
+    super().__init__()
+    self.action: str | None = None
+
+  def handle_starttag(self, tag: str, attributes: list[tuple[str, str | None]]) -> None:
+    found = dict(attributes)
+    if tag == "form" and found.get("id") == "kc-form-login":
+      self.action = found.get("action")
+
+
+class _KeepRedirect(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, request, fp, code, message, headers, newURL):  # type: ignore[no-untyped-def]
+    raise urllib.error.HTTPError(newURL, code, message, headers, fp)
+
+
+def _signsIn(context: ssl.SSLContext, settings: dict, userName: str, password: str) -> bool:
+  opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context),
+                                       urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), _KeepRedirect())
+  verifier = base64.urlsafe_b64encode(os.urandom(48)).rstrip(b"=").decode()
+  challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+  query = urllib.parse.urlencode({"response_type": "code", "client_id": settings["clientID"], "scope": "openid",
+                                  "redirect_uri": settings["redirectURI"], "state": "warm", "nonce": "warm",
+                                  "code_challenge": challenge, "code_challenge_method": "S256"})
+  form = _LoginForm()
+  with opener.open(f"{settings['issuer']}/protocol/openid-connect/auth?{query}", timeout=20) as response:
+    form.feed(response.read().decode("utf-8"))
+  if form.action is None:
+    return False
+  data = urllib.parse.urlencode({"username": userName, "password": password, "credentialId": ""}).encode()
+  try:
+    with opener.open(urllib.request.Request(form.action, data=data, method="POST"), timeout=20):
+      return False
+  except urllib.error.HTTPError as redirect:
+    return redirect.code in (302, 303) and "code=" in urllib.parse.urlsplit(redirect.url).query
+
+
+def waitForKeycloakSignIns(timeoutSeconds: int) -> None:
+  """Keycloak answers discovery before it completes sign-ins: a cold one refuses its first logins as expired codes.
+  Ready means three sign-ins in a row complete."""
+  testbed = json.loads((generated / "testbed.json").read_text(encoding="utf-8"))
+  context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
+  person = testbed["accounts"][0]
+  deadline, inARow = time.monotonic() + timeoutSeconds, 0
+  while inARow < 3:
+    try:
+      inARow = inARow + 1 if _signsIn(context, testbed["openIDConnect"], person["userName"], person["password"]) else 0
+    except OSError:
+      inARow = 0
+    if inARow == 0:
+      if time.monotonic() > deadline:
+        raise SystemExit(f"Keycloak did not complete sign-ins within {timeoutSeconds} s")
+      time.sleep(3)
+  print("Keycloak completes sign-ins")
+
+
 def waitForTLS(host: str, port: int, what: str, timeoutSeconds: int) -> None:
   context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
   deadline = time.monotonic() + timeoutSeconds
@@ -543,6 +604,7 @@ def main() -> None:
   arguments = parser.parse_args()
   if arguments.wait:
     waitForKeycloak(arguments.host, arguments.timeout)
+    waitForKeycloakSignIns(arguments.timeout)
     waitForFederation(arguments.host, arguments.timeout)
     waitForCAS(arguments.host, arguments.timeout)
     waitForTLS(arguments.host, openLDAPPorts[1], "OpenLDAP", arguments.timeout)
