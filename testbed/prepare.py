@@ -27,6 +27,7 @@ import os
 import ssl
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -38,6 +39,9 @@ redirectURI = "http://127.0.0.1:53682/callback"
 samlConsumerURL = "https://sp.carnelian.test/acs"
 samlEntities = {"response": "https://sp.carnelian.test/signs-response", "assertion": "https://sp.carnelian.test/signs-assertion"}
 keycloakPort = 8443
+mdqPort = 8444
+federationScope = "carnelian.test"
+federationAuthority = "https://federation.carnelian.test"
 directoryRealm = "CARNELIAN.TEST"
 directoryDomain = "CARNELIAN"
 directoryBase = "DC=carnelian,DC=test"
@@ -82,22 +86,66 @@ def makeCertificates(host: str) -> None:
   os.chmod(folder / "server.key", 0o644)
 
 
-def realm(secret: str, host: str) -> tuple[dict, list[dict]]:
+def signingKey(name: str) -> tuple[str, str]:
+  """An RSA key and its self-signed certificate, both PEM: the realm's SAML key, the federation's metadata key."""
+  from cryptography import x509
+  from cryptography.hazmat.primitives import hashes, serialization
+  from cryptography.hazmat.primitives.asymmetric import rsa
+  from cryptography.x509.oid import NameOID
+
+  key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+  subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+  start = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
+  certificate = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(key.public_key())
+                 .serial_number(x509.random_serial_number()).not_valid_before(start)
+                 .not_valid_after(start + datetime.timedelta(days=400)).sign(key, hashes.SHA256()))
+  return (key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption()).decode("ascii"),
+          certificate.public_bytes(serialization.Encoding.PEM).decode("ascii"))
+
+
+def userProfile() -> str:
+  """Keycloak's user profile with unmanaged attributes on, so each user can carry its subjectID."""
+  def attribute(name, validations):
+    return {"name": name, "displayName": f"${{{name}}}", "validations": validations, "multivalued": False,
+            "permissions": {"view": ["admin", "user"], "edit": ["admin"]}}
+  return json.dumps({
+    "attributes": [attribute("username", {"length": {"min": 1, "max": 255}}),
+                   attribute("email", {"email": {}, "length": {"max": 255}}),
+                   attribute("firstName", {"length": {"max": 255}}), attribute("lastName", {"length": {"max": 255}})],
+    "unmanagedAttributePolicy": "ENABLED",
+  })
+
+
+def realm(secret: str, host: str, realmKey: tuple[str, str]) -> tuple[dict, list[dict]]:
   dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
   many = [f"/{dataset['manyGroupsPrefix']}{index:02d}" for index in range(dataset["manyGroupsCount"])]
   groups = dataset["groups"] + [{"name": path[1:]} for path in many]
   users, accounts = [], []
   for user in dataset["users"]:
     password = derived(secret, f"user:{user['userName']}")
+    subject = f"{derived(secret, 'subject:' + user['userName'])[:16]}@{federationScope}"
     memberOf = many if user["groups"] == "many" else user["groups"]
     users.append({
       "username": user["userName"], "enabled": user["enabled"], "email": user["email"], "emailVerified": True,
       "firstName": user["firstName"], "lastName": user["lastName"], "groups": memberOf,
+      "attributes": {"subjectID": [subject]},
       "credentials": [{"type": "password", "value": password, "temporary": False}],
     })
-    accounts.append({**user, "groups": memberOf, "password": password})
+    accounts.append({**user, "groups": memberOf, "password": password, "subjectID": subject})
+  privateKey, certificate = realmKey
   document = {
     "realm": realmName, "enabled": True, "sslRequired": "all", "groups": groups, "users": users,
+    "components": {
+      "org.keycloak.keys.KeyProvider": [{
+        "name": "testbed-rsa", "providerId": "rsa", "subComponents": {},
+        "config": {"priority": ["500"], "enabled": ["true"], "active": ["true"], "algorithm": ["RS256"],
+                   "privateKey": [privateKey], "certificate": [certificate]},
+      }],
+      "org.keycloak.userprofile.UserProfileProvider": [{
+        "providerId": "declarative-user-profile", "subComponents": {}, "config": {"kc.user.profile.config": [userProfile()]},
+      }],
+    },
     "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()] + [{
       "clientId": clientID, "enabled": True, "protocol": "openid-connect", "publicClient": False,
       "secret": derived(secret, "client:oidc"), "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
@@ -130,8 +178,37 @@ def samlClient(entityID: str, signs: str) -> dict:
       mapper("groups", "saml-group-membership-mapper", {"full.path": "true", "attribute.name": "groups", "single": "true"}),
       mapper("email", "saml-user-property-mapper", {"user.attribute": "email", "attribute.name": "email"}),
       mapper("givenName", "saml-user-property-mapper", {"user.attribute": "firstName", "attribute.name": "givenName"}),
+      mapper("subject-id", "saml-user-attribute-mapper", {
+        "user.attribute": "subjectID", "attribute.name": "urn:oasis:names:tc:SAML:attribute:subject-id",
+        "attribute.nameformat": "URI Reference", "friendly.name": "subject-id"}),
     ],
   }
+
+
+def federationEntity(issuer: str, realmCertificate: str, federationKey: tuple[str, str]) -> bytes:
+  """Keycloak as an institution of the testbed federation: its metadata with scope and names, signed by the federation."""
+  from lxml import etree
+  from signxml import XMLSigner
+
+  body = "".join(line for line in realmCertificate.splitlines() if "CERTIFICATE" not in line)
+  until = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+  entity = etree.fromstring(
+    f'<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" '
+    f'xmlns:shibmd="urn:mace:shibboleth:metadata:1.0" xmlns:mdui="urn:oasis:names:tc:SAML:metadata:ui" '
+    f'xmlns:mdrpi="urn:oasis:names:tc:SAML:metadata:rpi" ID="_testbed" entityID="{issuer}" validUntil="{until}">'
+    f'<md:Extensions><mdrpi:RegistrationInfo registrationAuthority="{federationAuthority}"/></md:Extensions>'
+    '<md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:Extensions>'
+    f'<shibmd:Scope regexp="false">{federationScope}</shibmd:Scope><mdui:UIInfo>'
+    '<mdui:DisplayName xml:lang="en">Carnelian Testbed University</mdui:DisplayName>'
+    '<mdui:DisplayName xml:lang="ar">جامعة كارنيليان</mdui:DisplayName>'
+    '</mdui:UIInfo></md:Extensions><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data>'
+    f'<ds:X509Certificate>{body}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>'
+    '<md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" '
+    f'Location="{issuer}/protocol/saml"/></md:IDPSSODescriptor></md:EntityDescriptor>')
+  signed = XMLSigner(signature_algorithm="rsa-sha256", digest_algorithm="sha256",
+                     c14n_algorithm="http://www.w3.org/2001/10/xml-exc-c14n#").sign(
+    entity, key=federationKey[0].encode("ascii"), reference_uri="#_testbed", always_add_key_value=False)
+  return etree.tostring(signed, xml_declaration=True, encoding="UTF-8")
 
 
 def sambaSeed(secret: str, accounts: list[dict]) -> str:
@@ -165,7 +242,15 @@ def sambaSeed(secret: str, accounts: list[dict]) -> str:
 
 def prepare(host: str, secret: str) -> None:
   makeCertificates(host)
-  document, accounts = realm(secret, host)
+  realmKey, federationKey = signingKey("Carnelian testbed realm"), signingKey("Carnelian testbed federation")
+  document, accounts = realm(secret, host, realmKey)
+  issuer = f"https://{host}:{keycloakPort}/realms/{realmName}"
+  (generated / "mdq").mkdir(parents=True, exist_ok=True)
+  for stale in (generated / "mdq").glob("*.xml"):
+    stale.unlink()
+  (generated / "mdq" / f"{hashlib.sha256(issuer.encode('utf-8')).hexdigest()}.xml").write_bytes(
+    federationEntity(issuer, realmKey[1], federationKey))
+  (generated / "certificates" / "federation.crt").write_text(federationKey[1], encoding="ascii")
   (generated / "realm").mkdir(parents=True, exist_ok=True)
   (generated / "realm" / "carnelian.json").write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
   (generated / "samba").mkdir(parents=True, exist_ok=True)
@@ -175,13 +260,15 @@ def prepare(host: str, secret: str) -> None:
     f"CARNELIAN_ADMIN_PASSWORD=Adm-{derived(secret, 'directory:administrator')}\n", encoding="ascii")
   (generated / "keycloak.env").write_text(
     f"KC_BOOTSTRAP_ADMIN_PASSWORD={derived(secret, 'keycloak:admin')}\nCARNELIAN_TESTBED_HOST={host}\n", encoding="ascii")
-  issuer = f"https://{host}:{keycloakPort}/realms/{realmName}"
   (generated / "testbed.json").write_text(json.dumps({
     "certificateAuthority": str((generated / "certificates" / "ca.crt").resolve()),
     "openIDConnect": {"issuer": issuer, "clientID": clientID, "clientSecret": derived(secret, "client:oidc"),
                       "redirectURI": redirectURI},
     "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
              "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
+    "federation": {"mdqURL": f"https://{host}:{mdqPort}", "institution": issuer, "scope": federationScope,
+                   "registrationAuthority": federationAuthority,
+                   "signingCertificate": str((generated / "certificates" / "federation.crt").resolve())},
     "directory": {"host": host, "ldapsPort": 636, "ldapPort": 389, "baseDN": directoryBase,
                   "serviceDN": f"{serviceAccount}@{directoryRealm.lower()}",
                   "servicePassword": derived(secret, "directory:service")},
@@ -220,6 +307,23 @@ def waitForDirectory(host: str, timeoutSeconds: int) -> None:
     time.sleep(3)
 
 
+def waitForFederation(host: str, timeoutSeconds: int) -> None:
+  context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
+  issuer = urllib.parse.quote(f"https://{host}:{keycloakPort}/realms/{realmName}", safe="")
+  address = f"https://{host}:{mdqPort}/entities/{issuer}"
+  deadline = time.monotonic() + timeoutSeconds
+  while True:
+    try:
+      with urllib.request.urlopen(address, context=context, timeout=5) as response:
+        if b"EntityDescriptor" in response.read():
+          print(f"the federation's MDQ service answers at {address}")
+          return
+    except OSError as error:
+      if time.monotonic() > deadline:
+        raise SystemExit(f"the federation's MDQ service did not answer at {address} within {timeoutSeconds} s: {error}")
+    time.sleep(3)
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--host", required=True)
@@ -229,6 +333,7 @@ def main() -> None:
   arguments = parser.parse_args()
   if arguments.wait:
     waitForKeycloak(arguments.host, arguments.timeout)
+    waitForFederation(arguments.host, arguments.timeout)
     if arguments.directory:
       waitForDirectory(arguments.host, arguments.timeout)
     return

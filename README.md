@@ -6,6 +6,10 @@ Sign-in for Python applications on the standard library alone:
   token checks);
 - **SAML 2.0** service provider (requests, responses, XML signatures with exclusive
   canonicalization, protection against signature wrapping);
+- **Research and education federations** (InCommon, the national federations, eduGAIN):
+  institutions' signed metadata by the Metadata Query protocol, their scopes, scoped
+  identifiers (subject-id, pairwise-id, eduPersonPrincipalName), and the service provider's
+  own metadata to register;
 - **LDAP** client for Active Directory and other directories (bind and search over TLS);
 - **SCIM 2.0** service provider (users with the enterprise extension, groups, the full
   filter grammar, PATCH, paging, attribute selection, discovery), behind the application's

@@ -24,6 +24,17 @@ services:
     ports:
       - "8443:8443"
 
+  # The testbed federation's metadata query service, vouching for Keycloak as an institution.
+  mdq:
+    image: python:3.14-slim
+    command: ["python", "/mdq/server.py", "/metadata", "/certificates/server.crt", "/certificates/server.key"]
+    volumes:
+      - ./mdq:/mdq:ro
+      - ./generated/mdq:/metadata:ro
+      - ./generated/certificates:/certificates:ro
+    ports:
+      - "8444:8444"
+
   # An Active Directory domain controller. It needs a host whose kernel lets it set
   # security extended attributes (a VM or the workflow's runner, not an unprivileged
   # container), so it is a profile of its own: --profile directory.

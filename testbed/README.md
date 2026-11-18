@@ -6,6 +6,10 @@ and a development host can keep them running.
 
 - **Keycloak** over HTTPS on port 8443: OpenID Connect and SAML 2.0, with one realm loaded
   from the dataset.
+- **A research federation** of one institution: an MDQ service on port 8444 serving
+  Keycloak's metadata with its scope and names, signed by the testbed federation's key, as
+  InCommon's MDQ serves its members'. Keycloak signs with a realm key `prepare.py` makes,
+  and sends each user's scoped `subject-id`.
 - **Samba Active Directory** (the compose profile `directory`) on 389 (StartTLS) and 636
   (LDAPS). It needs a privileged container, so it runs on Docker in a VM or on a CI runner,
   not inside an unprivileged LXC container.

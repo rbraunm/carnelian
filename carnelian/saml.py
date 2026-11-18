@@ -57,12 +57,21 @@ def identityProviderFromMetadata(metadata: bytes, entityID: str | None = None) -
   """The identity provider an EntityDescriptor describes; its entity ID must be `entityID` when given."""
   try:
     root = parse(metadata)
-    if not root.isA(metadataNamespace, "EntityDescriptor"):
-      raise SAMLRefused("the metadata is not an EntityDescriptor")
-    found = root.attribute("entityID")
-    if entityID is not None and found != entityID:
-      raise SAMLRefused(f"the metadata is for {found!r}, not {entityID!r}")
+  except XMLRefused as error:
+    raise SAMLRefused(f"the metadata is refused: {error}") from None
+  return identityProviderFromDescriptor(root, entityID)
+
+
+def identityProviderFromDescriptor(root: Element, entityID: str | None = None) -> IdentityProvider:
+  if not root.isA(metadataNamespace, "EntityDescriptor"):
+    raise SAMLRefused("the metadata is not an EntityDescriptor")
+  found = root.attribute("entityID")
+  if entityID is not None and found != entityID:
+    raise SAMLRefused(f"the metadata is for {found!r}, not {entityID!r}")
+  try:
     descriptor = root.only(metadataNamespace, "IDPSSODescriptor")
+    if "urn:oasis:names:tc:SAML:2.0:protocol" not in (descriptor.attribute("protocolSupportEnumeration") or "").split():
+      raise SAMLRefused("the identity provider does not support SAML 2.0")
     services = [service.attribute("Location") for service in descriptor.childrenNamed(metadataNamespace, "SingleSignOnService")
                 if service.attribute("Binding") == redirectBinding]
     if len(services) != 1 or not services[0].startswith("https://"):

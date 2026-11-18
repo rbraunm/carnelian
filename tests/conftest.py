@@ -10,6 +10,7 @@ import pytest
 def pytest_addoption(parser):
   parser.addoption("--testbed", help="testbed.json written by testbed/prepare.py; integration tests need it")
   parser.addoption("--directory", action="store_true", help="the testbed's Samba directory is running too")
+  parser.addoption("--live", action="store_true", help="also check real federations' published metadata over the internet")
 
 
 @pytest.fixture(scope="session")
