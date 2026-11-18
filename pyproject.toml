@@ -10,7 +10,25 @@ description = "Sign-in for Python on the standard library alone: OpenID Connect,
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["openid-connect", "oidc", "saml", "saml2", "ldap", "active-directory", "scim", "sign-in", "sso"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Security",
+  "Topic :: System :: Systems Administration :: Authentication/Directory",
+  "Topic :: System :: Systems Administration :: Authentication/Directory :: LDAP",
+]
 dependencies = []
+
+[project.urls]
+Source = "https://github.com/rbraunm/carnelian"
+Issues = "https://github.com/rbraunm/carnelian/issues"
 
 [project.optional-dependencies]
 # Test oracles only: they check Carnelian's answers and never run in an application.

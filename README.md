@@ -20,6 +20,20 @@ Status: being built. It starts life as the sign-in layer of
 [OpenFurrow](https://github.com/rbraunm/openfurrow) and is tested against real identity
 providers.
 
+## Install
+
+```bash
+python -m pip install carnelian
+```
+
+Python 3.13 or newer; nothing else is installed with it.
+
+## Releases
+
+A release is a version tag `v<version>` on a commit of `main` whose `carnelian/version.py`
+names that version; the `publish` workflow builds it and publishes it to PyPI by trusted
+publishing, with no token stored anywhere.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
