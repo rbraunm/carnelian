@@ -63,7 +63,7 @@ jobs:
           docker compose --file testbed/compose.yaml --env-file testbed/generated/keycloak.env --profile directory up --detach --build
           python testbed/prepare.py --host localhost --wait --directory
       - name: Run the test suite against them
-        run: python -m pytest --testbed=testbed/generated/testbed.json --directory
+        run: python -m pytest --testbed=testbed/generated/testbed.json --directory --live
       - name: Show the providers' logs
         if: failure()
         run: docker compose --file testbed/compose.yaml --env-file testbed/generated/keycloak.env --profile directory logs --no-color --tail 80
