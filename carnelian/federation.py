@@ -28,7 +28,9 @@ from dataclasses import dataclass
 
 from carnelian.der import publicKeyFromCertificate
 from carnelian.fetching import DocumentFetcher
-from carnelian.saml import IdentityProvider, SAMLIdentity, SAMLRefused, _attribute, _time, identityProviderFromDescriptor, metadataNamespace
+from carnelian.saml import (IdentityProvider, SAMLIdentity, SAMLRefused, _time, assertionNamespace, entityAttributeNamespace,
+                            entityCategoryName, identityProviderFromDescriptor, metadataNamespace, uiNamespace)
+from carnelian.saml import serviceProviderMetadata as samlServiceProviderMetadata
 from carnelian.xmldsig import SignatureRefused, verifyEnveloped
 from carnelian.xmlTree import Element, XMLRefused, parse
 
@@ -37,11 +39,7 @@ __all__ = ["Federation", "Institution", "scopedIdentifier", "serviceProviderMeta
            "hideFromDiscovery"]
 
 shibbolethMetadata = "urn:mace:shibboleth:metadata:1.0"
-uiNamespace = "urn:oasis:names:tc:SAML:metadata:ui"
 registrationNamespace = "urn:oasis:names:tc:SAML:metadata:rpi"
-entityAttributeNamespace = "urn:oasis:names:tc:SAML:metadata:attribute"
-assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
-entityCategory = "http://macedir.org/entity-category"
 hideFromDiscovery = "http://refeds.org/category/hide-from-discovery"
 researchAndScholarship = "http://refeds.org/category/research-and-scholarship"
 metadataMediaType = "application/samlmetadata+xml"
@@ -110,7 +108,7 @@ def _institution(root: Element, signedBy: str) -> Institution:
     attributes = entityExtensions.optional(entityAttributeNamespace, "EntityAttributes")
     if attributes is not None:
       for attribute in attributes.childrenNamed(assertionNamespace, "Attribute"):
-        if attribute.attribute("Name") == entityCategory:
+        if attribute.attribute("Name") == entityCategoryName:
           categories += [value.simpleText.strip() for value in attribute.childrenNamed(assertionNamespace, "AttributeValue")]
   if not scopes:
     raise SAMLRefused(f"{root.attribute('entityID')} has no scope in {signedBy}'s metadata, so it can vouch for no one")
@@ -186,40 +184,6 @@ def serviceProviderMetadata(entityID: str, assertionConsumerURL: str, displayNam
                             informationURL: str, privacyStatementURL: str, organizationName: str,
                             technicalContact: str, securityContact: str | None = None,
                             entityCategories: tuple[str, ...] = (researchAndScholarship,)) -> bytes:
-  """The service provider's metadata for its federation to register: unsigned (the federation signs what it publishes)."""
-  for address in (assertionConsumerURL, informationURL, privacyStatementURL):
-    if not address.startswith("https://"):
-      raise ValueError(f"{address} must be an https address")
-  for contact in (technicalContact, securityContact):
-    if contact is not None and not re.match(r"^[^@\s]+@[^@\s]+$", contact):
-      raise ValueError(f"{contact} is not an e-mail address")
-  names = "".join(f'<mdui:DisplayName xml:lang="{_attribute(language)}">{_attribute(text)}</mdui:DisplayName>'
-                  for language, text in sorted(displayNames.items()))
-  categories = "".join(f"<saml:AttributeValue>{_attribute(category)}</saml:AttributeValue>" for category in entityCategories)
-  security = ""
-  if securityContact is not None:
-    security = (f'<md:ContactPerson contactType="other" xmlns:remd="http://refeds.org/metadata" '
-                f'remd:contactType="http://refeds.org/metadata/contactType/security">'
-                f"<md:EmailAddress>mailto:{_attribute(securityContact)}</md:EmailAddress></md:ContactPerson>")
-  document = (
-    f'<md:EntityDescriptor xmlns:md="{metadataNamespace}" xmlns:saml="{assertionNamespace}" '
-    f'xmlns:mdui="{uiNamespace}" xmlns:mdattr="{entityAttributeNamespace}" entityID="{_attribute(entityID)}">'
-    + (f'<md:Extensions><mdattr:EntityAttributes><saml:Attribute Name="{entityCategory}" '
-       f'NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">{categories}</saml:Attribute>'
-       f"</mdattr:EntityAttributes></md:Extensions>" if entityCategories else "")
-    + '<md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol" '
-      'AuthnRequestsSigned="false" WantAssertionsSigned="true">'
-      f"<md:Extensions><mdui:UIInfo>{names}"
-      f'<mdui:InformationURL xml:lang="en">{_attribute(informationURL)}</mdui:InformationURL>'
-      f'<mdui:PrivacyStatementURL xml:lang="en">{_attribute(privacyStatementURL)}</mdui:PrivacyStatementURL>'
-      "</mdui:UIInfo></md:Extensions>"
-      f'<md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
-      f'Location="{_attribute(assertionConsumerURL)}" index="0" isDefault="true"/>'
-      "</md:SPSSODescriptor>"
-      f'<md:Organization><md:OrganizationName xml:lang="en">{_attribute(organizationName)}</md:OrganizationName>'
-      f'<md:OrganizationDisplayName xml:lang="en">{_attribute(organizationName)}</md:OrganizationDisplayName>'
-      f'<md:OrganizationURL xml:lang="en">{_attribute(informationURL)}</md:OrganizationURL></md:Organization>'
-      f'<md:ContactPerson contactType="technical"><md:EmailAddress>mailto:{_attribute(technicalContact)}'
-      f"</md:EmailAddress></md:ContactPerson>{security}</md:EntityDescriptor>"
-  )
-  return document.encode("utf-8")
+  """The service provider's metadata for its federation to register, with everything federations ask for."""
+  return samlServiceProviderMetadata(entityID, assertionConsumerURL, displayNames, informationURL, privacyStatementURL,
+                                     organizationName, technicalContact, securityContact, entityCategories)

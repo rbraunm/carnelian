@@ -20,6 +20,17 @@ Configure the provider to sign its responses or its assertions (or both), to sen
 persistent or otherwise stable NameID or an attribute you will use as the identity, and,
 while the `keys` extra is not in use, not to encrypt assertions or require signed requests.
 
+Give the provider your metadata to register, from `serviceProviderMetadata`: the entity ID
+and assertion consumer address are enough, and display names, information and privacy
+pages, organization and contacts are written when you pass them.
+
+```python
+from carnelian.saml import serviceProviderMetadata
+
+metadata = serviceProviderMetadata("https://app.example.org/saml", "https://app.example.org/signin/saml",
+                                   technicalContact="it@example.org")  # serve it at an address the provider can fetch
+```
+
 ## Signing in
 
 ```python

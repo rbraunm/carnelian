@@ -20,6 +20,7 @@ from signxml import XMLSigner
 
 from carnelian.fetching import Fetcher, secureContext
 from carnelian.saml import (IdentityProvider, Pending, ReplayCache, SAMLRefused, ServiceProvider, identityProviderFromMetadata,
+                            serviceProviderMetadata,
                             maximumResponseLength)
 from carnelian.signatures import RSAPublicKey
 from carnelian.xmlTree import parse
@@ -317,6 +318,19 @@ def testAnAttributeValueIsTextOrEduPersonTargetedIDsNameID(inner, expected):
   else:
     identity = provider().finishSignIn(pending, posted(signAssertion(root)))
     assert identity.attributes["urn:oid:1.3.6.1.4.1.5923.1.1.1.10"] == expected
+
+def testPlainServiceProviderMetadataNeedsOnlyTheEntityAndTheConsumerAddress():
+  document = etree.fromstring(serviceProviderMetadata(sp, acs))
+  names = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
+  assert document.get("entityID") == sp
+  assert document.find("md:SPSSODescriptor/md:AssertionConsumerService", names).get("Location") == acs
+  assert document.find("md:SPSSODescriptor", names).get("WantAssertionsSigned") == "true"
+  assert document.find("md:Extensions", names) is None and document.find("md:Organization", names) is None
+  assert document.find("md:ContactPerson", names) is None
+  with pytest.raises(ValueError, match="needs its informationURL"):
+    serviceProviderMetadata(sp, acs, organizationName="Example")
+  with pytest.raises(ValueError, match="https"):
+    serviceProviderMetadata(sp, "http://sp.example.org/acs")
 
 # ---- against the testbed's Keycloak ----------------------------------------
 

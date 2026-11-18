@@ -46,11 +46,14 @@ from carnelian.xmldsig import SignatureRefused, dsig, verifyEnveloped
 from carnelian.xmlTree import Element, XMLRefused, parse
 
 __all__ = ["SAMLRefused", "IdentityProvider", "identityProviderFromMetadata", "Pending", "SAMLIdentity",
-           "ReplayStore", "ReplayCache", "ServiceProvider"]
+           "ReplayStore", "ReplayCache", "ServiceProvider", "serviceProviderMetadata"]
 
 assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
 protocolNamespace = "urn:oasis:names:tc:SAML:2.0:protocol"
 metadataNamespace = "urn:oasis:names:tc:SAML:2.0:metadata"
+uiNamespace = "urn:oasis:names:tc:SAML:metadata:ui"
+entityAttributeNamespace = "urn:oasis:names:tc:SAML:metadata:attribute"
+entityCategoryName = "http://macedir.org/entity-category"
 redirectBinding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
 postBinding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
 successStatus = "urn:oasis:names:tc:SAML:2.0:status:Success"
@@ -311,3 +314,56 @@ def _attributeValue(value: Element) -> str:
   if len(elements) == 1 and elements[0].isA(assertionNamespace, "NameID") and not value.text.replace(elements[0].text, "", 1).strip():
     return elements[0].simpleText
   return value.simpleText
+
+
+def serviceProviderMetadata(entityID: str, assertionConsumerURL: str, displayNames: dict[str, str] | None = None,
+                            informationURL: str | None = None, privacyStatementURL: str | None = None,
+                            organizationName: str | None = None, technicalContact: str | None = None,
+                            securityContact: str | None = None, entityCategories: tuple[str, ...] = ()) -> bytes:
+  """This service provider's metadata, for an identity provider (or a federation) to register; unsigned.
+
+  Only the entity ID and the assertion consumer address are needed; names, information and privacy pages, the
+  organization, contacts and entity categories are written when given (a federation asks for all of them)."""
+  for address in (assertionConsumerURL, informationURL, privacyStatementURL):
+    if address is not None and not address.startswith("https://"):
+      raise ValueError(f"{address} must be an https address")
+  for contact in (technicalContact, securityContact):
+    if contact is not None and not re.match(r"^[^@\s]+@[^@\s]+$", contact):
+      raise ValueError(f"{contact} is not an e-mail address")
+  if organizationName is not None and informationURL is None:
+    raise ValueError("an organization needs its informationURL, written as the OrganizationURL")
+  names = "".join(f'<mdui:DisplayName xml:lang="{_attribute(language)}">{_attribute(text)}</mdui:DisplayName>'
+                  for language, text in sorted((displayNames or {}).items()))
+  pages = "".join(f'<mdui:{element} xml:lang="en">{_attribute(address)}</mdui:{element}>'
+                  for element, address in (("InformationURL", informationURL), ("PrivacyStatementURL", privacyStatementURL))
+                  if address is not None)
+  information = f"<md:Extensions><mdui:UIInfo>{names}{pages}</mdui:UIInfo></md:Extensions>" if names or pages else ""
+  categories = "".join(f"<saml:AttributeValue>{_attribute(category)}</saml:AttributeValue>" for category in entityCategories)
+  extensions = (f'<md:Extensions><mdattr:EntityAttributes><saml:Attribute Name="{entityCategoryName}" '
+                f'NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri">{categories}</saml:Attribute>'
+                f"</mdattr:EntityAttributes></md:Extensions>" if entityCategories else "")
+  organization = ""
+  if organizationName is not None and informationURL is not None:
+    organization = (f'<md:Organization><md:OrganizationName xml:lang="en">{_attribute(organizationName)}</md:OrganizationName>'
+                    f'<md:OrganizationDisplayName xml:lang="en">{_attribute(organizationName)}</md:OrganizationDisplayName>'
+                    f'<md:OrganizationURL xml:lang="en">{_attribute(informationURL)}</md:OrganizationURL></md:Organization>')
+  contacts = ""
+  if technicalContact is not None:
+    contacts += (f'<md:ContactPerson contactType="technical"><md:EmailAddress>mailto:{_attribute(technicalContact)}'
+                 "</md:EmailAddress></md:ContactPerson>")
+  if securityContact is not None:
+    contacts += ('<md:ContactPerson contactType="other" xmlns:remd="http://refeds.org/metadata" '
+                 'remd:contactType="http://refeds.org/metadata/contactType/security">'
+                 f"<md:EmailAddress>mailto:{_attribute(securityContact)}</md:EmailAddress></md:ContactPerson>")
+  document = (
+    f'<md:EntityDescriptor xmlns:md="{metadataNamespace}" xmlns:saml="{assertionNamespace}" '
+    f'xmlns:mdui="{uiNamespace}" xmlns:mdattr="{entityAttributeNamespace}" entityID="{_attribute(entityID)}">'
+    f"{extensions}"
+    '<md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol" '
+    'AuthnRequestsSigned="false" WantAssertionsSigned="true">'
+    f"{information}"
+    '<md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
+    f'Location="{_attribute(assertionConsumerURL)}" index="0" isDefault="true"/>'
+    f"</md:SPSSODescriptor>{organization}{contacts}</md:EntityDescriptor>"
+  )
+  return document.encode("utf-8")
