@@ -38,6 +38,8 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
+from carnelian.fetching import _connected
+
 __all__ = ["DirectoryRefused", "Directory", "DirectoryKind", "DirectoryIdentity"]
 
 maximumMessageBytes = 4_000_000
@@ -248,7 +250,10 @@ class Connection:
     """LDAPS, or StartTLS before anything else; the certificate and host name are checked."""
     _requireVerification(context)
     try:
-      raw = socket.create_connection((host, port), timeout=timeoutSeconds)
+      raw = _connected(host, port, time.monotonic() + timeoutSeconds)
+      raw.settimeout(timeoutSeconds)
+    except TimeoutError:
+      raise DirectoryRefused(f"cannot reach the directory at {host}:{port} within {timeoutSeconds} seconds") from None
     except OSError as error:
       raise DirectoryRefused(f"cannot reach the directory at {host}:{port}: {error}") from None
     try:
