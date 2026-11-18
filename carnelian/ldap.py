@@ -38,6 +38,9 @@ maximumMessageBytes = 4_000_000
 maximumOperationBytes = 16_000_000
 maximumOperationSeconds = 30.0
 maximumEntries = 1000
+# Active Directory's LDAP_SERVER_DOMAIN_SCOPE control: answer from this domain only, without references to other
+# partitions, so a reference that still arrives is refused rather than ignored. Other servers ignore it (not critical).
+domainScopeControl = "1.2.840.113556.1.4.1339"
 
 
 class DirectoryRefused(ValueError):
@@ -284,8 +287,8 @@ class Connection:
       return DirectoryRefused(f"the directory was silent for {self._idleSeconds} seconds")
     return DirectoryRefused(f"the directory did not finish within {maximumOperationSeconds} seconds")
 
-  def _message(self, operation: bytes) -> bytes:
-    message = sequence(integer(self._nextID), operation)
+  def _message(self, operation: bytes, controls: bytes = b"") -> bytes:
+    message = sequence(integer(self._nextID), operation, controls)
     self._nextID += 1
     return message
 
@@ -364,7 +367,8 @@ class Connection:
     messageID = self._nextID
     self._send(self._message(sequence(
       octets(base), integer(2, 0x0A), integer(0, 0x0A), integer(maximumEntries), integer(int(maximumOperationSeconds)),
-      boolean(False), query.encoded(), sequence(*(octets(attribute) for attribute in attributes)), tag=0x63)))
+      boolean(False), query.encoded(), sequence(*(octets(attribute) for attribute in attributes)), tag=0x63),
+      sequence(sequence(octets(domainScopeControl)), tag=0xA0)))
     entries: list[Entry] = []
     while True:
       answerID, (tag, content) = self._receive()
