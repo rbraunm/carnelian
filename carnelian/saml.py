@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
 __all__ = ["SAMLRefused", "IdentityProvider", "identityProviderFromMetadata", "Pending", "SAMLIdentity",
            "ReplayStore", "ReplayCache", "EncryptionPolicy", "SignOutRequest", "ServiceProvider",
-           "serviceProviderMetadata", "rsaOAEPMGF1P", "rsaOAEP", "aes128GCM", "aes256GCM", "aes128CBC", "aes256CBC"]
+           "serviceProviderMetadata", "claimedIssuer", "rsaOAEPMGF1P", "rsaOAEP", "aes128GCM", "aes256GCM", "aes128CBC", "aes256CBC"]
 
 assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
 protocolNamespace = "urn:oasis:names:tc:SAML:2.0:protocol"
@@ -294,6 +294,48 @@ def _base64(text: str, what: str) -> bytes:
     return base64.b64decode("".join(text.split()), validate=True)
   except ValueError:
     raise SAMLRefused(f"{what} is not base64") from None
+
+
+def _redirectFields(parameter: str, query: str) -> dict[str, str]:
+  """The Redirect binding's parameters, by their literal names, each at most once, still URL-encoded."""
+  if len(query) > maximumResponseLength or not query.isascii():
+    raise SAMLRefused(f"the query is not ASCII of at most {maximumResponseLength} characters")
+  fields: dict[str, str] = {}
+  for part in query.split("&"):
+    name, _, value = part.partition("=")
+    if name in _bindingParameters:
+      if name in fields:
+        raise SAMLRefused(f"the query carries {name} twice")
+      fields[name] = value
+    elif urllib.parse.unquote_plus(name) in _bindingParameters:
+      raise SAMLRefused(f"the query spells {urllib.parse.unquote_plus(name)} as {name!r}; only the literal name is read")
+  if parameter not in fields or ({"SAMLRequest", "SAMLResponse"} - {parameter}) & set(fields):
+    raise SAMLRefused(f"the query must carry a {parameter} and nothing else to read")
+  return fields
+
+
+def claimedIssuer(parameter: str, query: str | None = None, posted: str | None = None) -> str:
+  """The Issuer an incoming logout message names, NOT verified: only for choosing which identity provider's
+  ServiceProvider then reads the message, which refuses it unless that provider signed it. `parameter` is
+  "SAMLRequest" or "SAMLResponse"; give the Redirect binding's raw query string or the POST binding's posted value."""
+  if parameter not in ("SAMLRequest", "SAMLResponse"):
+    raise ValueError(f"a logout message is a SAMLRequest or a SAMLResponse, not {parameter!r}")
+  try:
+    if query is not None and posted is None:
+      encoded = urllib.parse.unquote_plus(_redirectFields(parameter, query)[parameter])
+      message = parse(_inflated(_base64(encoded, f"the {parameter}")))
+    elif posted is not None and query is None:
+      if len(posted) > maximumResponseLength:
+        raise SAMLRefused(f"the {parameter} is longer than {maximumResponseLength} characters")
+      message = parse(_base64(posted, f"the {parameter}"))
+    else:
+      raise ValueError("give the Redirect binding's query or the POST binding's posted value, one of them")
+    issuer = message.only(assertionNamespace, "Issuer").simpleText
+  except XMLRefused as error:
+    raise SAMLRefused(str(error)) from None
+  if not issuer.strip():
+    raise SAMLRefused(f"the {parameter} names a blank Issuer")
+  return issuer
 
 
 def _inflated(data: bytes) -> bytes:
@@ -682,19 +724,7 @@ class ServiceProvider:
                   keys: list[RSAPublicKey | ECPublicKey]) -> tuple[Element, str | None]:
     if relayState is not None:
       raise ValueError("the Redirect binding's RelayState is read from its query")
-    if len(query) > maximumResponseLength or not query.isascii():
-      raise SAMLRefused(f"the query is not ASCII of at most {maximumResponseLength} characters")
-    fields: dict[str, str] = {}
-    for part in query.split("&"):
-      name, _, value = part.partition("=")
-      if name in _bindingParameters:
-        if name in fields:
-          raise SAMLRefused(f"the query carries {name} twice")
-        fields[name] = value
-      elif urllib.parse.unquote_plus(name) in _bindingParameters:
-        raise SAMLRefused(f"the query spells {urllib.parse.unquote_plus(name)} as {name!r}; only the literal name is read")
-    if parameter not in fields or ({"SAMLRequest", "SAMLResponse"} - {parameter}) & set(fields):
-      raise SAMLRefused(f"the query must carry a {parameter} and nothing else to read")
+    fields = _redirectFields(parameter, query)
     if "SigAlg" not in fields or "Signature" not in fields:
       raise SAMLRefused(f"the {parameter} is not signed: the query has no SigAlg and Signature")
     signedPart = "&".join(f"{name}={fields[name]}" for name in (parameter, "RelayState", "SigAlg") if name in fields)

@@ -32,7 +32,8 @@ Only the newest release is supported while Carnelian is below 1.0. Fixes are not
   attributes and namespace declarations, JSON nesting and number sizes, filter length and
   comparisons, LDAP messages, entries and time per operation, and the time a fetch may take.
   Every run of the test suite fuzzes the parsers an attacker can reach (DER, XML and XML
-  signatures, BER for LDAP, SCIM filters and requests, JOSE, SAML responses, CAS answers and
+  signatures, BER for LDAP, SCIM filters and requests, JOSE, SAML responses and the issuer
+  read from a logout message, CAS answers and
   the OpenID Connect and CAS callbacks) with generated input, 300 cases each (20,000 with
   `CARNELIAN_FUZZ=deep`): each may fail only with its own refusal, a signed SAML
   response with one byte changed is refused or read exactly as before, and an ID token with

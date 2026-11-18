@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import time
+import urllib.parse
 
 from hypothesis import HealthCheck, given, settings, strategies as strategies
 
@@ -15,7 +16,7 @@ from carnelian.der import DERError, publicKeyFromCertificate, readOne
 from carnelian.oidc import Pending as OpenIDConnectPending, SignInRefused
 from carnelian.jose import JOSEError, KeySet, readHeader, verifyCompact
 from carnelian.ldap import DirectoryRefused, readAll, readTLV
-from carnelian.saml import SAMLRefused
+from carnelian.saml import SAMLRefused, claimedIssuer
 from carnelian.scim import SCIMRefused, SCIMService, parseFilter
 from carnelian import xmlTree
 from carnelian.signatures import RSAPublicKey, SignatureError
@@ -205,6 +206,19 @@ def testCASAnswersRefuseByName(data):
 
 
 @fuzzed
+@given(strategies.binary(max_size=400) | xmlish.map(lambda text: text.encode("utf-8")),
+       strategies.text(alphabet="SAMLRequestRelaySigAlgnature=&%5Bx", max_size=60))
+def testClaimedIssuersRefuseByName(data, query):
+  encoded = base64.b64encode(data).decode("ascii")
+  for call in (lambda: claimedIssuer("SAMLRequest", posted=encoded),
+               lambda: claimedIssuer("SAMLRequest", query=query),
+               lambda: claimedIssuer("SAMLRequest", query="SAMLRequest=" + urllib.parse.quote(encoded))):
+    try:
+      assert call().strip()
+    except SAMLRefused:
+      pass
+
+
 @given(strategies.binary(max_size=400))
 def testSAMLResponsesRefuseByName(data):
   try:

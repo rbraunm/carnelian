@@ -259,6 +259,12 @@ returns the NameID, the SessionIndexes and the RelayState. End the sessions befo
 answer: `answerSignOut` always says Success, signed, and is refused by name without a
 signing key.
 
+With several identity providers at one logout address (a federation's institutions),
+`claimedIssuer("SAMLRequest", query=raw)` (or `posted=`) says which one the message claims
+to come from, so you can build that provider's `ServiceProvider` and read the message with
+it. The claim is not verified: `readSignOutRequest` refuses the message unless that provider
+signed it, so a forged issuer reaches only the provider it names and fails there.
+
 In a Redirect binding query, `SAMLRequest`, `SAMLResponse`, `RelayState`, `SigAlg` and
 `Signature` are read by their literal names, as the signature covers them; a parameter that
 spells one of them encoded (`Relay%53tate`) or carries it twice is refused. The provider's
