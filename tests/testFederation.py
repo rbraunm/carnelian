@@ -16,7 +16,7 @@ from signxml import XMLSigner
 
 from carnelian.federation import (Federation, eduPersonPrincipalName, pairwiseID, researchAndScholarship, scopedIdentifier,
                                   serviceProviderMetadata, subjectID)
-from carnelian.fetching import Fetcher, secureContext
+from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 from carnelian.saml import SAMLIdentity, SAMLRefused, ServiceProvider
 
 from testOIDC import account, signInAtKeycloak
@@ -97,6 +97,51 @@ def testInstitutionsAreAskedForByMDQAndKeptUntilValidUntil():
   ticks[0] = now + 3600
   with pytest.raises(SAMLRefused, match="expired"):
     source.institution(entity)
+
+
+class Unknown:
+  """An MDQ service that knows no entity: every lookup fails as the fetcher reports a 404."""
+
+  def __init__(self):
+    self.asked = []
+
+  def getBytes(self, address, accept):
+    self.asked.append(address)
+    raise HTTPFailure(f"{address} answered 404, not 200")
+
+
+def testAFailedLookupIsRefusedByNameAndRememberedForAWhile():
+  ticks = [now]
+  unknown = "https://unknown.example.edu/idp"
+  source = Federation("Example", mdq, federationCertificate, Unknown(), refusalCacheSeconds=60, clock=lambda: ticks[0])
+  why = (f"Example's metadata for {unknown} could not be fetched: "
+         f"{mdq}/entities/https%3A%2F%2Funknown.example.edu%2Fidp answered 404, not 200")
+  for tick in (now, now + 59):
+    ticks[0] = tick
+    with pytest.raises(SAMLRefused) as refused:
+      source.institution(unknown)
+    assert str(refused.value) == why
+  assert len(source.fetcher.asked) == 1
+  ticks[0] = now + 60
+  with pytest.raises(SAMLRefused):
+    source.institution(unknown)
+  assert len(source.fetcher.asked) == 2
+
+
+def testMetadataThatIsRefusedIsNotFetchedAgainAtOnce():
+  source = federation(signed(metadata()).replace(b"Example University", b"Evil University"))
+  for _ in range(3):
+    with pytest.raises(SAMLRefused, match="digest"):
+      source.institution(entity)
+  assert len(source.fetcher.asked) == 1
+
+
+@pytest.mark.parametrize("entityID", ["", "https://idp.example.edu/" + "a" * 1001])
+def testAnEntityIDOutsideSAMLsLengthIsRefusedWithoutAFetch(entityID):
+  source = federation()
+  with pytest.raises(SAMLRefused, match="an entity ID is 1 to 1024 characters"):
+    source.institution(entityID)
+  assert source.fetcher.asked == []
 
 
 def tampered():

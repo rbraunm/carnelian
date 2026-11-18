@@ -21,7 +21,7 @@ for each sign-in, so register it as a pattern that allows a query string.
 ```python
 import dataclasses, secrets
 from flask import Flask, redirect, request, session, abort
-from carnelian.cas import CASRefused, CASServer, Pending
+from carnelian.cas import CASRefused, CASServer, Pending, readLogoutRequest
 from carnelian.fetching import Fetcher, secureContext
 
 app = Flask(__name__)
@@ -48,8 +48,12 @@ def signInReturn():
   except CASRefused as refusal:
     abort(401, str(refusal))
   session["user"] = identity.userName
+  session["casTicket"] = identity.ticket  # with a server-side session store, index it by the ticket too
   return redirect("/")
 ```
+
+A failure to reach the CAS server is a `CASRefused` too; its message leaves out the ticket
+and the state.
 
 ## Signing out
 
@@ -57,12 +61,24 @@ def signInReturn():
 follows service redirects and the address is registered, sends them back. When CAS signs a
 person out elsewhere, it POSTs a `logoutRequest` to your service address; `readLogoutRequest`
 reads the service ticket it names. CAS does not sign these notices, so end only the session
-that this ticket started (keep the ticket with the session when you sign the person in).
+that this ticket started: `identity.ticket`, kept with the session when you sign the person
+in. A notice for a ticket whose session has already ended changes nothing.
+
+```python
+@app.post("/signin/cas")
+def singleLogout():
+  try:
+    ticket = readLogoutRequest(request.form["logoutRequest"])
+  except CASRefused as refusal:
+    abort(400, str(refusal))
+  endSessionStartedBy(ticket)  # yours: the one session whose casTicket is this ticket, if it is still open
+  return "", 204
+```
 
 ## What you get
 
-`CASIdentity` carries `userName` (the CAS user) and `attributes`: each released attribute
-by its name, as a tuple of values.
+`CASIdentity` carries `userName` (the CAS user), `attributes` (each released attribute by
+its name, as a tuple of values) and `ticket`, the service ticket the sign-in used.
 
 ## What is refused
 

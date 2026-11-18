@@ -28,11 +28,18 @@ decryption keys, an EncryptedAssertion is decrypted under an EncryptionPolicy th
 configuration chooses and the document never does: RSA PKCS #1 v1.5 key transport is always
 refused, RSA-OAEP and AES-GCM are the default, and AES-CBC is decrypted only when the policy
 allows it and the Response's own signature has been verified first. Every failure to
-decrypt is one refusal, whatever went wrong. The decrypted assertion is parsed with the same
-limits and goes through every check above. Without decryption keys an EncryptedAssertion is
+decrypt is one refusal, whatever went wrong: every key unwraps and decrypts the content, a
+failed unwrap with a random content key. The decrypted assertion is parsed with the same
+limits and goes through every check above; unless it carries its own signature, it must
+declare every namespace prefix it uses, since the Response's exclusive canonical form need
+not cover a declaration outside it. Without decryption keys an EncryptedAssertion is
 refused by name. With a signing key, requests and logout messages are signed by the
 Redirect binding's query signature (SAML bindings 3.4.4.1); without one, requests go
-unsigned and logout is refused by name.
+unsigned and logout is refused by name. A LogoutResponse needs an ID and an IssueInstant
+between its request and now, and answers its request once: the request's ID is claimed in
+the ReplayStore under this service provider's entity ID. The Redirect binding's parameters
+are read by their literal names; an encoded spelling of one is refused. An identity
+provider's address with a fragment or a parameter of the binding is refused.
 """
 
 from __future__ import annotations
@@ -95,9 +102,12 @@ _oaepDigests = {
 }
 _maskFunctions = {xmlEncryption11 + f"mgf1{name}": name for name in ("sha1", "sha256", "sha384", "sha512")}
 _keyTransports = (rsaOAEP, rsaOAEPMGF1P)
-_contentAlgorithms = {aes256GCM: "aes256-gcm", aes128GCM: "aes128-gcm", aes256CBC: "aes256-cbc", aes128CBC: "aes128-cbc"}
+_contentAlgorithms = {aes256GCM: ("aes256-gcm", 32), aes128GCM: ("aes128-gcm", 16), aes256CBC: ("aes256-cbc", 32),
+                      aes128CBC: ("aes128-cbc", 16)}
 _cbcAlgorithms = (aes128CBC, aes256CBC)
 _undecryptable = "the encrypted assertion does not decrypt with this service provider's keys"
+_bindingParameters = frozenset({"SAMLRequest", "SAMLResponse", "RelayState", "SigAlg", "Signature"})
+_notXMLCharacter = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 
 class SAMLRefused(ValueError):
@@ -111,6 +121,21 @@ class IdentityProvider:
   signingKeys: tuple[RSAPublicKey | ECPublicKey, ...]
   singleLogoutURL: str | None = None
   singleLogoutResponseURL: str | None = None
+
+  def __post_init__(self) -> None:
+    for address in (self.singleSignOnURL, self.singleLogoutURL, self.singleLogoutResponseURL):
+      if address is not None:
+        _checkEndpoint(address)
+
+
+def _checkEndpoint(address: str) -> None:
+  """An identity provider's address, to which the Redirect binding adds its own query."""
+  if "#" in address:
+    raise SAMLRefused(f"the identity provider's address {address!r} carries a fragment")
+  query = urllib.parse.urlsplit(address).query
+  names = {urllib.parse.unquote_plus(part.partition("=")[0]) for part in query.split("&") if part}
+  if names & _bindingParameters:
+    raise SAMLRefused(f"the identity provider's address {address!r} already carries {sorted(names & _bindingParameters)}")
 
 
 def identityProviderFromMetadata(metadata: bytes, entityID: str | None = None) -> IdentityProvider:
@@ -225,7 +250,8 @@ class EncryptionPolicy:
 
 
 class ReplayStore(Protocol):
-  """Where assertion IDs are remembered, per issuer. Behind several processes, one shared store (a database
+  """Where assertion and LogoutRequest IDs are remembered, per issuer, and the IDs of this service provider's own
+  answered LogoutRequests under its own entity ID. Behind several processes, one shared store (a database
   table with (issuer, assertion ID) as its unique key, say) so an assertion used on one process is refused on all."""
 
   def admit(self, issuer: str, assertionID: str, until: float, now: float) -> None:
@@ -428,16 +454,32 @@ class ServiceProvider:
     if mask not in _maskFunctions or mask not in policy.maskDigests:
       raise SAMLRefused(f"mask generation function {mask} is not allowed by this provider's encryption policy")
     wrappedKey, cipherData = _cipherValue(encryptedKey), _cipherValue(encryptedData)
+    algorithm, keyLength = _contentAlgorithms[content]
+    plaintexts = []
+    for key in self.decryptionKeys:
+      try:
+        contentKey, unwrapped = key.unwrapKey(wrappedKey, _oaepDigests[digest], _maskFunctions[mask]), True
+      except ValueError:
+        # A random key of the right length keeps a failed unwrap on the same path as content that fails its tag.
+        contentKey, unwrapped = secrets.token_bytes(keyLength), False
+      try:
+        plaintext = key.decryptContent(algorithm, contentKey, cipherData)
+      except ValueError:
+        continue
+      if unwrapped:
+        plaintexts.append(plaintext)
+    if not plaintexts:
+      raise SAMLRefused(_undecryptable)
     try:
-      for key in self.decryptionKeys:
-        try:
-          contentKey = key.unwrapKey(wrappedKey, _oaepDigests[digest], _maskFunctions[mask])
-        except ValueError:
-          continue
-        return _inContext(key.decryptContent(_contentAlgorithms[content], contentKey, cipherData), container)
-      raise ValueError(_undecryptable)
+      assertion = _inContext(plaintexts[0], container)
     except ValueError:
       raise SAMLRefused(_undecryptable) from None
+    inherited = _inheritedPrefixes(assertion)
+    if inherited and not assertion.childrenNamed(dsig, "Signature"):
+      raise SAMLRefused(f"the decrypted assertion uses namespace prefixes {sorted(inherited)} declared outside it, where "
+                        "the Response's signature need not cover them; without a signature of its own it must declare "
+                        "every prefix it uses")
+    return assertion
 
   @staticmethod
   def _encryptedKey(container: Element, encryptedData: Element) -> Element:
@@ -554,13 +596,18 @@ class ServiceProvider:
       raise SAMLRefused("the logout took too long; start again")
     try:
       response, _ = self._incoming("SAMLResponse", query, samlResponse, None)
-      if not response.isA(protocolNamespace, "LogoutResponse") or response.attribute("Version") != "2.0":
-        raise SAMLRefused("not a SAML 2.0 LogoutResponse")
+      if (not response.isA(protocolNamespace, "LogoutResponse") or response.attribute("Version") != "2.0"
+          or not response.attribute("ID")):
+        raise SAMLRefused("not a SAML 2.0 LogoutResponse with an ID")
       self._destination(response)
       if response.attribute("InResponseTo") != pending.requestID:
         raise SAMLRefused("the LogoutResponse does not answer this logout's request")
+      issued = _time(response.attribute("IssueInstant"), "IssueInstant")
+      if not pending.startedAt - self.leewaySeconds <= issued <= now + self.leewaySeconds:
+        raise SAMLRefused("the LogoutResponse was not issued between this logout's request and now")
       self._issuer(response, required=True)
       self._status(response)
+      self.replayCache.admit(self.entityID, pending.requestID, pending.startedAt + self.pendingSeconds + self.leewaySeconds, now)
     except (XMLRefused, SignatureRefused) as error:
       raise SAMLRefused(str(error)) from None
 
@@ -598,7 +645,9 @@ class ServiceProvider:
   def answerSignOut(self, request: SignOutRequest) -> str:
     """The address that tells the identity provider the session has ended: a signed LogoutResponse by the Redirect
     binding. End the application's session first."""
-    location = self.identityProvider.singleLogoutResponseURL or self._logoutAddress()
+    location = self._logoutAddress()
+    if self.identityProvider.singleLogoutResponseURL is not None:
+      location = self.identityProvider.singleLogoutResponseURL
     message, instant = self._newMessage()
     response = (
       f'<samlp:LogoutResponse xmlns:samlp="{protocolNamespace}" xmlns:saml="{assertionNamespace}" ID="{message.requestID}" '
@@ -638,11 +687,12 @@ class ServiceProvider:
     fields: dict[str, str] = {}
     for part in query.split("&"):
       name, _, value = part.partition("=")
-      name = urllib.parse.unquote_plus(name)
-      if name in ("SAMLRequest", "SAMLResponse", "RelayState", "SigAlg", "Signature"):
+      if name in _bindingParameters:
         if name in fields:
           raise SAMLRefused(f"the query carries {name} twice")
         fields[name] = value
+      elif urllib.parse.unquote_plus(name) in _bindingParameters:
+        raise SAMLRefused(f"the query spells {urllib.parse.unquote_plus(name)} as {name!r}; only the literal name is read")
     if parameter not in fields or ({"SAMLRequest", "SAMLResponse"} - {parameter}) & set(fields):
       raise SAMLRefused(f"the query must carry a {parameter} and nothing else to read")
     if "SigAlg" not in fields or "Signature" not in fields:
@@ -666,7 +716,8 @@ def _cipherValue(element: Element) -> bytes:
 
 
 def _inContext(plaintext: bytes, context: Element) -> Element:
-  """The one element of decrypted XML, parsed with the namespaces in scope where it was encrypted (XML Encryption 4.5)."""
+  """The one element of decrypted XML, parsed with the namespaces in scope where it was encrypted (XML Encryption 4.5);
+  a prefix taken from there is trusted only under the element's own signature (`_inheritedPrefixes`)."""
   namespaces: dict[str, str] = {}
   element: Element | None = context
   while element is not None:
@@ -682,8 +733,35 @@ def _inContext(plaintext: bytes, context: Element) -> Element:
   return elements[0]
 
 
+def _inheritedPrefixes(root: Element) -> set[str]:
+  """The prefixes `root` and its descendants use whose namespace is declared outside `root`."""
+  inherited = set()
+  for element in (root, *root.descendants()):
+    used = {element.prefix} | {name.partition(":")[0] for name, _ in element.attributes
+                               if ":" in name and not name.startswith("xmlns:")}
+    for prefix in used - {"xml"}:
+      if not _declaredWithin(element, prefix, root) and root.namespaceFor(prefix):
+        inherited.add(prefix)
+  return inherited
+
+
+def _declaredWithin(element: Element, prefix: str, root: Element) -> bool:
+  current: Element | None = element
+  while current is not None:
+    if prefix in current.declarations:
+      return True
+    if current is root:
+      return False
+    current = current.parent
+  return False
+
+
 def _attribute(text: str) -> str:
-  return text.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+  """Text for an attribute value or element content of this service provider's own XML."""
+  if _notXMLCharacter.search(text):
+    raise SAMLRefused(f"{text!r} holds a character XML cannot carry")
+  return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+          .replace("\t", "&#9;").replace("\n", "&#10;").replace("\r", "&#13;"))
 
 
 def _attributeValue(value: Element) -> str:

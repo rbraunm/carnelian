@@ -31,7 +31,12 @@ Only the newest release is supported while Carnelian is below 1.0. Fixes are not
 - **It bounds what an attacker can make it do:** input sizes, XML depth, elements,
   attributes and namespace declarations, JSON nesting and number sizes, filter length and
   comparisons, LDAP messages, entries and time per operation, and the time a fetch may take.
-  Malformed input of any kind is fuzzed against these rules on every test run.
+  Every run of the test suite fuzzes the parsers an attacker can reach (DER, XML and XML
+  signatures, BER for LDAP, SCIM filters and requests, JOSE, SAML responses, CAS answers and
+  the OpenID Connect and CAS callbacks) with generated input, 300 cases each (20,000 with
+  `CARNELIAN_FUZZ=deep`): each may fail only with its own refusal, a signed SAML
+  response with one byte changed is refused or read exactly as before, and an ID token with
+  one byte changed is refused.
 - **It never implements private-key cryptography itself.** The core only verifies.
   Decrypting SAML assertions and signing SAML requests and logout messages go through the
   interface of `carnelian.keys` (sign bytes, unwrap a content key, decrypt content): the
@@ -40,7 +45,9 @@ Only the newest release is supported while Carnelian is below 1.0. Fixes are not
   features are refused by name. Which XML Encryption algorithms are accepted is set by
   configuration, never by the document: RSA PKCS #1 v1.5 key transport is always refused,
   AES-CBC is decrypted only when configured and under a verified signature on the whole
-  Response, and every decryption failure is the same refusal.
+  Response, and every failure to decrypt is the same refusal after the same work (every key
+  tried, a failed unwrap continuing with a random content key). A decrypted assertion
+  without its own signature must declare every namespace prefix it uses.
 - **It leaves to the application**, and the guides in `docs/` show each in place:
   - keeping each sign-in's pending record server-side, tied to the browser and used once;
   - a shared, atomic replay store when SAML runs in several processes (`ReplayStore`);

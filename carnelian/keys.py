@@ -12,7 +12,8 @@ in for the backend here:
 - `DecryptionKey.decryptContent`: AES-GCM or AES-CBC decryption of the content with that key.
 
 A key used to sign is never used to decrypt: give each its own key pair. Every decryption
-failure raises the same `DecryptionFailed`, whatever went wrong.
+failure, of the key or of the content, raises the same `DecryptionFailed` with the same
+message, whatever went wrong.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ _contentKeyLengths = {"aes128-gcm": 16, "aes256-gcm": 32, "aes128-cbc": 16, "aes
 _gcmIVLength = 12
 _gcmTagLength = 16
 _blockLength = 16
+_doesNotDecrypt = "this does not decrypt with this key"
 
 
 class SigningKey(Protocol):
@@ -166,24 +168,24 @@ class LocalDecryptionKey:
       return self._key.decrypt(wrappedKey, padding.OAEP(mgf=padding.MGF1(_hashes[maskDigest]()),
                                                         algorithm=_hashes[oaepDigest](), label=None))
     except ValueError:
-      raise DecryptionFailed("the content key does not decrypt") from None
+      raise DecryptionFailed(_doesNotDecrypt) from None
 
   def decryptContent(self, algorithm: str, contentKey: bytes, cipherData: bytes) -> bytes:
     if algorithm not in _contentKeyLengths:
       raise ValueError(f"content algorithm {algorithm!r} is not one of {sorted(_contentKeyLengths)}")
     if len(contentKey) != _contentKeyLengths[algorithm]:
-      raise DecryptionFailed("the content does not decrypt")
+      raise DecryptionFailed(_doesNotDecrypt)
     if algorithm.endswith("-gcm"):
       if len(cipherData) < _gcmIVLength + _gcmTagLength:
-        raise DecryptionFailed("the content does not decrypt")
+        raise DecryptionFailed(_doesNotDecrypt)
       try:
         return AESGCM(contentKey).decrypt(cipherData[:_gcmIVLength], cipherData[_gcmIVLength:], None)
       except InvalidTag:
-        raise DecryptionFailed("the content does not decrypt") from None
+        raise DecryptionFailed(_doesNotDecrypt) from None
     if len(cipherData) < 2 * _blockLength or len(cipherData) % _blockLength:
-      raise DecryptionFailed("the content does not decrypt")
+      raise DecryptionFailed(_doesNotDecrypt)
     decryptor = Cipher(algorithms.AES(contentKey), modes.CBC(cipherData[:_blockLength])).decryptor()
     padded = decryptor.update(cipherData[_blockLength:]) + decryptor.finalize()
     if not 1 <= padded[-1] <= _blockLength:
-      raise DecryptionFailed("the content does not decrypt")
+      raise DecryptionFailed(_doesNotDecrypt)
     return padded[:-padded[-1]]

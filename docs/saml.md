@@ -100,7 +100,8 @@ said; honour it in your session.
 `ReplayCache` is kept in memory, in one process. Behind several processes, give
 `ServiceProvider` a `ReplayStore` of your own: its `admit(issuer, assertionID, until, now)`
 must claim the pair atomically (a database table with the pair as its unique key) and raise
-`SAMLRefused` when it is already claimed.
+`SAMLRefused` when it is already claimed. The same store keeps the provider's LogoutRequest
+IDs and, under your own entity ID, the IDs of your logout requests already answered.
 
 ## Keys of your own: encryption, signed requests, single logout
 
@@ -177,9 +178,18 @@ Everything else is refused by name before any key is used:
 Every failure after that point (a key that does not unwrap, a tag that does not verify,
 padding, a plaintext that is not one element) is one refusal, "the encrypted assertion does
 not decrypt with this service provider's keys", so the answer says nothing about which step
-failed. The decrypted assertion is parsed with the same limits as the response, in the
-namespaces in scope where it was encrypted, and goes through every check above: its own
-signature when the Response is unsigned, audience, conditions, confirmation, replay.
+failed. The work done does not tell either: every configured key unwraps and decrypts the
+content, and a key that does not unwrap decrypts with a random content key of the right
+length, which fails at the GCM tag as a tampered ciphertext does. A key service of your own
+should likewise raise the same error for every failure.
+
+The decrypted assertion is parsed with the same limits as the response, in the namespaces
+in scope where it was encrypted, and goes through every check above: its own signature when
+the Response is unsigned, audience, conditions, confirmation, replay. Unless it carries its
+own signature, it must declare every namespace prefix it uses itself: the Response's
+signature (exclusive canonicalization) does not cover a declaration that nothing outside the
+ciphertext uses, so such a prefix could be rebound to change what the assertion says, and
+an assertion that takes one from outside is refused by name.
 
 saml2int, the federation interoperability profile, asks identity providers to encrypt with
 AES-GCM and RSA-OAEP and service providers to decrypt with any of their configured keys;
@@ -236,11 +246,23 @@ def signOutReturn():
   return redirect("/")
 ```
 
-`finishSignOut` checks the LogoutResponse's signature, that it answers this request
-(InResponseTo), that it is for your logout address (Destination), its issuer, and its
-status: anything but Success is refused with the provider's status. `readSignOutRequest`
+`finishSignOut` checks the LogoutResponse's signature, that it has an ID, that it answers
+this request (InResponseTo), that it is for your logout address (Destination), that it was
+issued between the request and now, its issuer, and its status: anything but Success is
+refused with the provider's status. It accepts one answer per request: the request's ID is
+claimed in the `ReplayStore` under your own entity ID, so a second answer is refused, on
+every process sharing the store. `readSignOutRequest`
 checks the signature, Destination and issuer, that the request was issued within
 `pendingSeconds` and is not past its NotOnOrAfter, that its ID has not been seen before (the
 `ReplayStore`), and that it names a plain NameID (EncryptedID and BaseID are refused); it
 returns the NameID, the SessionIndexes and the RelayState. End the sessions before you
-answer: `answerSignOut` always says Success.
+answer: `answerSignOut` always says Success, signed, and is refused by name without a
+signing key.
+
+In a Redirect binding query, `SAMLRequest`, `SAMLResponse`, `RelayState`, `SigAlg` and
+`Signature` are read by their literal names, as the signature covers them; a parameter that
+spells one of them encoded (`Relay%53tate`) or carries it twice is refused. The provider's
+single sign-on and logout addresses may carry a query of their own, but not a fragment or
+any of these parameters. Names, session indexes and other text you pass are escaped in the
+XML Carnelian writes; a character XML cannot carry (a control character, a lone surrogate)
+is refused by name.

@@ -9,7 +9,8 @@ service address it was issued for. Both the CAS server and the service address m
 https. The ticket is checked by the CAS server itself (`/p3/serviceValidate`, over HTTPS),
 which answers the user (text only) and the attributes it releases. Only service tickets
 are accepted: a proxy ticket, an answer listing proxies and an answer carrying a
-proxy-granting ticket are refused by name.
+proxy-granting ticket are refused by name. A failure to reach the CAS server is a CASRefused
+too, its message without the ticket or the state.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from carnelian.fetching import DocumentFetcher
+from carnelian.fetching import DocumentFetcher, HTTPFailure
 from carnelian.xmlTree import Element, XMLRefused, parse
 
 __all__ = ["CASRefused", "CASServer", "Pending", "CASIdentity", "readLogoutRequest"]
@@ -44,8 +45,11 @@ class Pending:
 
 @dataclass(frozen=True)
 class CASIdentity:
+  """The CAS user, the attributes released, and the service ticket: keep the ticket with the session it starts, so a
+  single-logout notice naming it (`readLogoutRequest`) ends that session."""
   userName: str
   attributes: dict[str, tuple[str, ...]] = field(repr=False)
+  ticket: str = field(repr=False)
 
 
 class CASServer:
@@ -77,10 +81,17 @@ class CASServer:
     ticket = query.get("ticket", "")
     if not _ticketPattern.fullmatch(ticket):
       raise CASRefused("the CAS server sent no service ticket")
-    address = f"{self.serverURL}/p3/serviceValidate?" + urllib.parse.urlencode(
-      {"service": self._service(pending.state), "ticket": ticket})
-    return self.read(self.fetcher.getBytes(address, "application/xml"))
-
+    validation = f"{self.serverURL}/p3/serviceValidate"
+    address = f"{validation}?" + urllib.parse.urlencode({"service": self._service(pending.state), "ticket": ticket})
+    try:
+      answer = self.fetcher.getBytes(address, "application/xml")
+    except HTTPFailure as error:
+      reason = str(error).replace(address, validation)
+      for secret in (ticket, pending.state):
+        reason = reason.replace(secret, "(withheld)")
+      raise CASRefused(f"the CAS server's validation could not be fetched: {reason}") from None
+    userName, attributes = self.read(answer)
+    return CASIdentity(userName=userName, attributes=attributes, ticket=ticket)
 
   def logoutAddress(self, returnURL: str | None = None) -> str:
     """Where to send the person to sign out of CAS too; CAS sends them on to returnURL if its service registry allows."""
@@ -90,14 +101,14 @@ class CASServer:
       raise ValueError(f"a return address is https, not {returnURL!r}")
     return f"{self.serverURL}/logout?{urllib.parse.urlencode({'service': returnURL})}"
 
-  def read(self, answer: bytes) -> CASIdentity:
+  def read(self, answer: bytes) -> tuple[str, dict[str, tuple[str, ...]]]:
     """The CAS server's validation answer: the user and the released attributes, or why it refused."""
     try:
       return self._read(parse(answer))
     except XMLRefused as error:
       raise CASRefused(f"the CAS server's answer is refused: {error}") from None
 
-  def _read(self, root: Element) -> CASIdentity:
+  def _read(self, root: Element) -> tuple[str, dict[str, tuple[str, ...]]]:
     if not root.isA(casNamespace, "serviceResponse"):
       raise CASRefused("the CAS server's answer is not a serviceResponse")
     failure = root.optional(casNamespace, "authenticationFailure")
@@ -118,7 +129,7 @@ class CASServer:
         if attribute.namespaceURI != casNamespace:
           raise CASRefused(f"an attribute outside the CAS namespace: {attribute.localName}")
         attributes[attribute.localName] = attributes.get(attribute.localName, ()) + (attribute.text.strip(),)
-    return CASIdentity(userName=userName, attributes=attributes)
+    return userName, attributes
 
 
 def readLogoutRequest(logoutRequest: str) -> str:
@@ -127,7 +138,11 @@ def readLogoutRequest(logoutRequest: str) -> str:
   CAS does not sign these notices: end only the session that this ticket started, so a forged
   notice can do no more than sign out a session whose ticket its sender already knows."""
   try:
-    root = parse(logoutRequest.encode("utf-8"))
+    document = logoutRequest.encode("utf-8")
+  except UnicodeEncodeError:
+    raise CASRefused("the logout notice holds a lone surrogate, which is not text") from None
+  try:
+    root = parse(document)
     if not root.isA(samlProtocolNamespace, "LogoutRequest") or not root.attribute("ID"):
       raise CASRefused("the notice is not a SAML LogoutRequest with an ID")
     ticket = root.only(samlProtocolNamespace, "SessionIndex").simpleText.strip()

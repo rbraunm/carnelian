@@ -211,6 +211,24 @@ def testSignedAssertionsOutsideTheProfileAreRefused(edit, message):
     provider().finishSignIn(pending, signedEdited(edit))
 
 
+@pytest.mark.parametrize("address, why", [
+  (f"{idp}/sso#top", "carries a fragment"),
+  (f"{idp}/sso?SAMLRequest=x", r"already carries \['SAMLRequest'\]"),
+  (f"{idp}/sso?tenant=a&Relay%53tate=x", r"already carries \['RelayState'\]"),
+  (f"{idp}/sso?Signature", r"already carries \['Signature'\]"),
+])
+def testAnIdentityProviderAddressTheBindingCannotExtendIsRefused(address, why):
+  with pytest.raises(SAMLRefused, match=why):
+    IdentityProvider(idp, address, (public,))
+  with pytest.raises(SAMLRefused, match=why):
+    IdentityProvider(idp, f"{idp}/sso", (public,), singleLogoutURL=address)
+
+
+def testAnIdentityProvidersOwnQueryIsKept():
+  serviceProvider = ServiceProvider(sp, acs, IdentityProvider(idp, f"{idp}/sso?tenant=a", (public,)), clock=lambda: now)
+  assert serviceProvider.beginSignIn()[0].startswith(f"{idp}/sso?tenant=a&SAMLRequest=")
+
+
 def testTheSessionEndIsReturned():
   posting = signedEdited(lambda assertion: first(assertion, "saml:AuthnStatement").set("SessionNotOnOrAfter", instant(3600)))
   assert provider().finishSignIn(pending, posting).sessionNotOnOrAfter == now + 3600

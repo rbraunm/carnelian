@@ -40,6 +40,13 @@ serviceProvider = ServiceProvider("https://app.example.org/saml", "https://app.e
 person = scopedIdentifier(identity, institution, subjectID)              # e.g. "a1b2c3@arizona.edu"
 ```
 
+`federation.institution` refuses by name (`SAMLRefused`) an entity ID over SAML's 1,024
+characters, a failed fetch (an entity the MDQ service does not know answers 404), and
+metadata that fails its checks. Each refusal is remembered for `refusalCacheSeconds` (60
+by default), so a discovery form sending one entity ID again and again fetches it once in
+that time; a valid institution is kept until its `validUntil`, at most
+`maximumCacheSeconds`.
+
 `scopedIdentifier` refuses an identifier whose scope (the part after `@`) is not one the
 federation registered for that institution, so one university cannot sign in another's
 people. Only the scoped identifier is checked this way: the NameID, `mail` and other
@@ -53,9 +60,11 @@ To offer "choose your institution" across a whole federation, read its aggregate
 signed document holding every member. eduGAIN's
 (`https://mds.edugain.org/edugain-v2.xml`) is about 95 MB with about 6,600 identity
 providers, so it is read as a stream: each entity is built as a small tree, read and
-dropped, and the document's canonical form is hashed as it goes by. Memory follows the
-largest entity, not the document (about 20 MB traced for eduGAIN's), and reading it takes
-under a minute.
+dropped, and the document's canonical form is hashed as it goes by. Reading follows the
+largest entity, not the document (about 20 MB traced for eduGAIN's), and takes under a
+minute. `fetchAggregate` holds the downloaded document in memory, up to `maximumBytes`,
+while it is read; give `readAggregate` chunks of your own (from a file, say) to keep memory
+at the reading's.
 
 ```python
 from carnelian.aggregate import fetchAggregate

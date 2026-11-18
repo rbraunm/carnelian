@@ -4,7 +4,10 @@
 A federation vouches for its institutions by signing their metadata. Each institution's
 metadata is fetched by the Metadata Query protocol (MDQ: one small signed document per
 entity, as InCommon serves its own and eduGAIN's), its signature checked against the
-federation's signing certificate, and its validUntil required and honoured. What is read:
+federation's signing certificate, and its validUntil required and honoured. An institution is
+cached until its validUntil (at most `maximumCacheSeconds`); a refusal, an unknown entity ID
+among them, is cached for `refusalCacheSeconds`, so a discovery form cannot make repeated
+requests for one entity ID fetch each time. A failed fetch is a SAMLRefused like any other. What is read:
 the identity provider (its single sign-on address and signing keys), its display names, the
 federation that registered it, its entity categories, and its scopes. A whole federation's
 aggregate, every member in one document, is read by `carnelian.aggregate`.
@@ -28,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from carnelian.der import publicKeyFromCertificate
-from carnelian.fetching import DocumentFetcher
+from carnelian.fetching import DocumentFetcher, HTTPFailure
 from carnelian.saml import (EncryptionPolicy, IdentityProvider, SAMLIdentity, SAMLRefused, _time, assertionNamespace, entityAttributeNamespace,
                             entityCategoryName, identityProviderFromDescriptor, metadataNamespace, uiNamespace)
 from carnelian.saml import serviceProviderMetadata as samlServiceProviderMetadata
@@ -44,6 +47,8 @@ registrationNamespace = "urn:oasis:names:tc:SAML:metadata:rpi"
 hideFromDiscovery = "http://refeds.org/category/hide-from-discovery"
 researchAndScholarship = "http://refeds.org/category/research-and-scholarship"
 metadataMediaType = "application/samlmetadata+xml"
+maximumEntityIDLength = 1024
+maximumRefusals = 10_000
 
 subjectID = "urn:oasis:names:tc:SAML:attribute:subject-id"
 pairwiseID = "urn:oasis:names:tc:SAML:attribute:pairwise-id"
@@ -121,23 +126,49 @@ class Federation:
   """A federation's institutions, fetched one by one from its MDQ service and checked against its signing certificate."""
 
   def __init__(self, name: str, mdqURL: str, signingCertificate: str | bytes, fetcher: DocumentFetcher,
-               maximumCacheSeconds: float = 6 * 3600, clock: Callable[[], float] = time.time) -> None:
+               maximumCacheSeconds: float = 6 * 3600, refusalCacheSeconds: float = 60,
+               clock: Callable[[], float] = time.time) -> None:
     if not mdqURL.startswith("https://") or mdqURL.endswith("/"):
       raise ValueError("mdqURL must be an https address without a trailing slash")
+    if refusalCacheSeconds <= 0:
+      raise ValueError("refusalCacheSeconds must be positive")
     self.name, self.mdqURL, self.fetcher = name, mdqURL, fetcher
     self.signingKey = publicKeyFromCertificate(signingCertificate)
-    self.maximumCacheSeconds, self.clock = maximumCacheSeconds, clock
+    self.maximumCacheSeconds, self.refusalCacheSeconds, self.clock = maximumCacheSeconds, refusalCacheSeconds, clock
     self._cache: dict[str, tuple[float, Institution]] = {}
+    self._refusals: dict[str, tuple[float, str]] = {}
 
   def institution(self, entityID: str) -> Institution:
+    """The institution of this entity ID, cached or fetched; a refusal is remembered for refusalCacheSeconds."""
+    if not entityID or len(entityID) > maximumEntityIDLength:
+      raise SAMLRefused(f"an entity ID is 1 to {maximumEntityIDLength} characters")
     now = self.clock()
     cached = self._cache.get(entityID)
     if cached is not None and cached[0] > now:
       return cached[1]
+    refused = self._refusals.get(entityID)
+    if refused is not None and refused[0] > now:
+      raise SAMLRefused(refused[1])
     address = f"{self.mdqURL}/entities/{urllib.parse.quote(entityID, safe='')}"
-    institution = self.read(self.fetcher.getBytes(address, metadataMediaType), entityID)
+    try:
+      try:
+        metadata = self.fetcher.getBytes(address, metadataMediaType)
+      except HTTPFailure as error:
+        raise SAMLRefused(f"{self.name}'s metadata for {entityID} could not be fetched: {error}") from None
+      institution = self.read(metadata, entityID)
+    except SAMLRefused as refusal:
+      self._remember(entityID, str(refusal), now)
+      raise
+    self._refusals.pop(entityID, None)
     self._cache[entityID] = (min(institution.validUntil, now + self.maximumCacheSeconds), institution)
     return institution
+
+  def _remember(self, entityID: str, refusal: str, now: float) -> None:
+    if len(self._refusals) >= maximumRefusals:
+      self._refusals = {known: entry for known, entry in self._refusals.items() if entry[0] > now}
+    while len(self._refusals) >= maximumRefusals:
+      del self._refusals[next(iter(self._refusals))]
+    self._refusals[entityID] = (now + self.refusalCacheSeconds, refusal)
 
   def read(self, metadata: bytes, entityID: str) -> Institution:
     """One entity's signed metadata, as the MDQ service answers it, checked."""

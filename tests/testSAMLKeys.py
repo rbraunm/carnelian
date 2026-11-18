@@ -23,9 +23,9 @@ from cryptography import x509
 from lxml import etree
 
 from carnelian.fetching import Fetcher, secureContext
-from carnelian.keys import LocalDecryptionKey, LocalSigningKey, ecdsaSHA256, rsaSHA256
-from carnelian.saml import (EncryptionPolicy, IdentityProvider, ReplayCache, SAMLRefused, ServiceProvider, aes128CBC,
-                            aes128GCM, aes256CBC, aes256GCM, identityProviderFromMetadata, rsaOAEP, rsaOAEPMGF1P,
+from carnelian.keys import DecryptionFailed, LocalDecryptionKey, LocalSigningKey, ecdsaSHA256, rsaSHA256
+from carnelian.saml import (EncryptionPolicy, IdentityProvider, ReplayCache, SAMLRefused, ServiceProvider, SignOutRequest,
+                            aes128CBC, aes128GCM, aes256CBC, aes256GCM, identityProviderFromMetadata, rsaOAEP, rsaOAEPMGF1P,
                             serviceProviderMetadata)
 from carnelian.xmlTree import parse
 
@@ -57,10 +57,10 @@ hashFor = {None: hashes.SHA1, sha256Digest: hashes.SHA256, f"{xenc11}mgf1sha256"
 
 
 def encrypt(root, content=aes256GCM, transport=rsaOAEPMGF1P, digest=None, mask=None, recipient=decryptionPrivate,
-            placement="inside", keyCount=1, label=None, tamper=False):
+            placement="inside", keyCount=1, label=None, tamper=False, rewrite=None):
   """Replace the response's assertion by an EncryptedAssertion, the way an identity provider encrypts it."""
   assertion = root.find(f"{{{saml}}}Assertion")
-  plaintext = etree.tostring(assertion)
+  plaintext = etree.tostring(assertion) if rewrite is None else rewrite(etree.tostring(assertion))
   contentKey = os.urandom(16 if "128" in content else 32)
   if content.endswith("gcm"):
     iv = os.urandom(12)
@@ -173,6 +173,75 @@ def testATamperedCiphertextAndAWrongKeyGetTheSameRefusal():
       provider(decryptionKeys=keys, encryptionPolicy=cbcPolicy).finishSignIn(pending, posted(root))
     refusals.append(str(refused.value))
   assert refusals == ["the encrypted assertion does not decrypt with this service provider's keys"] * 3
+
+
+extension = "urn:example:extension"
+roleStatement = (b'<x:AttributeStatement><x:Attribute Name="role"><x:AttributeValue>admin</x:AttributeValue></x:Attribute>'
+                 b"</x:AttributeStatement></saml:Assertion>")
+
+
+def responseDeclaringX():
+  """A response whose root declares the prefix x, which nothing outside the encrypted assertion uses."""
+  return etree.fromstring(etree.tostring(response()).replace(b"<samlp:Response ", f'<samlp:Response xmlns:x="{extension}" '.encode(), 1))
+
+
+def testADecryptedAssertionUsingAPrefixFromOutsideItIsRefusedUnderTheResponseSignature():
+  # Exclusive canonicalization leaves out xmlns:x, so it can be rebound without breaking the Response's signature.
+  def withRoles(plaintext):
+    return plaintext.replace(f' xmlns:x="{extension}"'.encode(), b"").replace(b"</saml:Assertion>", roleStatement)
+  root = signed(encrypt(responseDeclaringX(), rewrite=withRoles))
+  document = etree.tostring(root)
+  rebound = document.replace(f'xmlns:x="{extension}"'.encode(), f'xmlns:x="{saml}"'.encode())
+  assert rebound != document
+  for sent in (document, rebound):
+    with pytest.raises(SAMLRefused, match=r"the decrypted assertion uses namespace prefixes \['x'\] declared outside it"):
+      provider().finishSignIn(pending, base64.b64encode(sent).decode())
+
+
+def testADecryptedAssertionWithItsOwnSignatureMayUsePrefixesFromOutsideIt():
+  root = encrypt(signAssertion(response()), rewrite=lambda plaintext: plaintext.replace(f' xmlns:saml="{saml}"'.encode(), b"", 1))
+  assert provider().finishSignIn(pending, posted(root)).nameID == "ana"
+
+
+class RecordingKey:
+  """A decryption key that notes each operation it is asked for, with the content algorithm and key length."""
+
+  def __init__(self, key):
+    self.key, self.calls = key, []
+
+  @property
+  def certificate(self):
+    return self.key.certificate
+
+  def unwrapKey(self, wrappedKey, oaepDigest, maskDigest):
+    self.calls.append("unwrapKey")
+    return self.key.unwrapKey(wrappedKey, oaepDigest, maskDigest)
+
+  def decryptContent(self, algorithm, contentKey, cipherData):
+    self.calls.append(("decryptContent", algorithm, len(contentKey)))
+    return self.key.decryptContent(algorithm, contentKey, cipherData)
+
+
+def testEveryKeyUnwrapsAndDecryptsContentWhetherOrNotItsUnwrapFails():
+  right, wrong = RecordingKey(decryptionKey), RecordingKey(otherDecryptionKey)
+  assert provider(decryptionKeys=(right, wrong)).finishSignIn(pending, posted(encrypt(signAssertion(response())))).nameID == "ana"
+  assert right.calls == wrong.calls == ["unwrapKey", ("decryptContent", "aes256-gcm", 32)]
+  alone = RecordingKey(otherDecryptionKey)
+  with pytest.raises(SAMLRefused, match="does not decrypt with this service provider's keys"):
+    provider(decryptionKeys=(alone,)).finishSignIn(pending, posted(encrypt(signAssertion(response()), aes128GCM)))
+  assert alone.calls == ["unwrapKey", ("decryptContent", "aes128-gcm", 16)]
+
+
+def testEveryDecryptionFailureOfTheBackendIsOneTypeWithOneMessage():
+  failures = []
+  for attempt in (lambda: decryptionKey.unwrapKey(bytes(256), "sha1", "sha1"),
+                  lambda: decryptionKey.decryptContent("aes256-gcm", bytes(32), bytes(40)),
+                  lambda: decryptionKey.decryptContent("aes128-gcm", bytes(32), bytes(40)),
+                  lambda: decryptionKey.decryptContent("aes128-cbc", bytes(16), bytes(8))):
+    with pytest.raises(DecryptionFailed) as failed:
+      attempt()
+    failures.append(str(failed.value))
+  assert failures == ["this does not decrypt with this key"] * 4
 
 
 def testADecryptedAssertionStillNeedsASignature():
@@ -327,8 +396,11 @@ def redirectQuery(document, parameter, relayState=None, signWith=key, sigAlg=rsa
   return query + "&" + urllib.parse.urlencode({"Signature": base64.b64encode(signature).decode()})
 
 
-def logoutResponse(inResponseTo, destination=slo, issuer=idp, status="urn:oasis:names:tc:SAML:2.0:status:Success"):
-  return (f'<samlp:LogoutResponse xmlns:samlp="{samlp}" xmlns:saml="{saml}" ID="lr1" Version="2.0" IssueInstant="{instant(0)}" '
+def logoutResponse(inResponseTo, destination=slo, issuer=idp, status="urn:oasis:names:tc:SAML:2.0:status:Success",
+                   responseID="lr1", issued=0):
+  identifier = f' ID="{responseID}"' if responseID is not None else ""
+  return (f'<samlp:LogoutResponse xmlns:samlp="{samlp}" xmlns:saml="{saml}"{identifier} Version="2.0" '
+          f'IssueInstant="{instant(issued)}" '
           f'Destination="{destination}" InResponseTo="{inResponseTo}"><saml:Issuer>{issuer}</saml:Issuer>'
           f'<samlp:Status><samlp:StatusCode Value="{status}"/></samlp:Status></samlp:LogoutResponse>')
 
@@ -380,11 +452,30 @@ def testTheProvidersLogoutResponseIsAcceptedByEitherBinding():
   (lambda requestID: redirectQuery(logoutResponse(requestID), "SAMLResponse").replace("&SigAlg", "&RelayState=x&SigAlg"),
    "does not verify with any trusted key"),
   (lambda requestID: "SAMLResponse=x&" + redirectQuery(logoutResponse(requestID), "SAMLResponse"), "carries SAMLResponse twice"),
+  (lambda requestID: redirectQuery(logoutResponse(requestID, responseID=None), "SAMLResponse"),
+   "not a SAML 2.0 LogoutResponse with an ID"),
+  (lambda requestID: redirectQuery(logoutResponse(requestID, issued=-3600), "SAMLResponse"),
+   "was not issued between this logout's request and now"),
+  (lambda requestID: redirectQuery(logoutResponse(requestID, issued=3600), "SAMLResponse"),
+   "was not issued between this logout's request and now"),
+  (lambda requestID: redirectQuery(logoutResponse(requestID), "SAMLResponse", "back").replace("RelayState=", "Relay%53tate="),
+   "the query spells RelayState as 'Relay%53tate'; only the literal name is read"),
+  (lambda requestID: redirectQuery(logoutResponse(requestID), "SAMLResponse").replace("SigAlg=", "%53igAlg="),
+   "the query spells SigAlg as '%53igAlg'"),
 ])
 def testALogoutResponseOutsideTheProfileIsRefused(query, message):
   started = provider().beginSignOut("ana", None, "s-1")[1]
   with pytest.raises(SAMLRefused, match=message):
     provider().finishSignOut(started, query=query(started.requestID))
+
+
+def testALogoutResponseIsAcceptedOnce():
+  cache = ReplayCache()
+  started = provider(cache=cache).beginSignOut("ana", None, "s-1")[1]
+  assert provider(cache=cache).finishSignOut(started, query=redirectQuery(logoutResponse(started.requestID), "SAMLResponse")) is None
+  again = redirectQuery(logoutResponse(started.requestID, responseID="lr2"), "SAMLResponse")
+  with pytest.raises(SAMLRefused, match=f"'{started.requestID}' was already used"):
+    provider(cache=cache).finishSignOut(started, query=again)
 
 
 def testAnUnsignedPostedLogoutResponseIsRefused():
@@ -396,6 +487,30 @@ def testAnUnsignedPostedLogoutResponseIsRefused():
 def testLogoutNeedsASigningKey():
   with pytest.raises(SAMLRefused, match="single logout needs a signing key"):
     provider(withSigningKey=False).beginSignOut("ana", None, "s-1")
+
+
+def testAnswerSignOutNeedsASigningKeyWhereverTheAnswerGoes():
+  identityProvider = IdentityProvider(idp, f"{idp}/sso", (public,), singleLogoutURL=idpLogout,
+                                      singleLogoutResponseURL=f"{idp}/answers")
+  request = SignOutRequest(requestID="_idp1", nameID="ana", nameIDFormat=None, sessionIndexes=("s-1",), relayState=None)
+  unsigned = ServiceProvider(sp, acs, identityProvider, clock=lambda: now, singleLogoutURL=slo)
+  with pytest.raises(SAMLRefused, match="single logout needs a signing key"):
+    unsigned.answerSignOut(request)
+  keyed = ServiceProvider(sp, acs, identityProvider, clock=lambda: now, signingKey=signingKey, singleLogoutURL=slo)
+  address = keyed.answerSignOut(request)
+  assert address.startswith(f"{idp}/answers?")
+  assert outgoing(address, "SAMLResponse")[0].attribute("Destination") == f"{idp}/answers"
+
+
+def testTheServiceProvidersOwnXMLCarriesAnyTextXMLCan():
+  nameID, sessionIndex = 'a]]>b&<"c\td\r\ne', "s]]>1"
+  request, _ = outgoing(provider().beginSignOut(nameID, "urn:example:format]]>", sessionIndex)[0], "SAMLRequest")
+  assert [(element.localName, element.simpleText) for element in request.elements()] == [
+    ("Issuer", sp), ("NameID", nameID), ("SessionIndex", sessionIndex)]
+  assert request.only(saml, "NameID").attribute("Format") == "urn:example:format]]>"
+  for unwritable in ("a\x00b", "a\udcffb"):
+    with pytest.raises(SAMLRefused, match="holds a character XML cannot carry"):
+      provider().beginSignOut(unwritable, None, None)
 
 
 def testTheProvidersLogoutRequestIsReadAndAnsweredSigned():

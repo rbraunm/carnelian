@@ -11,7 +11,7 @@ import urllib.request
 import pytest
 
 from carnelian.cas import CASRefused, CASServer, Pending, readLogoutRequest
-from carnelian.fetching import Fetcher, secureContext
+from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 
 from testOIDC import account
 
@@ -52,7 +52,7 @@ def testATicketIsValidatedForExactlyItsServiceAndReadWithItsAttributes():
                       '</cas:authenticationSuccess>'))
   pending = Pending(state="s1", startedAt=now - 5)
   identity = cas.finishSignIn(pending, {"state": "s1", "ticket": "ST-1-abc"})
-  assert identity.userName == "ana"
+  assert (identity.userName, identity.ticket) == ("ana", "ST-1-abc")
   assert identity.attributes == {"mail": ("ana@example.edu",), "memberOf": ("/field", "/analysts")}
   query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(cas.fetcher.asked[0]).query))
   assert cas.fetcher.asked[0].startswith(f"{server}/p3/serviceValidate?")
@@ -78,6 +78,30 @@ def testATicketForAnotherSignInOrOfAnotherKindIsRefused(query, why):
 def testMalformedCallbacksAreRefusedByName(query, why):
   with pytest.raises(CASRefused, match=why):
     client().finishSignIn(Pending(state="s1", startedAt=now - 5), query)
+
+
+class Unreachable:
+  """A network that fails with a message, as the fetcher words it, naming the address it was asked for."""
+
+  def __init__(self, words):
+    self.words = words
+
+  def getBytes(self, address, accept):
+    raise HTTPFailure(self.words.format(address=address, quoted=urllib.parse.quote(address, safe="")))
+
+
+@pytest.mark.parametrize("words, reason", [
+  ("{address} answered 502, not 200", f"{server}/p3/serviceValidate answered 502, not 200"),
+  ("{address}: ConnectionResetError: reset", f"{server}/p3/serviceValidate: ConnectionResetError: reset"),
+  ("could not reach {quoted}", "could not reach https%3A%2F%2Fcas.example.edu%2Fcas%2Fp3%2FserviceValidate%3Fservice%3D"
+                               "https%253A%252F%252Fapp.example.org%252Fsignin%252Fcas%252Freturn%253Fstate%253D(withheld)"
+                               "%26ticket%3D(withheld)"),
+])
+def testAFailedValidationIsRefusedByNameWithoutTheTicketOrTheState(words, reason):
+  cas = CASServer(server, service, Unreachable(words), clock=lambda: now)
+  with pytest.raises(CASRefused) as refused:
+    cas.finishSignIn(Pending(state="state-9Zq", startedAt=now - 5), {"state": "state-9Zq", "ticket": "ST-7-secretTicket"})
+  assert str(refused.value) == f"the CAS server's validation could not be fetched: {reason}"
 
 
 @pytest.mark.parametrize("serviceURL", ["http://app.example.org/signin/cas/return", "app.example.org/return"])
@@ -164,7 +188,7 @@ def testEveryoneSignsInThroughCAS(testbed, casServer, userName):
   query = signInAtCAS(address, userName, expected["password"], casServer.fetcher.context)
   assert query is not None and "ticket" in query
   identity = casServer.finishSignIn(pending, query)
-  assert identity.userName == userName
+  assert (identity.userName, identity.ticket) == (userName, query["ticket"])
   assert identity.attributes["mail"] == (expected["email"],)
   assert sorted(identity.attributes.get("memberOf", ())) == sorted(expected["groups"])
   with pytest.raises(CASRefused, match="INVALID_TICKET"):
@@ -204,6 +228,7 @@ def testASingleLogoutNoticeNamesItsTicket():
   (notice.replace("<samlp:SessionIndex>{ticket}</samlp:SessionIndex>", ""), "SessionIndex"),
   ('<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="x"/>', "not a SAML LogoutRequest"),
   ('<!DOCTYPE a [<!ENTITY x "y">]><a/>', "refused"),
+  (notice.format(ticket="ST-12-abc\udcff"), "holds a lone surrogate"),
 ])
 def testALogoutNoticeThatIsNotExactlyOneIsRefused(text, why):
   with pytest.raises(CASRefused, match=why):
