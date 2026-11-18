@@ -94,8 +94,6 @@ def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKe
     if _algorithm(method) != exclusiveC14N:
       raise SignatureRefused(f"SignedInfo canonicalization {_algorithm(method)} is refused; only exclusive c14n")
     signatureMethod = _algorithm(signedInfo.only(dsig, "SignatureMethod"))
-    if signatureMethod not in _signatureMethods:
-      raise SignatureRefused(f"signature method {signatureMethod} is not supported")
     references = signedInfo.childrenNamed(dsig, "Reference")
     if len(references) != 1:
       raise SignatureRefused(f"SignedInfo has {len(references)} references; exactly one is accepted")
@@ -122,6 +120,19 @@ def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKe
     value = _base64(signature.only(dsig, "SignatureValue").text)
   except XMLRefused as error:
     raise SignatureRefused(str(error)) from None
+  verifySignatureValue(signedBytes, value, signatureMethod, trustedKeys)
+  return signed
+
+
+def verifySignatureValue(signedBytes: bytes, value: bytes, signatureMethod: str,
+                         trustedKeys: list[RSAPublicKey | ECPublicKey]) -> None:
+  """Verify a signature value made by `signatureMethod` (an XML-DSig URI) over bytes, as the Redirect binding signs."""
+  if not trustedKeys:
+    raise SignatureRefused("no trusted key to verify with")
+  if signatureMethod in _refusedByName:
+    raise SignatureRefused(_refusedByName[signatureMethod])
+  if signatureMethod not in _signatureMethods:
+    raise SignatureRefused(f"signature method {signatureMethod} is not supported")
   kind, hashName = _signatureMethods[signatureMethod]
   for key in trustedKeys:
     try:
@@ -136,7 +147,7 @@ def verifyEnveloped(signed: Element, trustedKeys: list[RSAPublicKey | ECPublicKe
           key.verifyPKCS1v15(signedBytes, value, hashName)
         else:
           key.verifyPSS(signedBytes, value, hashName, hashlib.new(hashName).digest_size)
-      return signed
+      return
     except SignatureError:
       continue
   raise SignatureRefused("the signature does not verify with any trusted key")

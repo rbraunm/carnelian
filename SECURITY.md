@@ -33,8 +33,14 @@ Only the newest release is supported while Carnelian is below 1.0. Fixes are not
   comparisons, LDAP messages, entries and time per operation, and the time a fetch may take.
   Malformed input of any kind is fuzzed against these rules on every test run.
 - **It never implements private-key cryptography itself.** The core only verifies.
-  Decrypting SAML assertions and signing requests will go through an optional `keys` extra
-  on pyca/cryptography; until then they are refused by name.
+  Decrypting SAML assertions and signing SAML requests and logout messages go through the
+  interface of `carnelian.keys` (sign bytes, unwrap a content key, decrypt content): the
+  optional `keys` extra backs it with pyca/cryptography, or a deployment backs it with a
+  hardware or cloud key service. Nothing else imports that module, so without it these
+  features are refused by name. Which XML Encryption algorithms are accepted is set by
+  configuration, never by the document: RSA PKCS #1 v1.5 key transport is always refused,
+  AES-CBC is decrypted only when configured and under a verified signature on the whole
+  Response, and every decryption failure is the same refusal.
 - **It leaves to the application**, and the guides in `docs/` show each in place:
   - keeping each sign-in's pending record server-side, tied to the browser and used once;
   - a shared, atomic replay store when SAML runs in several processes (`ReplayStore`);

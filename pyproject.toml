@@ -31,6 +31,8 @@ Source = "https://github.com/rbraunm/carnelian"
 Issues = "https://github.com/rbraunm/carnelian/issues"
 
 [project.optional-dependencies]
+# Operations with a private key (decrypting assertions, signing requests and logout), only through carnelian.keys.
+keys = ["cryptography>=44"]
 # Test oracles, the type checker and the linter: they check Carnelian and never run in an application.
 test = [
   "pytest>=8",

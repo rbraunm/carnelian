@@ -5,7 +5,8 @@ Sign-in for Python applications on the standard library alone:
 - **OpenID Connect** relying party (discovery, the authorization-code flow with PKCE, ID
   token checks);
 - **SAML 2.0** service provider (requests, responses, XML signatures with exclusive
-  canonicalization, protection against signature wrapping);
+  canonicalization, protection against signature wrapping; with the `keys` extra, encrypted
+  assertions, signed requests and single logout);
 - **Research and education federations** (InCommon, the national federations, eduGAIN):
   institutions' signed metadata by the Metadata Query protocol, their scopes, scoped
   identifiers (subject-id, pairwise-id, eduPersonPrincipalName), and the service provider's
@@ -19,8 +20,9 @@ Sign-in for Python applications on the standard library alone:
   documented requests.
 
 No third-party packages, so nothing but its own MIT licence governs where it can be used.
-Its cryptography only *verifies* signatures with public keys -- it never signs or decrypts
-with a secret -- and it leaves TLS to Python's own `ssl` module.
+Its own cryptography only *verifies* signatures with public keys and it leaves TLS to
+Python's own `ssl` module. Signing and decrypting with a private key go through the
+optional `keys` extra (pyca/cryptography) or a key service of your own.
 
 It began as the sign-in layer of [OpenFurrow](https://github.com/rbraunm/openfurrow) and is
 tested against real identity providers: Keycloak, Samba Active Directory, Apereo CAS, a
@@ -36,8 +38,8 @@ One per protocol, each with a complete sign-in example, what it checks and what 
 What Carnelian promises and what it leaves to you: [SECURITY.md](SECURITY.md).
 
 The supported interface is what each of the modules `carnelian.oidc`, `carnelian.saml`,
-`carnelian.federation`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim`, `carnelian.workload` and
-`carnelian.fetching` lists in its `__all__`. Everything else is internal and may change
+`carnelian.federation`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim`, `carnelian.workload`,
+`carnelian.fetching` and `carnelian.keys` lists in its `__all__`. Everything else is internal and may change
 in any release.
 
 ## Install
@@ -46,7 +48,10 @@ in any release.
 python -m pip install carnelian
 ```
 
-Python 3.13 or newer; nothing else is installed with it.
+Python 3.13 or newer; nothing else is installed with it. For encrypted SAML assertions,
+signed SAML requests and single logout, `python -m pip install "carnelian[keys]"` adds
+pyca/cryptography (Apache-2.0 or BSD, with OpenSSL 3 under Apache-2.0 in its wheels, which
+the FSF holds incompatible with GPLv2-only redistribution).
 
 ## Releases
 

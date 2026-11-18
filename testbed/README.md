@@ -5,7 +5,10 @@ Real identity providers for the integration tests, defined once and used two way
 and a development host can keep them running.
 
 - **Keycloak** over HTTPS on port 8443: OpenID Connect and SAML 2.0, with one realm loaded
-  from the dataset.
+  from the dataset. Besides SAML clients that sign responses or assertions, it has clients
+  that use the service provider's own keys, which `prepare.py` makes: one encrypts
+  assertions with AES-256-GCM and RSA-OAEP, one with AES-128-CBC under a signed response,
+  one requires signed requests, and two log out by the Redirect binding.
 - **A research federation** of one institution: an MDQ service on port 8444 serving
   Keycloak's metadata with its scope and names, signed by the testbed federation's key, as
   InCommon's MDQ serves its members'. Keycloak signs with a realm key `prepare.py` makes,

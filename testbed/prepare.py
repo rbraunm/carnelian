@@ -6,7 +6,8 @@
 Every password and the client secret are derived from CARNELIAN_TESTBED_SECRET, so the
 same secret always gives the same files and nothing secret is committed. Output goes to
 testbed/generated (git-ignored): certificates/ (a test CA and the server's certificate for
-the host, localhost and 127.0.0.1), realm/carnelian.json for Keycloak to import, keycloak.env
+the host, localhost and 127.0.0.1), serviceProvider/ (the SAML service provider's signing and
+encryption keys), realm/carnelian.json for Keycloak to import, keycloak.env
 for compose, and testbed.json, which the tests read through `pytest --testbed`. Run with the
 test extras installed (it uses `cryptography` to make the certificates).
 
@@ -40,6 +41,12 @@ clientID = "carnelian-oidc"
 redirectURI = "http://127.0.0.1:53682/callback"
 samlConsumerURL = "https://sp.carnelian.test/acs"
 samlEntities = {"response": "https://sp.carnelian.test/signs-response", "assertion": "https://sp.carnelian.test/signs-assertion"}
+samlKeyedEntities = {
+  "encryptsGCM": "https://sp.carnelian.test/encrypts-gcm", "encryptsCBC": "https://sp.carnelian.test/encrypts-cbc",
+  "signsRequests": "https://sp.carnelian.test/signs-requests",
+  "logsOut": "https://sp.carnelian.test/logs-out", "logsOutToo": "https://sp.carnelian.test/logs-out-too",
+}
+samlLogoutURLs = {"logsOut": "https://sp.carnelian.test/slo/logs-out", "logsOutToo": "https://sp.carnelian.test/slo/logs-out-too"}
 keycloakPort = 8443
 mdqPort = 8444
 casPort = 8445
@@ -124,7 +131,7 @@ def userProfile() -> str:
   })
 
 
-def realm(secret: str, host: str, realmKey: tuple[str, str]) -> tuple[dict, list[dict]]:
+def realm(secret: str, host: str, realmKey: tuple[str, str], serviceProviderKeys: dict[str, tuple[str, str]]) -> tuple[dict, list[dict]]:
   dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
   many = [f"/{dataset['manyGroupsPrefix']}{index:02d}" for index in range(dataset["manyGroupsCount"])]
   groups = dataset["groups"] + [{"name": path[1:]} for path in many]
@@ -153,7 +160,8 @@ def realm(secret: str, host: str, realmKey: tuple[str, str]) -> tuple[dict, list
         "providerId": "declarative-user-profile", "subComponents": {}, "config": {"kc.user.profile.config": [userProfile()]},
       }],
     },
-    "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()] + [{
+    "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()]
+               + [keyedSAMLClient(kind, serviceProviderKeys) for kind in samlKeyedEntities] + [{
       "clientId": clientID, "enabled": True, "protocol": "openid-connect", "publicClient": False,
       "secret": derived(secret, "client:oidc"), "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
       "redirectUris": [redirectURI], "attributes": {"pkce.code.challenge.method": "S256", "post.logout.redirect.uris": "+"},
@@ -192,12 +200,49 @@ def samlClient(entityID: str, signs: str) -> dict:
   }
 
 
+def certificateBody(certificatePEM: str) -> str:
+  return "".join(line for line in certificatePEM.splitlines() if "CERTIFICATE" not in line)
+
+
+def keyedSAMLClient(kind: str, serviceProviderKeys: dict[str, tuple[str, str]]) -> dict:
+  """A SAML client that needs the service provider's keys: it encrypts assertions (AES-256-GCM with RSA-OAEP, or
+  AES-128-CBC under a signed response), wants signed requests, or logs out by the Redirect binding."""
+  signing, encryption = certificateBody(serviceProviderKeys["signing"][1]), certificateBody(serviceProviderKeys["encryption"][1])
+  if kind == "encryptsGCM":
+    client = samlClient(samlKeyedEntities[kind], "assertion")
+    client["attributes"].update({
+      "saml.encrypt": "true", "saml.encryption.certificate": encryption,
+      "saml.encryption.algorithm": "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+      "saml.encryption.keyAlgorithm": "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+      "saml.encryption.digestMethod": "http://www.w3.org/2001/04/xmlenc#sha256",
+      "saml.encryption.maskGenerationFunction": "http://www.w3.org/2009/xmlenc11#mgf1sha256",
+    })
+    return client
+  if kind == "encryptsCBC":
+    client = samlClient(samlKeyedEntities[kind], "response")
+    client["attributes"].update({
+      "saml.encrypt": "true", "saml.encryption.certificate": encryption,
+      "saml.encryption.algorithm": "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
+      "saml.encryption.keyAlgorithm": "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+      "saml.encryption.digestMethod": "http://www.w3.org/2000/09/xmldsig#sha1",
+    })
+    return client
+  client = samlClient(samlKeyedEntities[kind], "response")
+  client["attributes"].update({"saml.client.signature": "true", "saml.signing.certificate": signing})
+  if kind in samlLogoutURLs:
+    client["frontchannelLogout"] = True
+    client["redirectUris"] = [samlConsumerURL, samlLogoutURLs[kind]]
+    client["attributes"].update({"saml.force.post.binding": "false",
+                                 "saml_single_logout_service_url_redirect": samlLogoutURLs[kind]})
+  return client
+
+
 def federationEntity(issuer: str, realmCertificate: str, federationKey: tuple[str, str]) -> bytes:
   """Keycloak as an institution of the testbed federation: its metadata with scope and names, signed by the federation."""
   from lxml import etree
   from signxml import XMLSigner
 
-  body = "".join(line for line in realmCertificate.splitlines() if "CERTIFICATE" not in line)
+  body = certificateBody(realmCertificate)
   until = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
   entity = etree.fromstring(
     f'<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" '
@@ -363,7 +408,13 @@ def sambaSeed(secret: str, accounts: list[dict]) -> str:
 def prepare(host: str, secret: str) -> None:
   makeCertificates(host)
   realmKey, federationKey = signingKey("Carnelian testbed realm"), signingKey("Carnelian testbed federation")
-  document, accounts = realm(secret, host, realmKey)
+  serviceProviderKeys = {use: signingKey(f"Carnelian testbed service provider {use}") for use in ("signing", "encryption")}
+  keyFolder = generated / "serviceProvider"
+  keyFolder.mkdir(parents=True, exist_ok=True)
+  for use, (privateKey, certificate) in serviceProviderKeys.items():
+    (keyFolder / f"{use}.key").write_text(privateKey, encoding="ascii")
+    (keyFolder / f"{use}.crt").write_text(certificate, encoding="ascii")
+  document, accounts = realm(secret, host, realmKey, serviceProviderKeys)
   issuer = f"https://{host}:{keycloakPort}/realms/{realmName}"
   (generated / "mdq").mkdir(parents=True, exist_ok=True)
   for stale in (generated / "mdq").glob("*.xml"):
@@ -387,7 +438,10 @@ def prepare(host: str, secret: str) -> None:
     "openIDConnect": {"issuer": issuer, "clientID": clientID, "clientSecret": derived(secret, "client:oidc"),
                       "redirectURI": redirectURI},
     "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
-             "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
+             "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities,
+             "keyed": {"entities": samlKeyedEntities, "singleLogoutURLs": samlLogoutURLs,
+                       **{f"{use}{part}": str((keyFolder / f"{use}.{suffix}").resolve())
+                          for use in ("signing", "encryption") for part, suffix in (("Key", "key"), ("Certificate", "crt"))}}},
     "openLDAP": {"host": host, "ldapPort": openLDAPPorts[0], "ldapsPort": openLDAPPorts[1], "baseDN": openLDAPBase,
                  "groupsBaseDN": f"ou=groups,{openLDAPBase}", "serviceDN": openLDAPService,
                  "servicePassword": derived(secret, "openldap:service")},
