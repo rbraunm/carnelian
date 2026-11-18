@@ -690,3 +690,65 @@ def testOnlyCanonicalUUIDsReachTheStore():
   assert "neither a user nor a group" in refused(400, document, "invalidValue")
   assert "../../etc/passwd" not in store.asked
   assert call(service, "GET", f"/Users/{user['id']}")[0] == 200
+
+
+# ---- Okta's documented requests, in order ------------------------------------------
+
+def oktaUser(userName, password="1mz050nq"):
+  return {"schemas": [coreUser], "userName": userName, "name": {"givenName": "Test", "familyName": "User"},
+          "emails": [{"primary": True, "value": userName, "type": "work"}], "displayName": "Test User",
+          "locale": "en-US", "externalId": "00ujl29u0le5T6Aj10h7", "groups": [], "password": password, "active": True}
+
+
+def testTheOktaSequence():
+  okta = SCIMService(MemoryStore(), baseURL, lambda presented: presented == token, discardPasswords=True)
+  status, document, _ = call(okta, "GET", "/Users", query="startIndex=1&count=2")
+  assert (status, document["totalResults"]) == (200, 0)
+  status, document, _ = call(okta, "GET", "/Users", query=filterQuery('userName eq "test.user@okta.local"', "&startIndex=1&count=100"))
+  assert (status, document["totalResults"], document["Resources"]) == (200, 0, [])
+  user = created(okta, "/Users", oktaUser("test.user@okta.local"))
+  assert "password" not in user and user["userName"] == "test.user@okta.local" and user["active"] is True
+  other = created(okta, "/Users", oktaUser("other.user@okta.local"))
+
+  status, document, _ = call(okta, "GET", f"/Users/{user['id']}")
+  assert status == 200 and document == user
+  replaced = {**oktaUser("test.user@okta.local"), "id": user["id"], "name": {"givenName": "Another", "familyName": "User"},
+              "meta": {"resourceType": "User"}}
+  status, document, _ = call(okta, "PUT", f"/Users/{user['id']}", replaced)
+  assert status == 200 and document["name"] == {"givenName": "Another", "familyName": "User"}
+  status, document, _ = patch(okta, f"/Users/{user['id']}", {"op": "replace", "value": {"active": False}})
+  assert status == 200 and document["active"] is False
+  status, document, _ = patch(okta, f"/Users/{user['id']}", {"op": "replace", "value": {"password": "t1meMa$heen"}})
+  assert status == 200 and document["active"] is False and "password" not in document
+
+  group = created(okta, "/Groups", {"schemas": [coreGroup], "displayName": "Test SCIMv2", "members": []})
+  status, document, _ = call(okta, "GET", "/Groups", query=filterQuery('displayName eq "Test SCIMv2"', "&startIndex=1&count=100"))
+  assert [found["id"] for found in document["Resources"]] == [group["id"]]
+  status, _, _ = patch(okta, f"/Groups/{group['id']}", {"op": "replace", "value": {"id": group["id"], "displayName": "Renamed"}})
+  assert status == 204
+  status, document, _ = patch(okta, f"/Groups/{group['id']}", {"op": "replace", "value": {"id": other["id"], "displayName": "X"}})
+  assert status == 400 and refused(400, document, "mutability")
+
+  status, _, _ = patch(okta, f"/Groups/{group['id']}",
+                       {"op": "add", "path": "members", "value": [{"value": user["id"], "display": "test.user@okta.local"}]})
+  assert status == 204
+  status, _, _ = patch(okta, f"/Groups/{group['id']}",
+                       {"op": "remove", "path": f'members[value eq "{user["id"]}"]'},
+                       {"op": "add", "path": "members", "value": [{"value": other["id"], "display": "other.user@okta.local"}]})
+  assert status == 204
+  status, document, _ = call(okta, "GET", f"/Groups/{group['id']}")
+  assert document["displayName"] == "Renamed" and [member["value"] for member in document["members"]] == [other["id"]]
+  status, _, _ = patch(okta, f"/Groups/{group['id']}", {"op": "replace", "path": "members", "value": [
+    {"value": user["id"], "display": "test.user@okta.local"}, {"value": other["id"], "display": "other.user@okta.local"}]})
+  assert status == 204
+  status, document, _ = call(okta, "PUT", f"/Groups/{group['id']}", {
+    "schemas": [coreGroup], "id": group["id"], "displayName": "Renamed again",
+    "members": [{"value": user["id"], "display": "test.user@okta.local"}]})
+  assert status == 200 and [member["value"] for member in document["members"]] == [user["id"]]
+  status, document, _ = call(okta, "DELETE", f"/Groups/{group['id']}")
+  assert (status, document) == (204, None)
+
+
+def testPasswordsAreRefusedUnlessTheServiceDiscardsThem(service):
+  status, document, _ = call(service, "POST", "/Users", oktaUser("test.user@okta.local"))
+  assert status == 400 and "password is refused" in refused(400, document, "invalidValue")

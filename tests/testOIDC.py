@@ -118,7 +118,7 @@ def testEachIDTokenCheckRefuses(change, message):
   ('{"exp": -1e999}', "-1e999 is too large for a number"),
   ('{"exp": Infinity}', "Infinity is not a JSON number"),
   ('{"iat": NaN}', "NaN is not a JSON number"),
-  ('{"a": ' + "[" * 50_000 + "]" * 50_000 + "}", "nested too deeply"),
+  ('{"a": ' + "[" * 50_000 + "]" * 50_000 + "}", "nests deeper than 32"),
 ])
 def testClaimsThatAreNotFiniteJSONAreRefused(claimsText, message):
   with pytest.raises(SignInRefused, match=message):

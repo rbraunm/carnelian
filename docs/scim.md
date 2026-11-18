@@ -66,6 +66,11 @@ your store. Resource IDs are UUIDs Carnelian makes; any other ID in a request is
   token. Entra matches users by `userName` and groups by `displayName` (which Carnelian keeps
   unique), sends PATCH operation names in any case, and removes group members by listing
   them in `value`; all of these are handled. A group's PATCH is answered with 204.
+- **Okta:** the same base address and token, with "Push Groups" for groups. Okta sends a
+  `password` with every new user even when it syncs none, so give the service
+  `discardPasswords=True`: passwords are then dropped from requests (Carnelian keeps none
+  either way); without it they are refused. Okta renames a group with a PATCH that restates
+  its `id`, which is accepted as long as it is the group's own.
 
 ## What is refused
 

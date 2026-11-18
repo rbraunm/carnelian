@@ -174,7 +174,7 @@ def testANonASCIIPayloadSegmentIsRefusedByName():
 @pytest.mark.parametrize("headerText, message", [
   ('{"alg": "RS256", "x": NaN}', "NaN is not a JSON number"),
   ('{"alg": "RS256", "x": 1e999}', "too large for a number"),
-  ('{"alg": "RS256", "x": ' + "[" * 50_000 + "]" * 50_000 + "}", "nested too deeply"),
+  ('{"alg": "RS256", "x": ' + "[" * 50_000 + "]" * 50_000 + "}", "nests deeper than 32"),
 ])
 def testAHeaderThatIsNotStrictJSONIsRefusedByName(headerText, message):
   token = f"{base64urlEncode(headerText.encode())}.{base64urlEncode(b'{}')}.{base64urlEncode(b'x' * 256)}"

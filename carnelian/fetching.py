@@ -15,6 +15,7 @@ import http.client
 import io
 import json
 import math
+import re
 import socket
 import ssl
 import time
@@ -61,12 +62,38 @@ def _finiteNumber(text: str) -> float:
   return value
 
 
+maximumJSONDepth = 32
+_jsonStructurePattern = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|["\[\]{}]')
+
+
+def checkNesting(text: str) -> None:
+  """Refuses JSON nested deeper than maximumJSONDepth before it is parsed: whether the parser itself runs out of
+  recursion, and where, differs by platform and Python version."""
+  depth = 0
+  for found in _jsonStructurePattern.finditer(text):
+    mark = found.group()
+    if mark in ("[", "{"):
+      depth += 1
+      if depth > maximumJSONDepth:
+        raise ValueError(f"nests deeper than {maximumJSONDepth} arrays and objects")
+    elif mark in ("]", "}"):
+      depth -= 1
+    elif mark == '"':
+      # An unterminated string: the rest is string text, which the parser refuses; scanning on is quadratic.
+      return
+
+
 def parseJSON(data: bytes | str) -> Any:
-  """Strict JSON: no NaN or Infinity, no number too large to be finite; anything wrong is a ValueError."""
+  """Strict JSON: no NaN or Infinity, no number too large to be finite, no deep nesting; anything wrong is a ValueError."""
   try:
-    return json.loads(data, parse_constant=_refuseConstant, parse_float=_finiteNumber)
-  except RecursionError:
-    raise ValueError("the JSON is nested too deeply") from None
+    text = data.decode("utf-8") if isinstance(data, bytes) else data
+  except UnicodeDecodeError:
+    raise ValueError("the JSON is not UTF-8") from None
+  try:
+    checkNesting(text)
+  except ValueError as error:
+    raise ValueError(f"the JSON {error}") from None
+  return json.loads(text, parse_constant=_refuseConstant, parse_float=_finiteNumber)
 
 
 def _checkedContext(context: ssl.SSLContext) -> ssl.SSLContext:

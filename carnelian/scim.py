@@ -30,6 +30,8 @@ from collections.abc import Iterable
 from typing import Any, Callable, Mapping, NoReturn, Protocol, cast
 from urllib.parse import parse_qsl, unquote
 
+from carnelian.fetching import checkNesting
+
 __all__ = ["SCIMRefused", "SCIMService", "SCIMResponse", "Store", "Filter", "ResourceType", "userType", "groupType",
            "resourceTypes", "parseFilter", "matches", "Compare", "Present", "And", "Or", "Not", "ValuePath",
            "coreUserSchema", "coreGroupSchema", "enterpriseUserSchema"]
@@ -849,7 +851,11 @@ def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) ->
           continue
         if key.lower() == "password":
           raise _invalid("password is refused: Carnelian takes no passwords over SCIM")
-        _apply(work, resourceType, op, _resolve(resourceType, key, "invalidPath"), None, item, f"{where}.value.{key}")
+        target = _resolve(resourceType, key, "invalidPath")
+        if target.attribute.mutability == "readOnly" and target.sub is None and op != "remove" \
+            and (_container(work, target.schema, resourceType) or {}).get(target.attribute.name) == item:
+          continue
+        _apply(work, resourceType, op, target, None, item, f"{where}.value.{key}")
       continue
     if not isinstance(path, str):
       raise _invalid(f"{where}.path must be a string", "invalidSyntax")
@@ -1064,26 +1070,15 @@ def _readBodyNumber(text: str) -> int | float:
   return _readNumber(text, "the body", "invalidValue")
 
 
-maximumJSONDepth = 32
 maximumQueryLength = 16384
 maximumQueryParameters = 8
-_jsonStructurePattern = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|["\[\]{}]')
 
 
 def _checkNesting(text: str) -> None:
-  """Refuses deep nesting before json.loads, which would raise RecursionError on it."""
-  depth = 0
-  for found in _jsonStructurePattern.finditer(text):
-    mark = found.group()
-    if mark in ("[", "{"):
-      depth += 1
-      if depth > maximumJSONDepth:
-        raise _invalid(f"the body nests deeper than {maximumJSONDepth} arrays and objects", "invalidSyntax")
-    elif mark in ("]", "}"):
-      depth -= 1
-    elif mark == '"':
-      # An unterminated string: the rest is string text, which json.loads refuses; scanning on is quadratic.
-      return
+  try:
+    checkNesting(text)
+  except ValueError as error:
+    raise _invalid(f"the body {error}", "invalidSyntax") from None
 
 
 class SCIMService:
@@ -1097,13 +1092,14 @@ class SCIMService:
 
   def __init__(self, store: Store, baseURL: str, isAuthorized: Callable[[str], bool], pageSize: int = 100,
                maximumResults: int = 200, maximumBytes: int = 1_000_000,
-               clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+               clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), discardPasswords: bool = False) -> None:
     if not baseURL.startswith("https://") or baseURL.endswith("/"):
       raise ValueError("baseURL must be an https URL without a trailing slash")
     if not 0 < pageSize <= maximumResults:
       raise ValueError("pageSize must be positive and at most maximumResults")
     self.store, self.baseURL, self.isAuthorized = store, baseURL, isAuthorized
     self.pageSize, self.maximumResults, self.maximumBytes, self.clock = pageSize, maximumResults, maximumBytes, clock
+    self.discardPasswords = discardPasswords
 
   def handle(self, method: str, path: str, query: str, headers: Mapping[str, str], body: bytes) -> SCIMResponse:
     try:
@@ -1265,7 +1261,7 @@ class SCIMService:
   def _create(self, resourceType: ResourceType, parameters: dict[str, str], headers: dict[str, str],
               body: bytes) -> SCIMResponse:
     self._allowProjection(resourceType, parameters)
-    resource = _readResource(resourceType, self._document(headers, body))
+    resource = _readResource(resourceType, self._withoutPasswords(self._document(headers, body)))
     resourceID = str(uuid.uuid4())
     self._checkResource(resourceType, resource, resourceID)
     stamp = _stamp(self.clock())
@@ -1279,17 +1275,41 @@ class SCIMService:
                body: bytes) -> SCIMResponse:
     self._allowProjection(resourceType, parameters)
     existing = self._existing(resourceType, resourceID)
-    resource = _readResource(resourceType, self._document(headers, body))
+    resource = _readResource(resourceType, self._withoutPasswords(self._document(headers, body)))
     self._checkResource(resourceType, resource, resourceID)
     resource = {"id": resourceID, "meta": {**existing["meta"], "lastModified": _stamp(self.clock())}, **resource}
     self.store.replace(resourceType.name, resource)
     return self._answer(200, self._render(resourceType, resource, parameters))
 
+  def _withoutPasswords(self, document: object) -> object:
+    """With discardPasswords, the request without its password (Okta sends one even when it syncs none)."""
+    if not self.discardPasswords or not isinstance(document, dict):
+      return document
+    kept = {key: value for key, value in document.items() if key.lower() != "password"}
+    operations = kept.get("Operations")
+    if isinstance(operations, list):
+      remaining = []
+      for operation in operations:
+        if isinstance(operation, dict) and str(operation.get("path", "")).lower() == "password":
+          continue
+        if isinstance(operation, dict) and isinstance(operation.get("value"), dict) and "path" not in operation:
+          value = {key: item for key, item in operation["value"].items() if key.lower() != "password"}
+          if not value:
+            continue
+          operation = {**operation, "value": value}
+        remaining.append(operation)
+      kept["Operations"] = remaining
+    return kept
+
   def _patch(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
              body: bytes) -> SCIMResponse:
     self._allowProjection(resourceType, parameters)
     existing = self._existing(resourceType, resourceID)
-    resource = _applyPatch(resourceType, existing, self._document(headers, body))
+    document = self._withoutPasswords(self._document(headers, body))
+    if isinstance(document, dict) and document.get("Operations") == []:
+      resource = existing
+    else:
+      resource = _applyPatch(resourceType, existing, document)
     self._checkResource(resourceType, resource, resourceID)
     resource["meta"] = {**resource["meta"], "lastModified": _stamp(self.clock())}
     self.store.replace(resourceType.name, resource)
