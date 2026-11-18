@@ -6,10 +6,12 @@ request below your SCIM base address, checks the bearer token, parses and valida
 against the SCIM schemas, and answers; your application keeps the users and groups.
 
 Offered: users with the enterprise extension, groups, the whole filter grammar of RFC 7644,
-paging and sorting (sortBy, sortOrder; resources without the value come last), attribute
-selection, POST, GET, PUT, PATCH and DELETE, version tags (each resource's meta.version and
-ETag; If-Match refuses a change to a resource changed since with 412, If-None-Match`nanswers an unchanged read with 304), bulk requests (up to 1,000 operations in order, a later
-one naming an earlier POST's ulkId:, ailOnErrors honoured) and the discovery endpoints.
+paging and sorting (`sortBy`, `sortOrder`; resources without the value come last),
+attribute selection, POST, GET, PUT, PATCH and DELETE, version tags (each resource's
+`meta.version` and `ETag`; `If-Match` refuses a change to a resource changed since with 412,
+`If-None-Match` answers an unchanged read with 304), bulk requests (up to 1,000 operations
+in order, a later one naming an earlier POST's `bulkId:`, `failOnErrors` honoured) and the
+discovery endpoints.
 
 ## What you provide
 
