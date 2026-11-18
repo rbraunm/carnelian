@@ -499,8 +499,8 @@ def testAnOpenLDAPGroupNotNamedByItsCnIsRefused(standInDirectory, tlsFiles, dn, 
 
 def testAnOpenLDAPGroupRDNIsReadWithItsEscapes(standInDirectory, tlsFiles):
   directory, _ = openLDAPDirectory(standInDirectory, tlsFiles, {
-    personDN: [group("CN=r\\+d\\2C \\c3\\a9quipe,ou=groups,dc=x", "R+D, Équipe", 1)]})
-  assert directory.signIn("ana", "right").groups == ("R+D, Équipe",)
+    personDN: [group("CN=r\\+d\\2C \\c3\\a9quipe,ou=groups,dc=x", "R+D, \u00c9quipe", 1)]})
+  assert directory.signIn("ana", "right").groups == ("R+D, \u00c9quipe",)
 
 
 def testAnOpenLDAPGroupWithoutAUUIDIsRefused(standInDirectory, tlsFiles):

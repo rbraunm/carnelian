@@ -19,7 +19,6 @@ PATCH op names in any case, and "remove" of members listed in "value" rather tha
 from __future__ import annotations
 
 import base64
-import binascii
 import copy
 import hashlib
 import json
@@ -327,7 +326,7 @@ def _readSingle(attribute: Attribute, value: object, where: str, patching: bool)
       raise _invalid(f"{where} must be base64 text")
     try:
       base64.b64decode(value, validate=True)
-    except binascii.Error:
+    except ValueError:
       raise _invalid(f"{where} must be base64 text") from None
   return value
 
@@ -809,7 +808,8 @@ def _field(document: JSON, name: str, where: str) -> Any:
   return found[0] if found else _absent
 
 
-def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) -> JSON:
+def _applyPatch(resourceType: ResourceType, resource: JSON, document: object, discardPasswords: bool) -> JSON | None:
+  """The resource with the PATCH applied; None when discardPasswords leaves no operation to apply."""
   if not isinstance(document, dict):
     raise _invalid("a PATCH body must be a JSON object", "invalidSyntax")
   schemas = _field(document, "schemas", "the PATCH body")
@@ -822,6 +822,7 @@ def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) ->
   if unknown:
     raise _invalid(f"a PATCH body has unknown members {unknown}", "invalidSyntax")
   work = copy.deepcopy(resource)
+  applied = 0
   for index, operation in enumerate(operations):
     where = f"Operations[{index}]"
     if not isinstance(operation, dict):
@@ -840,6 +841,11 @@ def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) ->
         raise _invalid(f"{where}: remove needs a path", "noTarget")
       if not isinstance(value, dict):
         raise _invalid(f"{where}: {op} without a path needs an object of attributes", "invalidSyntax")
+      if discardPasswords:
+        if value and all(key.lower() == "password" for key in value):
+          continue
+        value = {key: item for key, item in value.items() if key.lower() != "password"}
+      applied += 1
       for key, item in value.items():
         extension = resourceType.schemaNamed(key)
         if extension is not None and extension is not resourceType.schema:
@@ -862,9 +868,14 @@ def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) ->
     if not isinstance(path, str):
       raise _invalid(f"{where}.path must be a string", "invalidSyntax")
     if path.lower() == "password":
+      if discardPasswords:
+        continue
       raise _invalid("password is refused: Carnelian takes no passwords over SCIM")
+    applied += 1
     target, query = _patchPath(resourceType, path)
     _apply(work, resourceType, op, target, query, value, f"{where} {path}")
+  if not applied:
+    return None
   for schema in resourceType.extensions:
     if work.get(schema.id) == {}:
       del work[schema.id]
@@ -1020,13 +1031,21 @@ def _remove(container: JSON, attribute: Attribute, sub: Attribute | None, query:
 
 class Store(Protocol):
   """The application's resources. Each is a dict as SCIMService builds it: id, meta (resourceType,
-  created, lastModified), the core attributes, and each extension under its schema URI.
-  search gets a filter already checked against the schema (None for every resource), and
-  `matches` evaluates one in memory. create and replace raise SCIMRefused(409, ..., "uniqueness")
-  when the store's own unique constraints refuse the resource. A request is checked against the
-  store and then written in several calls (a DELETE also replaces each group that held the
-  resource); a store serving concurrent requests runs them in one transaction where it needs
-  them to hold together."""
+  created, lastModified, and revision, a count every write raises, which version tags are made
+  from), the core attributes, and each extension under its schema URI. search gets a filter
+  already checked against the schema (None for every resource), and `matches` evaluates one in
+  memory. create and replace raise SCIMRefused(409, ..., "uniqueness") when the store's own
+  unique constraints refuse the resource.
+
+  A request is checked against the store first (If-Match and If-None-Match included) and then
+  written in several calls; every request, and every operation of a bulk request, belongs in
+  one transaction (a savepoint per bulk operation), so a check and the writes it allows hold
+  together under concurrent requests. A refusal from the service comes before the first write,
+  and a resource's own create or replace is its first write, so an operation refused for
+  uniqueness has written nothing. Writes that follow: a group's write gives each user whose
+  groups it changes a new revision; a DELETE first takes the resource out of every group that
+  holds it, then (for a group) gives its users a new revision, and deletes it last, so a store
+  failing midway leaves no group holding a member that is gone."""
 
   def create(self, resourceType: str, resource: JSON) -> None: ...
 
@@ -1078,33 +1097,143 @@ bulkRequestSchema = "urn:ietf:params:scim:api:messages:2.0:BulkRequest"
 bulkResponseSchema = "urn:ietf:params:scim:api:messages:2.0:BulkResponse"
 
 
-def _resolveBulkIDs(value: Any, created: dict[str, str], where: str) -> Any:
-  """Every "bulkId:name" an operation holds, as the ID its earlier POST made; a later or unknown one is refused."""
-  if isinstance(value, str):
-    for name, resourceID in created.items():
-      value = value.replace(f"bulkId:{name}", resourceID)
-    if "bulkId:" in value:
-      raise SCIMRefused(409, f"{where} refers to a bulkId no earlier operation of this request made", "invalidValue")
-    return value
-  if isinstance(value, list):
-    return [_resolveBulkIDs(item, created, where) for item in value]
-  if isinstance(value, dict):
-    return {key: _resolveBulkIDs(item, created, where) for key, item in value.items()}
+maximumBulkIDLength = 64
+_bulkIDPattern = re.compile(rf"[A-Za-z0-9._~-]{{1,{maximumBulkIDLength}}}")
+_entityTag = r'(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"'
+_entityTagListPattern = re.compile(rf"\s*{_entityTag}\s*(?:,\s*{_entityTag}\s*)*")
+
+
+def _bulkResource(reference: str, created: dict[str, str | None], where: str) -> str:
+  """The ID an earlier POST of the request made for "bulkId:name"; any other name is refused."""
+  name = reference.removeprefix("bulkId:")
+  if not _bulkIDPattern.fullmatch(name):
+    raise _invalid(f"{where} refers to {reference!r}, whose name is not a bulkId", "invalidValue")
+  if name not in created:
+    raise SCIMRefused(409, f"{where} refers to bulkId {name}, which no earlier operation of this request made",
+                      "invalidValue")
+  resourceID = created[name]
+  if resourceID is None:
+    raise SCIMRefused(409, f"{where} refers to bulkId {name}, whose POST failed", "invalidValue")
+  return resourceID
+
+
+def _isReference(resourceType: ResourceType, target: _Target) -> bool:
+  """The attributes whose value may be "bulkId:name" (RFC 7644 section 3.7.2): a group's members, a user's manager."""
+  return ((resourceType is groupType and target.attribute.name == "members")
+          or (target.schema is enterpriseSchema and target.attribute.name == "manager"))
+
+
+def _referenceTarget(resourceType: ResourceType, text: str, patchPath: bool) -> _Target | None:
+  """The reference attribute a key or PATCH path names; any other, the route reads (and refuses) as it is."""
+  try:
+    target = _patchPath(resourceType, text)[0] if patchPath else _resolve(resourceType, text, "invalidPath")
+  except SCIMRefused:
+    return None
+  return target if _isReference(resourceType, target) else None
+
+
+def _resolveReference(value: object, created: dict[str, str | None], where: str) -> object:
+  if isinstance(value, str) and value.startswith("bulkId:"):
+    return _bulkResource(value, created, where)
   return value
 
 
+def _resolveHolders(value: object, created: dict[str, str | None], where: str) -> object:
+  """Member or manager objects as sent, each one's value resolved."""
+  def one(item: object) -> object:
+    if not isinstance(item, dict):
+      return item
+    return {key: _resolveReference(inner, created, where) if key.lower() == "value" else inner
+            for key, inner in item.items()}
+  return [one(item) for item in value] if isinstance(value, list) else one(value)
+
+
+def _resolveAttributes(resourceType: ResourceType, document: object, created: dict[str, str | None],
+                       where: str) -> object:
+  """A resource body, or a PATCH value without a path, with "bulkId:name" resolved where it names a reference."""
+  if not isinstance(document, dict):
+    return document
+  resolved: JSON = {}
+  for key, value in document.items():
+    extension = resourceType.schemaNamed(key)
+    if extension is not None and extension is not resourceType.schema and isinstance(value, dict):
+      inner: JSON = {}
+      for innerKey, item in value.items():
+        attribute = _named(extension.attributes, innerKey)
+        reference = attribute is not None and _isReference(resourceType, _Target(extension, attribute, None))
+        inner[innerKey] = _resolveHolders(item, created, where) if reference else item
+      resolved[key] = inner
+    elif _referenceTarget(resourceType, key, patchPath=False) is not None:
+      resolved[key] = _resolveHolders(value, created, where)
+    else:
+      resolved[key] = value
+  return resolved
+
+
+def _resolvePatch(resourceType: ResourceType, document: object, created: dict[str, str | None], where: str) -> object:
+  if not isinstance(document, dict):
+    return document
+  resolved = dict(document)
+  for key, operations in document.items():
+    if key.lower() == "operations" and isinstance(operations, list):
+      resolved[key] = [_resolveOperation(resourceType, operation, created, where) for operation in operations]
+  return resolved
+
+
+def _resolveOperation(resourceType: ResourceType, operation: object, created: dict[str, str | None],
+                      where: str) -> object:
+  if not isinstance(operation, dict):
+    return operation
+  paths = [value for key, value in operation.items() if key.lower() == "path"]
+  values = [key for key in operation if key.lower() == "value"]
+  if len(paths) > 1 or len(values) != 1:
+    return operation
+  value = operation[values[0]]
+  if not paths or paths[0] is None:
+    return {**operation, values[0]: _resolveAttributes(resourceType, value, created, where)}
+  if not isinstance(paths[0], str):
+    return operation
+  target = _referenceTarget(resourceType, paths[0], patchPath=True)
+  if target is None:
+    return operation
+  if target.sub is None:
+    return {**operation, values[0]: _resolveHolders(value, created, where)}
+  if target.sub.name == "value":
+    return {**operation, values[0]: _resolveReference(value, created, where)}
+  return operation
+
+
 def _version(resource: JSON) -> str:
-  """A resource's weak entity tag, derived from what it holds (its timestamps and the tag itself left out)."""
+  """A resource's weak entity tag, from what it holds and its revision, so a write never brings back an earlier tag."""
   content = {key: value for key, value in resource.items() if key != "meta"}
-  digest = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+  revision = resource["meta"]["revision"]
+  digest = hashlib.sha256(json.dumps([revision, content], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
   return f'W/"{digest[:32]}"'
 
 
-def _matches(header: str | None, version: str) -> bool:
-  if header is None:
-    return False
-  tags = [tag.strip() for tag in header.split(",")]
-  return "*" in tags or version in tags or version.removeprefix("W/") in tags
+def _entityTags(header: str, name: str) -> list[str]:
+  if header.strip() == "*":
+    return ["*"]
+  if not _entityTagListPattern.fullmatch(header):
+    raise _invalid(f"{name} is not * or a list of entity tags", "invalidSyntax")
+  return re.findall(_entityTag, header)
+
+
+def _ifMatch(header: str, version: str) -> bool:
+  """If-Match compares the tag exactly as this service gave it: weak, as RFC 7644 section 3.14 sends it, and
+  changed by every write (see _version), so RFC 7232's strong comparison, which never matches a weak tag, is not used."""
+  tags = _entityTags(header, "If-Match")
+  return tags == ["*"] or version in tags
+
+
+def _ifNoneMatch(header: str, version: str) -> bool:
+  """If-None-Match compares weakly (RFC 7232 section 2.3.2): the tags' opaque parts, W/ or not."""
+  tags = _entityTags(header, "If-None-Match")
+  return tags == ["*"] or version.removeprefix("W/") in (tag.removeprefix("W/") for tag in tags)
+
+
+def _touched(meta: JSON, stamp: str) -> JSON:
+  return {**meta, "lastModified": stamp, "revision": meta["revision"] + 1}
 
 
 def _sortKey(resourceType: ResourceType, path: str, resource: JSON) -> tuple[Any, ...] | None:
@@ -1217,12 +1346,11 @@ class SCIMService:
       self._allowProjection(resourceType, parameters)
       resource = self._existing(resourceType, resourceID)
       version = _version(resource)
-      if _matches(headers.get("if-none-match"), version):
+      if self._preconditions(resourceType, headers, version, reading=True):
         return self._answer(304, None, {"ETag": version})
       return self._answer(200, self._render(resourceType, resource, parameters), {"ETag": version})
-    if method in ("PUT", "PATCH", "DELETE") and "if-match" in headers:
-      if not _matches(headers["if-match"], _version(self._existing(resourceType, resourceID))):
-        raise SCIMRefused(412, f"the {resourceType.name} has changed since the version given in If-Match")
+    if method in ("PUT", "PATCH", "DELETE") and ("if-match" in headers or "if-none-match" in headers):
+      self._preconditions(resourceType, headers, _version(self._existing(resourceType, resourceID)), reading=False)
     if method == "PUT":
       return self._replace(resourceType, resourceID, parameters, headers, body)
     if method == "PATCH":
@@ -1231,6 +1359,17 @@ class SCIMService:
       self._allow(parameters, ())
       return self._delete(resourceType, resourceID)
     raise SCIMRefused(405, f"{method} is not allowed on {resourceType.endpoint}/{{id}}")
+
+  @staticmethod
+  def _preconditions(resourceType: ResourceType, headers: dict[str, str], version: str, reading: bool) -> bool:
+    """RFC 7232 section 6: If-Match, then If-None-Match; True when a read is to be answered 304."""
+    if "if-match" in headers and not _ifMatch(headers["if-match"], version):
+      raise SCIMRefused(412, f"the {resourceType.name} has changed since the version given in If-Match")
+    if "if-none-match" in headers and _ifNoneMatch(headers["if-none-match"], version):
+      if reading:
+        return True
+      raise SCIMRefused(412, f"the {resourceType.name} has the version given in If-None-Match")
+    return False
 
   # -- requests
 
@@ -1332,9 +1471,11 @@ class SCIMService:
     resourceID = str(uuid.uuid4())
     self._checkResource(resourceType, resource, resourceID)
     stamp = _stamp(self.clock())
-    resource = {"id": resourceID, "meta": {"resourceType": resourceType.name, "created": stamp, "lastModified": stamp},
-                **resource}
+    resource = {"id": resourceID, "meta": {"resourceType": resourceType.name, "created": stamp, "lastModified": stamp,
+                                           "revision": 1}, **resource}
     self.store.create(resourceType.name, resource)
+    if resourceType is groupType:
+      self._touchMembers(None, resource, stamp)
     rendered = self._render(resourceType, resource, parameters)
     return self._answer(201, rendered, {"Location": self._location(resourceType, resourceID), "ETag": _version(resource)})
 
@@ -1344,8 +1485,11 @@ class SCIMService:
     existing = self._existing(resourceType, resourceID)
     resource = _readResource(resourceType, self._withoutPasswords(self._document(headers, body)))
     self._checkResource(resourceType, resource, resourceID)
-    resource = {"id": resourceID, "meta": {**existing["meta"], "lastModified": _stamp(self.clock())}, **resource}
+    stamp = _stamp(self.clock())
+    resource = {"id": resourceID, "meta": _touched(existing["meta"], stamp), **resource}
     self.store.replace(resourceType.name, resource)
+    if resourceType is groupType:
+      self._touchMembers(existing, resource, stamp)
     return self._answer(200, self._render(resourceType, resource, parameters), {"ETag": _version(resource)})
 
   def _bulk(self, headers: dict[str, str], body: bytes) -> SCIMResponse:
@@ -1363,7 +1507,7 @@ class SCIMService:
     failOnErrors = document.get("failOnErrors")
     if failOnErrors is not None and (type(failOnErrors) is not int or failOnErrors < 1):
       raise _invalid("failOnErrors is a whole number of at least 1", "invalidSyntax")
-    created: dict[str, str] = {}
+    created: dict[str, str | None] = {}
     answers: list[JSON] = []
     errors = 0
     for index, operation in enumerate(operations):
@@ -1373,30 +1517,14 @@ class SCIMService:
       errors += int(answers[-1]["status"]) >= 400
     return self._answer(200, {"schemas": [bulkResponseSchema], "Operations": answers})
 
-  def _bulkOperation(self, index: int, operation: object, created: dict[str, str]) -> JSON:
+  def _bulkOperation(self, index: int, operation: object, created: dict[str, str | None]) -> JSON:
+    """One operation, answered on its own: a malformed one too, so it counts toward failOnErrors."""
     where = f"Operations[{index}]"
-    if not isinstance(operation, dict):
-      raise _invalid(f"{where} must be an object", "invalidSyntax")
-    unknown = sorted(set(operation) - {"method", "bulkId", "version", "path", "data"})
-    if unknown:
-      raise _invalid(f"{where} has unknown members {unknown}", "invalidSyntax")
-    method, path, bulkId = operation.get("method"), operation.get("path"), operation.get("bulkId")
-    if method not in ("POST", "PUT", "PATCH", "DELETE") or not isinstance(path, str):
-      raise _invalid(f"{where} needs a method (POST, PUT, PATCH or DELETE) and a path", "invalidSyntax")
-    if method == "POST" and (not isinstance(bulkId, str) or not bulkId or bulkId in created):
-      raise _invalid(f"{where}: a POST needs a bulkId of its own", "invalidSyntax")
-    if not re.fullmatch(r"/(Users|Groups)(/[^/]+)?", path) or (method == "POST") != ("/" not in path[1:]):
-      raise _invalid(f"{where}: {method} {path} is not a resource operation", "invalidPath")
-    answer: JSON = {"method": method, "status": "0"}
-    if bulkId is not None:
-      answer["bulkId"] = bulkId
-    headers = {"content-type": mediaType}
-    if isinstance(operation.get("version"), str):
-      headers["if-match"] = operation["version"]
+    answer: JSON = {}
+    if isinstance(operation, dict):
+      answer.update((key, operation[key]) for key in ("method", "bulkId") if isinstance(operation.get(key), str))
     try:
-      path = _resolveBulkIDs(path, created, where)
-      data = _resolveBulkIDs(operation.get("data"), created, where)
-      body = b"" if method == "DELETE" else json.dumps(data, ensure_ascii=False).encode("utf-8")
+      method, path, body, headers = self._readBulkOperation(where, operation, created)
       response = self._route(method, path, "", headers, body)
     except SCIMRefused as refused:
       error: JSON = {"schemas": [errorSchema], "status": str(refused.status), "detail": refused.detail}
@@ -1408,62 +1536,108 @@ class SCIMService:
     if "ETag" in response.headers:
       answer["version"] = response.headers["ETag"]
     if method == "POST":
-      resourceID = cast(str, json.loads(response.body)["id"])
-      created[cast(str, bulkId)] = resourceID
+      created[answer["bulkId"]] = cast(str, json.loads(response.body)["id"])
       answer["location"] = response.headers["Location"]
     elif method != "DELETE":
       answer["location"] = f"{self.baseURL}{path}"
     return answer
 
+  def _readBulkOperation(self, where: str, operation: object, created: dict[str, str | None]
+                         ) -> tuple[str, str, bytes, dict[str, str]]:
+    """The method, path (bulkId resolved), body (bulkId references resolved) and headers of one bulk operation."""
+    if not isinstance(operation, dict):
+      raise _invalid(f"{where} must be an object", "invalidSyntax")
+    unknown = sorted(set(operation) - {"method", "bulkId", "version", "path", "data"})
+    if unknown:
+      raise _invalid(f"{where} has unknown members {unknown}", "invalidSyntax")
+    method, path, bulkId = operation.get("method"), operation.get("path"), operation.get("bulkId")
+    if method not in ("POST", "PUT", "PATCH", "DELETE") or not isinstance(path, str):
+      raise _invalid(f"{where} needs a method (POST, PUT, PATCH or DELETE) and a path", "invalidSyntax")
+    if not re.fullmatch(r"/(Users|Groups)(/[^/]+)?", path) or (method == "POST") != ("/" not in path[1:]):
+      raise _invalid(f"{where}: {method} {path} is not a resource operation", "invalidPath")
+    if "bulkId" in operation and (not isinstance(bulkId, str) or not _bulkIDPattern.fullmatch(bulkId)):
+      raise _invalid(f"{where}: a bulkId is 1 to {maximumBulkIDLength} letters, digits and . _ ~ -", "invalidSyntax")
+    if method == "POST" and bulkId is None:
+      raise _invalid(f"{where}: a POST needs a bulkId", "invalidSyntax")
+    if bulkId is not None and bulkId in created:
+      raise _invalid(f"{where}: bulkId {bulkId} is used by an earlier operation", "invalidSyntax")
+    headers = {"content-type": mediaType}
+    if "version" in operation:
+      version = operation["version"]
+      if method == "POST":
+        raise _invalid(f"{where}: a POST takes no version", "invalidSyntax")
+      if not isinstance(version, str) or not re.fullmatch(_entityTag, version):
+        raise _invalid(f"{where}: version must be an entity tag", "invalidSyntax")
+      headers["if-match"] = version
+    if method == "DELETE" and "data" in operation:
+      raise _invalid(f"{where}: a DELETE takes no data", "invalidSyntax")
+    if method == "POST":
+      created[cast(str, bulkId)] = None
+    endpoint, _, segment = path[1:].partition("/")
+    if segment.startswith("bulkId:"):
+      path = f"/{endpoint}/{_bulkResource(segment, created, where)}"
+    if method == "DELETE":
+      return method, path, b"", headers
+    resourceType = userType if endpoint == "Users" else groupType
+    data = operation.get("data")
+    resolved = (_resolvePatch(resourceType, data, created, where) if method == "PATCH"
+                else _resolveAttributes(resourceType, data, created, where))
+    return method, path, json.dumps(resolved, ensure_ascii=False).encode("utf-8"), headers
+
   def _withoutPasswords(self, document: object) -> object:
-    """With discardPasswords, the request without its password (Okta sends one even when it syncs none)."""
+    """With discardPasswords, a POST or PUT body without its password (Okta sends one even when it syncs none)."""
     if not self.discardPasswords or not isinstance(document, dict):
       return document
-    kept = {key: value for key, value in document.items() if key.lower() != "password"}
-    operations = kept.get("Operations")
-    if isinstance(operations, list):
-      remaining = []
-      for operation in operations:
-        if isinstance(operation, dict) and str(operation.get("path", "")).lower() == "password":
-          continue
-        if isinstance(operation, dict) and isinstance(operation.get("value"), dict) and "path" not in operation:
-          value = {key: item for key, item in operation["value"].items() if key.lower() != "password"}
-          if not value:
-            continue
-          operation = {**operation, "value": value}
-        remaining.append(operation)
-      kept["Operations"] = remaining
-    return kept
+    return {key: value for key, value in document.items() if key.lower() != "password"}
 
   def _patch(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
              body: bytes) -> SCIMResponse:
     self._allowProjection(resourceType, parameters)
     existing = self._existing(resourceType, resourceID)
-    document = self._withoutPasswords(self._document(headers, body))
-    if isinstance(document, dict) and document.get("Operations") == []:
-      resource = existing
-    else:
-      resource = _applyPatch(resourceType, existing, document)
+    resource = _applyPatch(resourceType, existing, self._document(headers, body), self.discardPasswords)
+    if resource is None:
+      return self._patched(resourceType, existing, parameters)
     self._checkResource(resourceType, resource, resourceID)
-    resource["meta"] = {**resource["meta"], "lastModified": _stamp(self.clock())}
+    stamp = _stamp(self.clock())
+    resource["meta"] = _touched(resource["meta"], stamp)
     self.store.replace(resourceType.name, resource)
+    if resourceType is groupType:
+      self._touchMembers(existing, resource, stamp)
+    return self._patched(resourceType, resource, parameters)
+
+  def _patched(self, resourceType: ResourceType, resource: JSON, parameters: dict[str, str]) -> SCIMResponse:
     # A group's member list can be long, so its PATCH answers without a body, as Entra asks.
     if resourceType is groupType and not parameters:
       return self._answer(204, None, {"ETag": _version(resource)})
     return self._answer(200, self._render(resourceType, resource, parameters), {"ETag": _version(resource)})
 
   def _delete(self, resourceType: ResourceType, resourceID: str) -> SCIMResponse:
-    self._existing(resourceType, resourceID)
-    self.store.delete(resourceType.name, resourceID)
+    existing = self._existing(resourceType, resourceID)
     stamp = _stamp(self.clock())
     for group in self.store.search("Group", ValuePath("members", Compare("value", "eq", resourceID))):
       group = copy.deepcopy(group)
       group["members"] = [member for member in group["members"] if member["value"] != resourceID]
       if not group["members"]:
         del group["members"]
-      group["meta"] = {**group["meta"], "lastModified": stamp}
+      group["meta"] = _touched(group["meta"], stamp)
       self.store.replace("Group", group)
+    if resourceType is groupType:
+      self._touchMembers(existing, None, stamp)
+    self.store.delete(resourceType.name, resourceID)
     return self._answer(204, None)
+
+  def _touchMembers(self, before: JSON | None, after: JSON | None, stamp: str) -> None:
+    """A new revision for each user whose rendered groups a group's write changes, so its version changes too."""
+    def users(group: JSON | None) -> set[str]:
+      return {member["value"] for member in (group or {}).get("members", []) if member["type"] == "User"}
+    renamed = before is not None and after is not None and before["displayName"] != after["displayName"]
+    changed = users(before) | users(after) if renamed else users(before) ^ users(after)
+    for userID in sorted(changed):
+      user = self.store.get("User", userID)
+      if user is None:
+        raise LookupError(f"a group holds the user {userID}, which the store does not have")
+      user["meta"] = _touched(user["meta"], stamp)
+      self.store.replace("User", user)
 
   def _list(self, resourceType: ResourceType, parameters: dict[str, str]) -> SCIMResponse:
     self._allow(parameters, ("filter", "startIndex", "count", "attributes", "excludedAttributes", "sortBy", "sortOrder"))

@@ -824,13 +824,241 @@ def testABulkRequestStopsAfterFailOnErrors(service):
   assert [answer["status"] for answer in document["Operations"]] == ["201", "409", "409"]
 
 
-@pytest.mark.parametrize("operation, why", [
-  ({"method": "GET", "path": "/Users"}, "needs a method"),
-  ({"method": "POST", "path": "/Users", "data": {}}, "needs a bulkId"),
-  ({"method": "POST", "path": "/Bulk", "bulkId": "x", "data": {}}, "not a resource operation"),
-  ({"method": "DELETE", "path": "/Users"}, "not a resource operation"),
+bulkSchema = "urn:ietf:params:scim:api:messages:2.0:BulkRequest"
+enterprise = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+nobody = "00000000-0000-4000-8000-000000000000"
+
+
+def bulk(service, *operations, **extra):
+  status, document, _ = call(service, "POST", "/Bulk", {"schemas": [bulkSchema], "Operations": list(operations), **extra})
+  assert status == 200, document
+  return document["Operations"]
+
+
+def postUser(bulkId, userName, **attributes):
+  return {"method": "POST", "path": "/Users", "bulkId": bulkId, "data": {"schemas": [coreUser], "userName": userName, **attributes}}
+
+
+@pytest.mark.parametrize("operation, why, scimType", [
+  ({"method": "GET", "path": "/Users"}, "needs a method", "invalidSyntax"),
+  ({"method": "POST", "path": "/Users", "data": {}}, "needs a bulkId", "invalidSyntax"),
+  ({"method": "POST", "path": "/Bulk", "bulkId": "x", "data": {}}, "not a resource operation", "invalidPath"),
+  ({"method": "DELETE", "path": "/Users"}, "not a resource operation", "invalidPath"),
+  ("DELETE /Users", "must be an object", "invalidSyntax"),
+  ({"method": "DELETE", "path": f"/Users/{nobody}", "data": {}}, "a DELETE takes no data", "invalidSyntax"),
+  ({"method": "DELETE", "path": f"/Users/{nobody}", "version": 123}, "version must be an entity tag", "invalidSyntax"),
+  ({"method": "DELETE", "path": f"/Users/{nobody}", "version": "abc"}, "version must be an entity tag", "invalidSyntax"),
+  ({"method": "POST", "path": "/Users", "bulkId": "x", "version": 'W/"1"', "data": {}}, "a POST takes no version",
+   "invalidSyntax"),
+  ({"method": "POST", "path": "/Users", "bulkId": "a b", "data": {}}, "a bulkId is 1 to 64", "invalidSyntax"),
+  ({"method": "POST", "path": "/Users", "bulkId": "x" * 65, "data": {}}, "a bulkId is 1 to 64", "invalidSyntax"),
 ])
-def testBulkOperationsThatAreNotResourceOperationsAreRefused(service, operation, why):
-  status, document, _ = call(service, "POST", "/Bulk", {
-    "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"], "Operations": [operation]})
-  assert status == 400 and why in refused(400, document, document.get("scimType"))
+def testAMalformedBulkOperationIsAnsweredOnItsOwnAfterTheOnesBefore(service, operation, why, scimType):
+  answers = bulk(service, postUser("kept", "kept"), operation, postUser("after", "after"))
+  assert [answer["status"] for answer in answers] == ["201", "400", "201"]
+  assert why in refused(400, answers[1]["response"], scimType)
+  assert sorted(user["userName"] for user in service.store.resources["User"].values()) == ["after", "kept"]
+
+
+def testAMalformedBulkOperationCountsTowardFailOnErrors(service):
+  answers = bulk(service, {"method": "GET", "path": "/Users"}, postUser("never", "never"), failOnErrors=1)
+  assert [answer["status"] for answer in answers] == ["400"]
+  assert service.store.resources["User"] == {}
+
+
+def testABulkVersionIsTheIfMatchOfItsOperation(service):
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  replace = {"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "title", "value": "x"}]}
+  answers = bulk(service, {"method": "PATCH", "path": f"/Users/{user['id']}", "version": 'W/"0"', "data": replace},
+                 {"method": "PATCH", "path": f"/Users/{user['id']}", "version": user["meta"]["version"], "data": replace})
+  assert [answer["status"] for answer in answers] == ["412", "200"]
+
+
+def testBulkIDsResolveOnlyAsWholeReferences(service):
+  answers = bulk(
+    service, postUser("u1", "first"), postUser("u10", "second"),
+    postUser("u2", "third", displayName="see bulkId:u10", externalId="bulkId:u1"),
+    {"method": "PATCH", "path": "/Users/bulkId:u10",
+     "data": {"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "title", "value": "bulkId:u1"}]}},
+    {"method": "POST", "path": "/Groups", "bulkId": "team",
+     "data": {"schemas": [coreGroup], "displayName": "bulkId:u1", "members": [{"value": "bulkId:u10"}]}},
+    {"method": "PATCH", "path": "/Groups/bulkId:team", "data": {"schemas": [patchOpSchema], "Operations": [
+      {"op": "add", "path": "members", "value": [{"value": "bulkId:u2"}]},
+      {"op": "add", "value": {"members": [{"value": "bulkId:u1"}]}}]}},
+    postUser("u3", "fourth", schemas=[coreUser, enterprise], **{enterprise: {"manager": {"value": "bulkId:u1"}}}),
+    {"method": "PATCH", "path": "/Users/bulkId:u2", "data": {"schemas": [patchOpSchema], "Operations": [
+      {"op": "add", "path": f"{enterprise}:manager.value", "value": "bulkId:u10"}]}},
+  )
+  assert [answer["status"] for answer in answers] == ["201", "201", "201", "200", "201", "204", "201", "200"]
+  ids = {user["userName"]: userID for userID, user in service.store.resources["User"].items()}
+  users = service.store.resources["User"]
+  assert (users[ids["third"]]["displayName"], users[ids["third"]]["externalId"]) == ("see bulkId:u10", "bulkId:u1")
+  assert users[ids["second"]]["title"] == "bulkId:u1"
+  group = next(iter(service.store.resources["Group"].values()))
+  assert group["displayName"] == "bulkId:u1"
+  assert [member["value"] for member in group["members"]] == [ids["second"], ids["third"], ids["first"]]
+  assert users[ids["fourth"]][enterprise]["manager"] == {"value": ids["first"]}
+  assert users[ids["third"]][enterprise]["manager"] == {"value": ids["second"]}
+
+
+@pytest.mark.parametrize("operation, status, why, scimType", [
+  ({"method": "PATCH", "path": "/Users/bulkId:u10", "data": {"schemas": [patchOpSchema], "Operations": [
+    {"op": "replace", "path": "title", "value": "x"}]}}, "409", "bulkId u10, which no earlier operation", "invalidValue"),
+  ({"method": "POST", "path": "/Groups", "bulkId": "g", "data": {"schemas": [coreGroup], "displayName": "g",
+                                                                  "members": [{"value": "bulkId:later"}]}},
+   "409", "bulkId later, which no earlier operation", "invalidValue"),
+  ({"method": "POST", "path": "/Groups", "bulkId": "g", "data": {"schemas": [coreGroup], "displayName": "g",
+                                                                  "members": [{"value": "bulkId:failed"}]}},
+   "409", "bulkId failed, whose POST failed", "invalidValue"),
+  ({"method": "POST", "path": "/Groups", "bulkId": "g", "data": {"schemas": [coreGroup], "displayName": "g",
+                                                                  "members": [{"value": "bulkId:a b"}]}},
+   "400", "whose name is not a bulkId", "invalidValue"),
+  (postUser("u1", "again"), "400", "bulkId u1 is used by an earlier operation", "invalidSyntax"),
+  (postUser("failed", "again"), "400", "bulkId failed is used by an earlier operation", "invalidSyntax"),
+])
+def testBulkIDReferencesAreRefusedByName(service, operation, status, why, scimType):
+  answers = bulk(service, postUser("u1", "first"), postUser("failed", "first"), operation)
+  assert [answer["status"] for answer in answers] == ["201", "409", status]
+  assert why in refused(int(status), answers[2]["response"], scimType)
+
+
+def testAResolvedBulkOperationIsBoundedByTheBodyLimit():
+  service = SCIMService(MemoryStore(), baseURL, lambda presented: presented == token, maximumBytes=2000)
+  group = {"method": "POST", "path": "/Groups", "bulkId": "g",
+           "data": {"schemas": [coreGroup], "displayName": "g", "members": [{"value": "bulkId:a"}] * 60}}
+  body = {"schemas": [bulkSchema], "Operations": [postUser("a", "a"), group]}
+  assert len(json.dumps(body)) < 2000
+  answers = bulk(service, *body["Operations"])
+  assert [answer["status"] for answer in answers] == ["201", "413"]
+
+
+def versionOf(service, path, headers=None):
+  status, _, answered = call(service, "GET", path, headers=headers)
+  assert status in (200, 304)
+  return answered["ETag"]
+
+
+def testAUsersVersionChangesWithItsGroupsAndNeverReturns(service):
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  path = f"/Users/{user['id']}"
+  versions = [versionOf(service, path)]
+  group = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "admins", "members": [{"value": user["id"]}]})
+  versions.append(versionOf(service, path))
+  assert call(service, "GET", path, headers={"Authorization": f"Bearer {token}", "If-None-Match": versions[0]})[0] == 200
+  assert patch(service, f"/Groups/{group['id']}", {"op": "replace", "path": "displayName", "value": "staff"})[0] == 204
+  versions.append(versionOf(service, path))
+  assert call(service, "GET", path)[1]["groups"] == [{"value": group["id"], "display": "staff", "type": "direct",
+                                                    "$ref": f"{baseURL}/Groups/{group['id']}"}]
+  assert patch(service, f"/Groups/{group['id']}", {"op": "remove", "path": "members"})[0] == 204
+  versions.append(versionOf(service, path))
+  assert patch(service, f"/Groups/{group['id']}", {"op": "add", "path": "members", "value": [{"value": user["id"]}]})[0] == 204
+  versions.append(versionOf(service, path))
+  assert call(service, "DELETE", f"/Groups/{group['id']}")[0] == 204
+  versions.append(versionOf(service, path))
+  assert len(set(versions)) == len(versions)
+
+
+def testAChangeUndoneGivesANewVersion(service):
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  first = user["meta"]["version"]
+  assert patch(service, f"/Users/{user['id']}", {"op": "add", "path": "title", "value": "x"})[0] == 200
+  status, document, _ = patch(service, f"/Users/{user['id']}", {"op": "remove", "path": "title"})
+  assert status == 200 and "title" not in document and document["meta"]["version"] != first
+  answer = service.handle("PATCH", f"/Users/{user['id']}", "", {
+    "Authorization": f"Bearer {token}", "Content-Type": "application/scim+json", "If-Match": first},
+    json.dumps({"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "title", "value": "y"}]}).encode())
+  assert answer.status == 412
+
+
+def testIfMatchComparesExactlyAndIfNoneMatchWeakly(service):
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  path, version = f"/Users/{user['id']}", user["meta"]["version"]
+  strong = version.removeprefix("W/")
+  def get(header, value):
+    return call(service, "GET", path, headers={"Authorization": f"Bearer {token}", header: value})
+  assert get("If-None-Match", strong)[0] == 304
+  assert get("If-None-Match", f'"other", {version}')[0] == 304
+  assert get("If-Match", strong)[0] == 412
+  assert get("If-Match", f'"other", {version}')[0] == 200
+  assert get("If-Match", "*")[0] == 200
+  status, document, _ = get("If-Match", version.removeprefix("W/").strip('"'))
+  assert "If-Match is not * or a list of entity tags" in refused(400, document, "invalidSyntax")
+  deleting = {"Authorization": f"Bearer {token}", "If-None-Match": version}
+  assert service.handle("DELETE", path, "", deleting, b"").status == 412
+  assert service.handle("DELETE", path, "", {**deleting, "If-None-Match": 'W/"other"'}, b"").status == 204
+
+
+def oktaService():
+  return SCIMService(MemoryStore(), baseURL, lambda presented: presented == token, discardPasswords=True)
+
+
+@pytest.mark.parametrize("body, why", [
+  ({"Operations": [], "schemas": "not a list", "junk": 1}, "names exactly the schema"),
+  ({"schemas": [patchOpSchema], "Operations": []}, "needs a list of Operations"),
+  ({"schemas": [patchOpSchema], "Operations": [{"op": "bogus", "path": "password", "value": "x"}]}, "op must be add"),
+  ({"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "password", "value": "x", "junk": 1}]},
+   "unknown members"),
+  ({"schemas": [patchOpSchema], "Operations": [{"op": "replace", "value": "password"}]}, "needs an object of attributes"),
+])
+def testAPatchWithPasswordsDiscardedIsStillReadStrictly(body, why):
+  okta = oktaService()
+  user = created(okta, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  status, document, _ = call(okta, "PATCH", f"/Users/{user['id']}", body)
+  assert status == 400 and why in refused(400, document, "invalidSyntax")
+  assert okta.store.resources["User"][user["id"]]["meta"]["revision"] == 1
+
+
+def testAPatchOfOnlyPasswordsWritesNothing():
+  okta = oktaService()
+  user = created(okta, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  stored = copy.deepcopy(okta.store.resources["User"])
+  status, document, headers = patch(okta, f"/Users/{user['id']}", {"op": "replace", "path": "password", "value": "x"},
+                                    {"op": "replace", "value": {"Password": "y"}})
+  assert (status, headers["ETag"], document) == (200, user["meta"]["version"], user)
+  assert okta.store.resources["User"] == stored
+  status, document, _ = patch(okta, f"/Users/{user['id']}", {"op": "replace", "value": {"password": "y", "title": "t"}})
+  assert status == 200 and document["title"] == "t"
+
+
+def testABinaryValueOutsideASCIIIsRefusedAsBase64(service):
+  status, document, _ = call(service, "POST", "/Users", {"schemas": [coreUser], "userName": "ana",
+                                                         "x509Certificates": [{"value": "\u00e9"}]})
+  assert status == 400 and "must be base64 text" in refused(400, document, "invalidValue")
+
+
+class FailingStore(MemoryStore):
+  """The memory store, failing (as a database can) at the given replace call."""
+
+  def __init__(self):
+    super().__init__()
+    self.replacesLeft = None
+
+  def replace(self, resourceType, resource):
+    if self.replacesLeft == 0:
+      raise ConnectionError("the database went away")
+    if self.replacesLeft is not None:
+      self.replacesLeft -= 1
+    super().replace(resourceType, resource)
+
+
+def danglingMembers(store):
+  return [member["value"] for group in store.resources["Group"].values() for member in group.get("members", [])
+          if member["value"] not in store.resources[member["type"]]]
+
+
+@pytest.mark.parametrize("deleted, replacesLeft", [("user", 0), ("user", 1), ("inner", 0), ("inner", 1)])
+def testADeleteFailingMidwayLeavesNoMemberDangling(deleted, replacesLeft):
+  store = FailingStore()
+  service = SCIMService(store, baseURL, lambda presented: presented == token)
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  inner = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "inner", "members": [{"value": user["id"]}]})
+  created(service, "/Groups", {"schemas": [coreGroup], "displayName": "outer",
+                               "members": [{"value": user["id"]}, {"value": inner["id"]}]})
+  target = {"user": f"/Users/{user['id']}", "inner": f"/Groups/{inner['id']}"}[deleted]
+  store.replacesLeft = replacesLeft
+  with pytest.raises(ConnectionError):
+    service.handle("DELETE", target, "", {"Authorization": f"Bearer {token}"}, b"")
+  assert danglingMembers(store) == []
+  store.replacesLeft = None
+  assert service.handle("DELETE", target, "", {"Authorization": f"Bearer {token}"}, b"").status == 204
+  assert danglingMembers(store) == []
