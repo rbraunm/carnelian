@@ -31,11 +31,12 @@ test federation and InCommon's live metadata.
 One per protocol, each with a complete sign-in example, what it checks and what it refuses:
 [OpenID Connect](docs/openIDConnect.md), [SAML 2.0](docs/saml.md),
 [research federations](docs/federations.md), [CAS](docs/cas.md),
-[LDAP and Active Directory](docs/ldap.md), [SCIM 2.0](docs/scim.md).
+[LDAP: Active Directory and OpenLDAP](docs/ldap.md), [SCIM 2.0](docs/scim.md),
+[workload tokens from CI and cloud](docs/workload.md).
 What Carnelian promises and what it leaves to you: [SECURITY.md](SECURITY.md).
 
 The supported interface is what each of the modules `carnelian.oidc`, `carnelian.saml`,
-`carnelian.federation`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim` and
+`carnelian.federation`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim`, `carnelian.workload` and
 `carnelian.fetching` lists in its `__all__`. Everything else is internal and may change
 in any release.
 

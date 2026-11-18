@@ -3,7 +3,6 @@
 scopes, scoped identifiers, the service provider's metadata, and InCommon's real MDQ service."""
 
 import base64
-import copy
 import datetime
 from pathlib import Path
 

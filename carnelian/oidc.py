@@ -22,7 +22,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import math
 import secrets
 import time
 import urllib.parse
@@ -30,12 +29,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from carnelian.fetching import JSON, JSONFetcher
-from carnelian.jose import JOSEError, KeySet, acceptedAlgorithm, readHeader, readJSON, supportedAlgorithms, verifyCompact
+from carnelian.jose import JOSEError, KeyCache, numericDate, readJSON, supportedAlgorithms
 
 __all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty"]
 
-minimumKeyRefreshSeconds = 60
-maximumKeyAgeSeconds = 24 * 60 * 60
 
 
 class SignInRefused(ValueError):
@@ -93,10 +90,10 @@ def _sameText(given: object, expected: str) -> bool:
 
 
 def _numericDate(claims: JSON, member: str) -> float:
-  value = claims.get(member)
-  if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-    raise SignInRefused(f"the ID token's '{member}' is not a finite number: {value!r}")
-  return value
+  try:
+    return numericDate(claims, member)
+  except JOSEError as error:
+    raise SignInRefused(f"the ID token's {error}") from None
 
 
 def discover(issuer: str, fetcher: JSONFetcher) -> Provider:
@@ -169,8 +166,7 @@ class RelyingParty:
     self.leewaySeconds = leewaySeconds
     self.pendingSeconds = pendingSeconds
     self.clock = clock
-    self._keys: KeySet | None = None
-    self._keysFetchedAt = float("-inf")
+    self._keys = KeyCache(lambda: self.fetcher.getJSON(self.provider.jwksURI), lambda: self.clock())
 
   def beginSignIn(self) -> tuple[str, Pending]:
     pending = Pending(issuer=self.provider.issuer, clientID=self.clientID, state=secrets.token_urlsafe(32),
@@ -224,24 +220,8 @@ class RelyingParty:
       displayName=_optionalText(claims, "name"), groups=tuple(groups), claims=claims,
     )
 
-  def _fetchKeys(self) -> KeySet:
-    keys = KeySet(self.fetcher.getJSON(self.provider.jwksURI))
-    self._keys, self._keysFetchedAt = keys, self.clock()
-    return keys
-
   def _verifiedPayload(self, idToken: str) -> bytes:
-    header = readHeader(idToken)
-    acceptedAlgorithm(header, self.provider.signingAlgorithms)
-    keys = self._keys
-    if keys is None or self.clock() - self._keysFetchedAt >= maximumKeyAgeSeconds:
-      keys = self._fetchKeys()
-    try:
-      return verifyCompact(idToken, keys.keyFor(header), self.provider.signingAlgorithms).payload
-    except JOSEError:
-      # Bounded so that tokens naming unknown keys cannot make every sign-in fetch the provider's keys.
-      if self.clock() - self._keysFetchedAt < minimumKeyRefreshSeconds:
-        raise
-    return verifyCompact(idToken, self._fetchKeys().keyFor(header), self.provider.signingAlgorithms).payload
+    return self._keys.verify(idToken, self.provider.signingAlgorithms).payload
 
   def checkIDToken(self, idToken: str, nonce: str) -> JSON:
     """The claims of an ID token that passes every check, or SignInRefused saying which failed."""

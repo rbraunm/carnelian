@@ -31,7 +31,7 @@ Source = "https://github.com/rbraunm/carnelian"
 Issues = "https://github.com/rbraunm/carnelian/issues"
 
 [project.optional-dependencies]
-# Test oracles and the type checker: they check Carnelian and never run in an application.
+# Test oracles, the type checker and the linter: they check Carnelian and never run in an application.
 test = [
   "pytest>=8",
   "cryptography>=44",
@@ -39,6 +39,7 @@ test = [
   "signxml>=4",
   "hypothesis>=6.170",
   "mypy>=2.4",
+  "ruff>=0.17",
 ]
 
 [tool.setuptools.packages.find]

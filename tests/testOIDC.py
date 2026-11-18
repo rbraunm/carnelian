@@ -17,7 +17,8 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 from carnelian.jose import base64urlEncode
-from carnelian.oidc import Pending, Provider, RelyingParty, SignInRefused, discover, maximumKeyAgeSeconds
+from carnelian.jose import maximumKeyAgeSeconds
+from carnelian.oidc import Pending, Provider, RelyingParty, SignInRefused, discover
 
 issuer = "https://id.example.org/realms/test"
 

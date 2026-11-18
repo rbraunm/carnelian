@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -188,3 +190,43 @@ class KeySet:
     if "alg" in chosen and chosen["alg"] != header.get("alg"):
       raise JOSEError(f"key '{keyID}' is for '{chosen['alg']}', the token uses '{header.get('alg')}'")
     return keyFromJWK(chosen)
+
+
+def numericDate(claims: JSON, member: str) -> float:
+  """A JWT time claim: a finite number of seconds (never a boolean, a string or 1e999)."""
+  value = claims.get(member)
+  if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+    raise JOSEError(f"'{member}' is not a finite number: {value!r}")
+  return value
+
+
+minimumKeyRefreshSeconds = 60
+maximumKeyAgeSeconds = 24 * 60 * 60
+
+
+class KeyCache:
+  """An issuer's JWK set, fetched when first needed, again when a day old, and again (at most once a minute) when a
+  token names a key it lacks or fails against the key it names: rotation is followed, and tokens naming unknown keys
+  cannot make every check fetch the issuer's keys."""
+
+  def __init__(self, fetchKeys: Callable[[], JSON], clock: Callable[[], float]) -> None:
+    self._fetch, self._clock = fetchKeys, clock
+    self._keys: KeySet | None = None
+    self._fetchedAt = float("-inf")
+
+  def _fetched(self) -> KeySet:
+    self._keys, self._fetchedAt = KeySet(self._fetch()), self._clock()
+    return self._keys
+
+  def verify(self, token: str, allowedAlgorithms: frozenset[str]) -> VerifiedJWS:
+    header = readHeader(token)
+    acceptedAlgorithm(header, allowedAlgorithms)
+    keys = self._keys
+    if keys is None or self._clock() - self._fetchedAt >= maximumKeyAgeSeconds:
+      keys = self._fetched()
+    try:
+      return verifyCompact(token, keys.keyFor(header), allowedAlgorithms)
+    except JOSEError:
+      if self._clock() - self._fetchedAt < minimumKeyRefreshSeconds:
+        raise
+    return verifyCompact(token, self._fetched().keyFor(header), allowedAlgorithms)
