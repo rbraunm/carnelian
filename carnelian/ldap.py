@@ -22,6 +22,10 @@ userAccountControl and not be disabled, the person's password is checked by bind
 entry on a fresh connection, and the groups are those the entry belongs to, nested ones
 included (Active Directory's LDAP_MATCHING_RULE_IN_CHAIN), named by sAMAccountName, which
 Active Directory keeps unique in the domain (a cn is unique only within its container).
+OpenLDAP groups are groupOfNames in one container, each named by the cn its DN begins with
+(a group whose first RDN is not cn=<its cn> is refused, since its cn need not be unique
+there), told apart by entryUUID, and walked within maximumGroupNesting levels,
+maximumGroupSearches searches, maximumGroups groups and maximumGroupWalkSeconds.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import re
 import socket
 import ssl
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 
@@ -420,10 +425,67 @@ class DirectoryKind(Enum):
   """How a directory keeps people and groups."""
 
   activeDirectory = "activeDirectory"  # user objects, userAccountControl, in-chain groups named by sAMAccountName
-  openLDAP = "openLDAP"                # inetOrgPerson, groupOfNames in one container named by cn, password policy
+  openLDAP = "openLDAP"                # inetOrgPerson, groupOfNames in one container named by cn RDNs, password policy
 
 
 maximumGroupNesting = 16
+maximumGroupSearches = 200
+maximumGroups = 500
+maximumGroupWalkSeconds = 30.0
+_dnSpecials = frozenset(' "#+,;<=>\\')
+_hexDigits = frozenset("0123456789abcdefABCDEF")
+
+
+def _firstRDN(dn: str) -> tuple[str, str]:
+  """A DN's first RDN (RFC 4514) as its attribute type and unescaped value; a multi-valued or BER-encoded one is refused."""
+  attributeType, equals, rest = dn.partition("=")
+  if not equals or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", attributeType):
+    raise DirectoryRefused(f"the group DN {dn!r} does not begin with an attribute type and =")
+  if rest.startswith("#"):
+    raise DirectoryRefused(f"the group DN {dn!r} names its first RDN by a BER value")
+  value = bytearray()
+  index = 0
+  while index < len(rest):
+    character = rest[index]
+    if character == "\\":
+      pair = rest[index + 1:index + 3]
+      if len(pair) == 2 and set(pair) <= _hexDigits:
+        value.append(int(pair, 16))
+        index += 3
+        continue
+      if pair[:1] and pair[0] in _dnSpecials:
+        value.extend(pair[0].encode("utf-8"))
+        index += 2
+        continue
+      raise DirectoryRefused(f"the group DN {dn!r} holds an escape RFC 4514 does not define")
+    if character == "+":
+      raise DirectoryRefused(f"the group DN {dn!r} has a first RDN of more than one attribute")
+    if character == ",":
+      break
+    value.extend(character.encode("utf-8"))
+    index += 1
+  try:
+    return attributeType.lower(), value.decode("utf-8")
+  except UnicodeDecodeError:
+    raise DirectoryRefused(f"the group DN {dn!r} escapes bytes that are not UTF-8") from None
+
+
+def _groupName(group: Entry) -> str:
+  """A group's cn, which is unique in its container only because it is the RDN its DN begins with."""
+  name = _required(group, "cn", "a group")
+  attributeType, value = _firstRDN(group.dn)
+  if attributeType != "cn" or value.casefold() != name.casefold():
+    raise DirectoryRefused(f"the group {group.dn!r} is not named by cn={name} as its first RDN, "
+                           "so its cn need not be unique in the container")
+  return name
+
+
+def _entryUUID(group: Entry) -> str:
+  text = _required(group, "entryUUID", "a group")
+  try:
+    return str(uuid.UUID(text))
+  except ValueError:
+    raise DirectoryRefused(f"the directory sent an entryUUID that is not a UUID for {group.dn!r}") from None
 
 
 class Directory:
@@ -494,23 +556,38 @@ class Directory:
           person.bind(entry.dn, password)
         except DirectoryRefused:
           raise DirectoryRefused("the user name or the password is wrong") from None
-      names: set[str] = set()
-      seen: set[str] = set()
-      frontier = [entry.dn]
-      for _ in range(maximumGroupNesting):
-        reached = []
-        for member in frontier:
-          for group in service.search(groupsBaseDN, All((Equal("objectClass", "groupOfNames"), Equal("member", member))),
-                                      ("cn",), oneLevel=True):
-            if group.dn.lower() not in seen:
-              seen.add(group.dn.lower())
-              names.add(_required(group, "cn", "a group"))
-              reached.append(group.dn)
-        if not reached:
-          break
-        frontier = reached
-      else:
-        raise DirectoryRefused(f"the groups nest deeper than {maximumGroupNesting}")
+      names = self._openLDAPGroups(service, entry.dn, groupsBaseDN)
     return DirectoryIdentity(dn=entry.dn, userName=_required(entry, self.userAttribute, "the user"),
                              displayName=_single(entry, "displayName"), email=_single(entry, "mail"),
                              groups=tuple(sorted(names)))
+
+  @staticmethod
+  def _openLDAPGroups(service: Connection, personDN: str, groupsBaseDN: str) -> set[str]:
+    """The cn of every group holding the person, nested included, walked within the module's bounds."""
+    deadline = time.monotonic() + maximumGroupWalkSeconds
+    names: set[str] = set()
+    seen: set[str] = set()
+    searches = 0
+    frontier = [personDN]
+    for _ in range(maximumGroupNesting):
+      reached = []
+      for member in frontier:
+        if searches == maximumGroupSearches:
+          raise DirectoryRefused(f"the group walk needs more than {maximumGroupSearches} searches")
+        if time.monotonic() >= deadline:
+          raise DirectoryRefused(f"the group walk did not finish within {maximumGroupWalkSeconds} seconds")
+        searches += 1
+        for group in service.search(groupsBaseDN, All((Equal("objectClass", "groupOfNames"), Equal("member", member))),
+                                    ("cn", "entryUUID"), oneLevel=True):
+          identifier = _entryUUID(group)
+          if identifier in seen:
+            continue
+          if len(seen) == maximumGroups:
+            raise DirectoryRefused(f"the person is in more than {maximumGroups} groups")
+          seen.add(identifier)
+          names.add(_groupName(group))
+          reached.append(group.dn)
+      if not reached:
+        return names
+      frontier = reached
+    raise DirectoryRefused(f"the groups nest deeper than {maximumGroupNesting}")

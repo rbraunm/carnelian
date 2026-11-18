@@ -52,8 +52,14 @@ directory = Directory("ldap.example.edu", secureContext(), "dc=example,dc=edu", 
 ```
 
 People are `inetOrgPerson` entries found by `uid` (or the `userAttribute` you give); groups
-are `groupOfNames` in `groupsBaseDN`, named by `cn` (unique there), nested groups followed to
-a depth of 16. A disabled account is the server's password policy's to refuse: lock it
+are `groupOfNames` in `groupsBaseDN`, named by `cn`. A `cn` is unique in the container only
+when it is the group's RDN, so each group's DN must begin with `cn=<its cn>`; a group named
+by another attribute (`description=x` with `cn: admins`, say) or by a multi-valued RDN is
+refused rather than taken as a second `admins`. Groups are told apart by their `entryUUID`,
+not by comparing DN text. Nested groups are followed within `ldap.maximumGroupNesting` (16)
+levels, `maximumGroupSearches` (200) searches, `maximumGroups` (500) groups and
+`maximumGroupWalkSeconds` (30) per sign-in; a walk past any of them is refused by name.
+A disabled account is the server's password policy's to refuse: lock it
 (`pwdAccountLockedTime`) and the bind fails.
 
 ## What is refused

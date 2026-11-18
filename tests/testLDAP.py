@@ -347,6 +347,8 @@ class StandInDirectory:
           self.searches.append((tlv(*query),
                                 [name.decode() for _, name in readAll(parts[7][1])]))
           found = self.groups if b"group" in query[1] and b"person" not in query[1] else self.users
+          if isinstance(found, dict):
+            found = found.get(readAll(readAll(query[1])[1][1])[1][1].decode(), [])
           connection.sendall(b"".join(message(messageID, each) for each in found) + searchDone(messageID))
         else:
           return
@@ -354,6 +356,10 @@ class StandInDirectory:
   def directory(self, tlsFiles):
     return Directory("127.0.0.1", secureContext(str(tlsFiles / "authority.pem")), "DC=x", "CN=svc,DC=x", "svc password",
                      port=self.port)
+
+  def openLDAP(self, tlsFiles):
+    return Directory("127.0.0.1", secureContext(str(tlsFiles / "authority.pem")), "dc=x", "CN=svc,DC=x", "svc password",
+                     port=self.port, kind=DirectoryKind.openLDAP, groupsBaseDN="ou=groups,dc=x")
 
   def close(self):
     self.listener.close()
@@ -368,7 +374,7 @@ def standInDirectory(tlsFiles):
   made = []
 
   def make(users, groups=(), accepted=(service, (anaDN, "right"))):
-    made.append(StandInDirectory(tlsFiles, list(users), list(groups), set(accepted)))
+    made.append(StandInDirectory(tlsFiles, list(users), groups if isinstance(groups, dict) else list(groups), set(accepted)))
     return made[-1].directory(tlsFiles), made[-1]
 
   yield make
@@ -446,6 +452,87 @@ def testAWrongPasswordIsRefused(standInDirectory):
   with pytest.raises(DirectoryRefused, match="^the user name or the password is wrong$"):
     directory.signIn("ana", "wrong")
   assert server.binds == [service, (anaDN, "wrong")]
+
+
+# ---- OpenLDAP groups against a stand-in directory -------------------------------
+
+personDN = "uid=ana,ou=people,dc=x"
+
+
+def openLDAPDirectory(standInDirectory, tlsFiles, groupsOf):
+  _, server = standInDirectory([entry(personDN, {"uid": ["ana"], "mail": ["ana@x"]})], groupsOf,
+                               accepted=(service, (personDN, "right")))
+  return server.openLDAP(tlsFiles), server
+
+
+def group(dn, name, number):
+  return entry(dn, {"cn": [name], "entryUUID": [f"00000000-0000-4000-8000-{number:012d}"]})
+
+
+def testOpenLDAPGroupsAreWalkedOnceEachByTheirEntryUUID(standInDirectory, tlsFiles):
+  staff, everyone = "cn=staff,ou=groups,dc=x", "cn=everyone,ou=groups,dc=x"
+  directory, server = openLDAPDirectory(standInDirectory, tlsFiles, {
+    personDN: [group(staff, "staff", 1)],
+    staff: [group(everyone, "everyone", 2)],
+    everyone: [group("cn=staff, ou=groups,dc=x", "staff", 1)],
+  })
+  assert directory.signIn("ana", "right").groups == ("everyone", "staff")
+  groupSearches = server.searches[1:]
+  assert [query for query, _ in groupSearches] == [
+    All((Equal("objectClass", "groupOfNames"), Equal("member", member))).encoded() for member in (personDN, staff, everyone)]
+  assert {tuple(attributes) for _, attributes in groupSearches} == {("cn", "entryUUID")}
+
+
+@pytest.mark.parametrize("dn, reason", [
+  ("description=x,ou=groups,dc=x", "not named by cn=admins as its first RDN"),
+  ("cn=other,ou=groups,dc=x", "not named by cn=admins as its first RDN"),
+  ("cn=admins+ou=x,ou=groups,dc=x", "first RDN of more than one attribute"),
+  ("cn=#0406061646d696e73,ou=groups,dc=x", "by a BER value"),
+  ("cn=adm\\qins,ou=groups,dc=x", "escape RFC 4514 does not define"),
+  ("cn=\\ff,ou=groups,dc=x", "escapes bytes that are not UTF-8"),
+])
+def testAnOpenLDAPGroupNotNamedByItsCnIsRefused(standInDirectory, tlsFiles, dn, reason):
+  directory, _ = openLDAPDirectory(standInDirectory, tlsFiles, {personDN: [group(dn, "admins", 1)]})
+  with pytest.raises(DirectoryRefused, match=reason):
+    directory.signIn("ana", "right")
+
+
+def testAnOpenLDAPGroupRDNIsReadWithItsEscapes(standInDirectory, tlsFiles):
+  directory, _ = openLDAPDirectory(standInDirectory, tlsFiles, {
+    personDN: [group("CN=r\\+d\\2C \\c3\\a9quipe,ou=groups,dc=x", "R+D, Équipe", 1)]})
+  assert directory.signIn("ana", "right").groups == ("R+D, Équipe",)
+
+
+def testAnOpenLDAPGroupWithoutAUUIDIsRefused(standInDirectory, tlsFiles):
+  directory, _ = openLDAPDirectory(standInDirectory, tlsFiles, {
+    personDN: [entry("cn=staff,ou=groups,dc=x", {"cn": ["staff"], "entryUUID": ["staff"]})]})
+  with pytest.raises(DirectoryRefused, match="entryUUID that is not a UUID"):
+    directory.signIn("ana", "right")
+
+
+def chain(length):
+  dns = [personDN] + [f"cn=g{index},ou=groups,dc=x" for index in range(length)]
+  return {dns[index]: [group(dns[index + 1], f"g{index}", index)] for index in range(length)}
+
+
+@pytest.mark.parametrize("bound, value, groupsOf, reason", [
+  ("maximumGroupSearches", 3, chain(3), "needs more than 3 searches"),
+  ("maximumGroups", 2, {personDN: [group(f"cn=g{index},ou=groups,dc=x", f"g{index}", index) for index in range(3)]},
+   "in more than 2 groups"),
+  ("maximumGroupWalkSeconds", 0.0, chain(1), "did not finish within 0.0 seconds"),
+])
+def testTheOpenLDAPGroupWalkIsBounded(standInDirectory, tlsFiles, monkeypatch, bound, value, groupsOf, reason):
+  monkeypatch.setattr(ldap, bound, value)
+  directory, _ = openLDAPDirectory(standInDirectory, tlsFiles, groupsOf)
+  with pytest.raises(DirectoryRefused, match=reason):
+    directory.signIn("ana", "right")
+
+
+def testTheOpenLDAPGroupWalkReadsUpToItsBounds(standInDirectory, tlsFiles, monkeypatch):
+  monkeypatch.setattr(ldap, "maximumGroupSearches", 4)
+  monkeypatch.setattr(ldap, "maximumGroups", 3)
+  directory, _ = openLDAPDirectory(standInDirectory, tlsFiles, chain(3))
+  assert directory.signIn("ana", "right").groups == ("g0", "g1", "g2")
 
 
 # ---- against the testbed's Samba Active Directory --------------------------
