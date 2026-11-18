@@ -60,7 +60,7 @@ def expectedGroups(paths):
   return tuple(sorted({segment for path in paths for segment in path.strip("/").split("/")}))
 
 
-@pytest.mark.parametrize("userName", ["ana", "jose", "layla", "wei", "manygroups"])
+@pytest.mark.parametrize("userName", ["ana", "jose", "layla", "wei", "\u0645\u0631\u064a\u0645", "manygroups"])
 def testEveryoneSignsInWithNestedGroups(testbed, directory, userName):
   expected = account(testbed, userName)
   identity = directory.signIn(userName, expected["password"])

@@ -186,7 +186,7 @@ def keycloakIdentityProvider(testbed):
 
 
 @pytest.mark.parametrize("signs", ["response", "assertion"])
-@pytest.mark.parametrize("userName", ["ana", "jose", "layla", "manygroups"])
+@pytest.mark.parametrize("userName", ["ana", "jose", "layla", "\u0645\u0631\u064a\u0645", "manygroups"])
 def testEveryoneSignsInThroughKeycloak(testbed, keycloakIdentityProvider, signs, userName):
   identityProvider, fetcher = keycloakIdentityProvider
   settings = testbed["saml"]

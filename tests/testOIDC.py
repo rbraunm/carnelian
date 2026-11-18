@@ -160,7 +160,7 @@ def account(testbed, userName):
   return next(account for account in testbed["accounts"] if account["userName"] == userName)
 
 
-@pytest.mark.parametrize("userName", ["ana", "jose", "layla", "wei", "manygroups"])
+@pytest.mark.parametrize("userName", ["ana", "jose", "layla", "wei", "\u0645\u0631\u064a\u0645", "manygroups"])
 def testEveryoneInTheDatasetSignsIn(testbed, keycloak, userName):
   relyingParty, fetcher = keycloak
   expected = account(testbed, userName)
