@@ -494,3 +494,199 @@ def testDiscoveryDescribesWhatIsOffered(service):
   assert (userName["required"], userName["uniqueness"], userName["caseExact"]) == (True, "server", False)
   status, document, _ = call(service, "GET", f"/Schemas/{coreGroup}")
   assert [attribute["name"] for attribute in document["attributes"]] == ["displayName", "members"]
+
+
+# ---- integrity and bounds ---------------------------------------------------
+
+class RecordingStore(MemoryStore):
+  """The memory store, noting every ID the service asks it for."""
+
+  def __init__(self):
+    super().__init__()
+    self.asked = []
+
+  def get(self, resourceType, resourceID):
+    self.asked.append(resourceID)
+    return super().get(resourceType, resourceID)
+
+
+def groupOfOne(service):
+  users = [created(service, "/Users", {"schemas": [coreUser], "userName": name}) for name in ("babs", "mandy")]
+  group = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "g", "members": [{"value": users[0]["id"]}]})
+  return users, group
+
+
+@pytest.mark.parametrize("operation", [
+  {"op": "replace", "path": 'members[value eq "{first}"].value', "value": "{second}"},
+  {"op": "add", "path": 'members[value eq "{first}"].value', "value": "{second}"},
+  {"op": "replace", "path": 'members[value eq "{first}"].type', "value": "Group"},
+  {"op": "replace", "path": 'members[value eq "{first}"].type', "value": None},
+  {"op": "remove", "path": 'members[value eq "{first}"].type'},
+  {"op": "replace", "path": 'members[value eq "{first}"].$ref', "value": "https://example.test/elsewhere"},
+  {"op": "replace", "path": 'members[value eq "{first}"]', "value": {"value": "{second}"}},
+])
+def testPatchCannotChangeAnImmutableSubAttributeOfAMember(service, operation):
+  users, group = groupOfOne(service)
+  operation = json.loads(json.dumps(operation).replace("{first}", users[0]["id"]).replace("{second}", users[1]["id"]))
+  status, document, _ = patch(service, f"/Groups/{group['id']}", operation)
+  assert status == 400 and "is immutable" in refused(400, document, "mutability")
+  assert call(service, "GET", f"/Groups/{group['id']}")[1]["members"] == group["members"]
+
+
+def testPatchMayRewriteAMemberKeepingItsValue(service):
+  users, group = groupOfOne(service)
+  status, _, _ = patch(service, f"/Groups/{group['id']}", {
+    "op": "replace", "path": f'members[value eq "{users[0]["id"]}"]', "value": {"value": users[0]["id"], "display": "B"}})
+  assert status == 204
+  assert call(service, "GET", f"/Groups/{group['id']}")[1]["members"] == [
+    {"value": users[0]["id"], "$ref": f"{baseURL}/Users/{users[0]['id']}", "display": "B", "type": "User"}]
+
+
+@pytest.mark.parametrize("op", ["remove", "replace"])
+def testPatchCannotRemoveAMembersRequiredValue(service, op):
+  users, group = groupOfOne(service)
+  operation = {"op": op, "path": f'members[value eq "{users[0]["id"]}"].value'}
+  if op == "replace":
+    operation["value"] = None
+  status, document, _ = patch(service, f"/Groups/{group['id']}", operation)
+  assert status == 400 and "members.value is required" in refused(400, document, "invalidValue")
+  assert call(service, "GET", f"/Groups/{group['id']}")[1]["members"] == group["members"]
+
+
+@pytest.mark.parametrize("operation", [
+  {"op": "remove", "path": f"{enterpriseUserSchema}:manager.value"},
+  {"op": "replace", "path": f"{enterpriseUserSchema}:manager.value", "value": None},
+])
+def testPatchCannotRemoveTheManagersRequiredValue(service, operation):
+  user = created(service, "/Users", rfcUser())
+  status, document, _ = patch(service, f"/Users/{user['id']}", operation)
+  assert status == 400 and "manager.value is required" in refused(400, document, "invalidValue")
+  assert call(service, "GET", f"/Users/{user['id']}")[1] == user
+
+
+def testGroupsCannotContainThemselvesThroughOtherGroups(service):
+  inner = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "inner"})
+  middle = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "middle",
+                                        "members": [{"value": inner["id"]}]})
+  outer = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "outer",
+                                       "members": [{"value": middle["id"]}]})
+  for holder in (middle, outer):
+    status, document, _ = patch(service, f"/Groups/{inner['id']}", {"op": "add", "path": "members",
+                                                                    "value": [{"value": holder["id"]}]})
+    assert status == 400 and "would contain itself" in refused(400, document, "invalidValue")
+  status, document, _ = call(service, "PUT", f"/Groups/{inner['id']}", {
+    "schemas": [coreGroup], "displayName": "inner", "members": [{"value": outer["id"]}]})
+  assert status == 400 and "would contain itself" in refused(400, document, "invalidValue")
+  assert "members" not in call(service, "GET", f"/Groups/{inner['id']}")[1]
+  sibling = created(service, "/Groups", {"schemas": [coreGroup], "displayName": "sibling",
+                                         "members": [{"value": inner["id"]}, {"value": outer["id"]}]})
+  assert [member["value"] for member in sibling["members"]] == [inner["id"], outer["id"]]
+
+
+def testARefusedProjectionLeavesTheStoreUnchanged(service):
+  status, document, _ = call(service, "POST", "/Users", {"schemas": [coreUser], "userName": "babs"},
+                             query="attributes=nosuch")
+  assert status == 400 and "no such attribute" in refused(400, document, "invalidValue")
+  assert call(service, "GET", "/Users")[1]["totalResults"] == 0
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "babs", "title": "Guide"})
+  status, document, _ = call(service, "PUT", f"/Users/{user['id']}", {"schemas": [coreUser], "userName": "babs",
+                                                                      "title": "Lead"}, query="excludedAttributes=nosuch")
+  assert status == 400 and "no such attribute" in refused(400, document, "invalidValue")
+  status, document, _ = call(service, "PATCH", f"/Users/{user['id']}", {"schemas": [patchOpSchema], "Operations": [
+    {"op": "replace", "path": "title", "value": "Lead"}]}, query="attributes=nosuch")
+  assert status == 400 and "no such attribute" in refused(400, document, "invalidValue")
+  assert call(service, "GET", f"/Users/{user['id']}")[1] == user
+
+
+@pytest.mark.parametrize("body", [
+  b'{"schemas": ["%s"], "userName": "\\ud800"}' % coreUser.encode(),
+  b'{"schemas": ["%s"], "userName": "a", "\\udfff": 1}' % coreUser.encode(),
+  b'{"schemas": ["%s"], "userName": "a", "emails": [{"value": "x\\ude00y"}]}' % coreUser.encode(),
+])
+def testLoneSurrogatesInTheBodyAreRefused(service, body):
+  status, document, _ = call(service, "POST", "/Users", body)
+  assert status == 400 and "lone surrogate" in refused(400, document, "invalidValue")
+  assert call(service, "GET", "/Users")[1]["totalResults"] == 0
+
+
+def testAPairedSurrogateEscapeIsOneCharacter(service):
+  user = created(service, "/Users", b'{"schemas": ["%s"], "userName": "a\\ud83d\\ude00"}' % coreUser.encode())
+  assert user["userName"] == "a\U0001f600"
+
+
+def testLoneSurrogatesInThePathAndQueryAreRefused(service):
+  status, document, _ = call(service, "GET", "/Users", query=filterQuery('userName eq "\\ud800"'))
+  assert status == 400 and "lone surrogate" in refused(400, document, "invalidValue")
+  status, document, _ = call(service, "GET", "/Users", query="attributes=user\udc80Name")
+  assert status == 400 and "lone surrogate" in refused(400, document, "invalidValue")
+  status, document, _ = call(service, "GET", "/Users/\udc80")
+  assert status == 400 and "lone surrogate" in refused(400, document, "invalidValue")
+
+
+def nested(depth):
+  return b'{"schemas": ["%s"], "userName": "a", "x": %s}' % (coreUser.encode(), b"[" * depth + b"]" * depth)
+
+
+def testDeeplyNestedBodiesAreRefusedBeforeParsing(service):
+  status, document, _ = call(service, "POST", "/Users", b"[" * 100000 + b"]" * 100000)
+  assert status == 400 and "nests deeper than 32" in refused(400, document, "invalidSyntax")
+  status, document, _ = call(service, "POST", "/Users", nested(31))
+  assert "no such attribute" in refused(400, document, "invalidSyntax")
+  status, document, _ = call(service, "POST", "/Users", nested(32))
+  assert "nests deeper than 32" in refused(400, document, "invalidSyntax")
+  userName = "[" * 100 + '\\"{' * 100
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": userName})
+  assert user["userName"] == userName
+
+
+@pytest.mark.parametrize("number, why", [("1" * 5000, "longer than 64"), ("1e999", "beyond the range"),
+                                         ("-1e999", "beyond the range")])
+def testNumbersTooLongOrTooLargeAreRefused(service, number, why):
+  body = b'{"schemas": ["%s"], "userName": "a", "active": %s}' % (coreUser.encode(), number.encode())
+  status, document, _ = call(service, "POST", "/Users", body)
+  assert status == 400 and why in refused(400, document, "invalidValue")
+
+
+@pytest.mark.parametrize("text, why", [
+  ("meta.created gt 1e999", "beyond the range"),
+  ("title eq " + "1" * 65, "longer than 64"),
+  (" or ".join(["title pr"] * 101), "more than 100 comparisons"),
+])
+def testFiltersAreBounded(service, text, why):
+  status, document, _ = call(service, "GET", "/Users", query=filterQuery(text))
+  assert status == 400 and why in refused(400, document, "invalidFilter")
+
+
+def testAFilterOfOneHundredComparisonsIsRead(service):
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "a", "title": "t"})
+  status, document, _ = call(service, "GET", "/Users", query=filterQuery(" or ".join(["title pr"] * 100)))
+  assert status == 200 and [found["id"] for found in document["Resources"]] == [user["id"]]
+
+
+@pytest.mark.parametrize("query, why", [
+  ("filter=" + "a" * 16384, "longer than 16384"),
+  ("&".join(f"x{number}=1" for number in range(9)), "more than 8 parameters"),
+])
+def testQueryStringsAreBounded(service, query, why):
+  status, document, _ = call(service, "GET", "/Users", query=query)
+  assert status == 400 and why in refused(400, document, "invalidValue")
+
+
+def testOnlyCanonicalUUIDsReachTheStore():
+  store = RecordingStore()
+  service = SCIMService(store, baseURL, lambda presented: presented == token)
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "a"})
+  bodies = {"GET": None, "DELETE": None, "PUT": {"schemas": [coreUser], "userName": "a"},
+            "PATCH": {"schemas": [patchOpSchema], "Operations": [{"op": "remove", "path": "title"}]}}
+  for path in ("/Users/..%2F..%2Fetc%2Fpasswd", f"/Users/{user['id'].upper()}", f"/Users/{{{user['id']}}}",
+               f"/Users/{user['id'].replace('-', '')}"):
+    for method, body in bodies.items():
+      store.asked.clear()
+      status, document, _ = call(service, method, path, body)
+      assert status == 404 and refused(404, document)
+      assert store.asked == []
+  status, document, _ = call(service, "POST", "/Groups", {"schemas": [coreGroup], "displayName": "g",
+                                                          "members": [{"value": "../../etc/passwd"}]})
+  assert "neither a user nor a group" in refused(400, document, "invalidValue")
+  assert "../../etc/passwd" not in store.asked
+  assert call(service, "GET", f"/Users/{user['id']}")[0] == 200

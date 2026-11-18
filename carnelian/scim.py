@@ -21,6 +21,7 @@ import base64
 import binascii
 import copy
 import json
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -55,6 +56,22 @@ class SCIMRefused(ValueError):
 
 def _invalid(detail: str, scimType: str = "invalidValue") -> SCIMRefused:
   return SCIMRefused(400, detail, scimType)
+
+
+_surrogatePattern = re.compile(r"[\ud800-\udfff]")
+
+
+def _refuseSurrogates(text: str, where: str, scimType: str = "invalidValue") -> None:
+  if _surrogatePattern.search(text):
+    raise _invalid(f"{where} holds a lone surrogate (half of a UTF-16 pair), which UTF-8 cannot carry", scimType)
+
+
+def _isResourceID(text: str) -> bool:
+  """Carnelian makes every resource ID itself as a UUID in its canonical form."""
+  try:
+    return str(uuid.UUID(text)) == text
+  except ValueError:
+    return False
 
 
 # ---- schemas ----------------------------------------------------------------
@@ -404,6 +421,12 @@ def _checkRequired(resourceType: ResourceType, resource: JSON) -> None:
         _checkPrimary(attribute, container[attribute.name], attribute.name)
 
 
+def _checkWhole(resourceType: ResourceType, resource: JSON) -> None:
+  """A changed resource read again as a whole: every value, required sub-attributes included."""
+  document = {key: value for key, value in resource.items() if key not in ("id", "meta")}
+  _checkRequired(resourceType, _readResource(resourceType, {"schemas": _schemasOf(resourceType, resource), **document}))
+
+
 # ---- filters (RFC 7644 section 3.4.2.2) -------------------------------------
 
 @dataclass(frozen=True)
@@ -450,8 +473,11 @@ _token = tuple[str, str, int, int]
 comparisonOperators = ("eq", "ne", "co", "sw", "ew", "gt", "lt", "ge", "le")
 _tokenPattern = re.compile(r'\s*(?:(?P<mark>[()\[\]])|(?P<string>"(?:[^"\\]|\\.)*")|(?P<word>[^\s()\[\]"]+))', re.DOTALL)
 _numberPattern = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+_integerPattern = re.compile(r"-?[0-9]+")
 maximumFilterLength = 4096
 maximumFilterDepth = 32
+maximumFilterTerms = 100
+maximumNumberLength = 64
 
 
 class _FilterParser:
@@ -471,7 +497,7 @@ class _FilterParser:
         raise _invalid(f"the filter cannot be read at character {position}", "invalidFilter")
       self.tokens.append((kind, found.group(kind), found.start(kind), found.end(kind)))
       position = found.end()
-    self.index, self.depth, self.inValuePath = 0, 0, False
+    self.index, self.depth, self.terms, self.inValuePath = 0, 0, 0, False
 
   def fail(self, why: str) -> NoReturn:
     raise _invalid(f"the filter {why}", "invalidFilter")
@@ -556,6 +582,9 @@ class _FilterParser:
     return self.comparison(path)
 
   def comparison(self, path: str) -> Compare | Present:
+    self.terms += 1
+    if self.terms > maximumFilterTerms:
+      self.fail(f"has more than {maximumFilterTerms} comparisons")
     kind, operator, _, _ = self.take()
     operator = (operator or "").lower()
     if kind != "word":
@@ -570,13 +599,23 @@ class _FilterParser:
         value = json.loads(text)
       except json.JSONDecodeError:
         self.fail(f"has a string it cannot read: {text}")
+      _refuseSurrogates(value, "the filter")
     elif kind == "word" and text in ("true", "false", "null"):
       value = {"true": True, "false": False, "null": None}[text]
     elif kind == "word" and _numberPattern.fullmatch(text):
-      value = json.loads(text)
+      value = _readNumber(text, "the filter", "invalidFilter")
     else:
       self.fail(f"needs a value after {path} {operator} where it has {text!r}")
     return Compare(path, operator, value)
+
+
+def _readNumber(text: str, where: str, scimType: str) -> int | float:
+  if len(text) > maximumNumberLength:
+    raise _invalid(f"{where} has a number longer than {maximumNumberLength} characters", scimType)
+  number: int | float = int(text) if _integerPattern.fullmatch(text) else float(text)
+  if not math.isfinite(number):
+    raise _invalid(f"{where} has a number beyond the range of a double: {text}", scimType)
+  return number
 
 
 def parseFilter(text: str) -> Filter:
@@ -821,7 +860,7 @@ def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) ->
   for schema in resourceType.extensions:
     if work.get(schema.id) == {}:
       del work[schema.id]
-  _checkRequired(resourceType, work)
+  _checkWhole(resourceType, work)
   return work
 
 
@@ -849,6 +888,13 @@ def _apply(work: JSON, resourceType: ResourceType, op: str, target: _Target, que
       if op == "add":
         raise _invalid(f"{where}: add to a filtered value needs a sub-attribute", "invalidPath")
       replacement = _readSingle(attribute, value, where, True)
+      if replacement is not _absent:
+        for element in found:
+          for part in attribute.subAttributes:
+            if (part.mutability == "immutable" and part.name in element and part.name in replacement
+                and element[part.name] != replacement[part.name]):
+              raise _invalid(f"{where}: {name}.{part.name} is immutable: remove the value and add another",
+                             "mutability")
       rebuilt = []
       for element in values:
         if not any(element is match for match in found):
@@ -858,6 +904,10 @@ def _apply(work: JSON, resourceType: ResourceType, op: str, target: _Target, que
       container[name] = rebuilt
     else:
       read = _readSingle(sub, value, where, True)
+      if read is _absent:
+        _refuseRemovingSub(attribute, sub, where)
+      if sub.mutability == "immutable" and any(not sub.stored or element.get(sub.name) != read for element in found):
+        raise _invalid(f"{where}: {name}.{sub.name} is immutable: remove the value and add another", "mutability")
       if read is not _absent and sub.name == "primary" and read is True:
         for element in values:
           element.pop("primary", None)
@@ -872,6 +922,7 @@ def _apply(work: JSON, resourceType: ResourceType, op: str, target: _Target, que
     read = _readSingle(sub, value, where, True)
     complexValue = container.setdefault(name, {})
     if read is _absent:
+      _refuseRemovingSub(attribute, sub, where)
       complexValue.pop(sub.name, None)
     elif sub.stored:
       complexValue[sub.name] = read
@@ -902,6 +953,14 @@ def _apply(work: JSON, resourceType: ResourceType, op: str, target: _Target, que
     _checkPrimary(attribute, container[name], name)
 
 
+def _refuseRemovingSub(attribute: Attribute, sub: Attribute, where: str) -> None:
+  if sub.required:
+    raise _invalid(f"{where}: {attribute.name}.{sub.name} is required: remove the whole {attribute.name} value instead")
+  if sub.mutability == "immutable":
+    raise _invalid(f"{where}: {attribute.name}.{sub.name} is immutable: remove the value and add another",
+                   "mutability")
+
+
 def _sameValue(attribute: Attribute, left: Any, right: Any) -> bool:
   if attribute.type == "complex" and "value" in left and "value" in right:
     valueAttribute = attribute.sub("value")
@@ -919,6 +978,8 @@ def _remove(container: JSON, attribute: Attribute, sub: Attribute | None, query:
   current = container.get(name)
   if value is not _absent and not (attribute.multiValued and query is None and sub is None):
     raise _invalid(f"{where}: remove takes a value only to list values of a multi-valued attribute", "invalidSyntax")
+  if sub is not None:
+    _refuseRemovingSub(attribute, sub, where)
   if current is None:
     return
   if query is None and sub is None:
@@ -954,7 +1015,10 @@ class Store(Protocol):
   created, lastModified), the core attributes, and each extension under its schema URI.
   search gets a filter already checked against the schema (None for every resource), and
   `matches` evaluates one in memory. create and replace raise SCIMRefused(409, ..., "uniqueness")
-  when the store's own unique constraints refuse the resource."""
+  when the store's own unique constraints refuse the resource. A request is checked against the
+  store and then written in several calls (a DELETE also replaces each group that held the
+  resource); a store serving concurrent requests runs them in one transaction where it needs
+  them to hold together."""
 
   def create(self, resourceType: str, resource: JSON) -> None: ...
 
@@ -996,8 +1060,40 @@ def _refuseConstant(name: str) -> NoReturn:
   raise _invalid(f"the body holds {name}, which is not JSON", "invalidSyntax")
 
 
+def _readBodyNumber(text: str) -> int | float:
+  return _readNumber(text, "the body", "invalidValue")
+
+
+maximumJSONDepth = 32
+maximumQueryLength = 16384
+maximumQueryParameters = 8
+_jsonStructurePattern = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|["\[\]{}]')
+
+
+def _checkNesting(text: str) -> None:
+  """Refuses deep nesting before json.loads, which would raise RecursionError on it."""
+  depth = 0
+  for found in _jsonStructurePattern.finditer(text):
+    mark = found.group()
+    if mark in ("[", "{"):
+      depth += 1
+      if depth > maximumJSONDepth:
+        raise _invalid(f"the body nests deeper than {maximumJSONDepth} arrays and objects", "invalidSyntax")
+    elif mark in ("]", "}"):
+      depth -= 1
+    elif mark == '"':
+      # An unterminated string: the rest is string text, which json.loads refuses; scanning on is quadratic.
+      return
+
+
 class SCIMService:
-  """Answers SCIM requests below baseURL (https) from the store, once isAuthorized accepts the bearer token."""
+  """Answers SCIM requests below baseURL (https) from the store, once isAuthorized accepts the bearer token.
+
+  An accepted token authorizes everything the service does on the store: it creates, changes
+  and deletes every user and group, active, roles, entitlements and memberships included.
+  isAuthorized answers only yes or no, so a token meant for one tenant or for narrower rights
+  gets no narrower treatment here; such grants are the application's to enforce, in the store
+  it passes (one per tenant, say) and in its token check."""
 
   def __init__(self, store: Store, baseURL: str, isAuthorized: Callable[[str], bool], pageSize: int = 100,
                maximumResults: int = 200, maximumBytes: int = 1_000_000,
@@ -1036,6 +1132,7 @@ class SCIMService:
     return SCIMResponse(status, headers, json.dumps(document, ensure_ascii=False).encode("utf-8"))
 
   def _route(self, method: str, path: str, query: str, headers: dict[str, str], body: bytes) -> SCIMResponse:
+    _refuseSurrogates(path, "the path")
     if not path.startswith("/"):
       raise SCIMRefused(404, f"no endpoint {path}")
     segments = [unquote(segment) for segment in path[1:].split("/")]
@@ -1059,7 +1156,7 @@ class SCIMService:
       raise SCIMRefused(405, f"{method} is not allowed on {resourceType.endpoint}")
     resourceID = segments[1]
     if method == "GET":
-      self._allow(parameters, ("attributes", "excludedAttributes"))
+      self._allowProjection(resourceType, parameters)
       resource = self._existing(resourceType, resourceID)
       return self._answer(200, self._render(resourceType, resource, parameters))
     if method == "PUT":
@@ -1076,6 +1173,11 @@ class SCIMService:
   def _parameters(self, query: str) -> dict[str, str]:
     if not query:
       return {}
+    if len(query) > maximumQueryLength:
+      raise _invalid(f"the query string is longer than {maximumQueryLength} characters")
+    if query.count("&") >= maximumQueryParameters:
+      raise _invalid(f"the query string has more than {maximumQueryParameters} parameters")
+    _refuseSurrogates(query, "the query string")
     try:
       pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
@@ -1093,6 +1195,11 @@ class SCIMService:
       why = " (sorting is not offered)" if {"sortBy", "sortOrder"} & set(unknown) else ""
       raise _invalid(f"unknown query parameters {unknown}{why}")
 
+  def _allowProjection(self, resourceType: ResourceType, parameters: dict[str, str]) -> None:
+    """Checked before any write, so a request refused for its projection has changed nothing."""
+    self._allow(parameters, ("attributes", "excludedAttributes"))
+    self._projection(resourceType, parameters)
+
   def _document(self, headers: dict[str, str], body: bytes) -> object:
     contentType = headers.get("content-type", "").split(";")[0].strip().lower()
     if contentType not in (mediaType, "application/json"):
@@ -1100,11 +1207,18 @@ class SCIMService:
     if len(body) > self.maximumBytes:
       raise SCIMRefused(413, f"the body is larger than {self.maximumBytes} bytes")
     try:
-      return json.loads(body.decode("utf-8"), object_pairs_hook=_refuseDuplicates, parse_constant=_refuseConstant)
+      text = body.decode("utf-8")
+      _checkNesting(text)
+      document = json.loads(text, object_pairs_hook=_refuseDuplicates, parse_constant=_refuseConstant,
+                            parse_int=_readBodyNumber, parse_float=_readBodyNumber)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
       raise _invalid(f"the body is not JSON: {error}", "invalidSyntax") from None
+    _refuseSurrogates(json.dumps(document, ensure_ascii=False), "the body")
+    return document
 
   def _existing(self, resourceType: ResourceType, resourceID: str) -> JSON:
+    if not _isResourceID(resourceID):
+      raise SCIMRefused(404, f"no {resourceType.name} {resourceID}")
     resource = self.store.get(resourceType.name, resourceID)
     if resource is None:
       raise SCIMRefused(404, f"no {resourceType.name} {resourceID}")
@@ -1112,7 +1226,7 @@ class SCIMService:
 
   # -- checks shared by create, replace and patch
 
-  def _checkResource(self, resourceType: ResourceType, resource: JSON, resourceID: str | None) -> None:
+  def _checkResource(self, resourceType: ResourceType, resource: JSON, resourceID: str) -> None:
     _checkRequired(resourceType, resource)
     unique = resourceType.uniqueAttribute
     others = [found for found in self.store.search(resourceType.name, Compare(unique, "eq", resource[unique]))
@@ -1123,16 +1237,34 @@ class SCIMService:
       for member in resource.get("members", []):
         if member["value"] == resourceID:
           raise _invalid("a group cannot be its own member")
-        found = [name for name in ("User", "Group") if self.store.get(name, member["value"]) is not None]
+        found = [name for name in ("User", "Group")
+                 if _isResourceID(member["value"]) and self.store.get(name, member["value"]) is not None]
         if not found:
           raise _invalid(f"member {member['value']} is neither a user nor a group here")
         if member.get("type", found[0]) != found[0]:
           raise _invalid(f"member {member['value']} is a {found[0]}, not a {member['type']}")
         member["type"] = found[0]
+        if found[0] == "Group" and self._holds(member["value"], resourceID):
+          raise _invalid(f"member {member['value']} holds this group already, so the group would contain itself")
+
+  def _holds(self, outerID: str, innerID: str) -> bool:
+    """Whether the group outerID holds innerID, directly or through groups it holds."""
+    pending, seen = [outerID], set()
+    while pending:
+      groupID = pending.pop()
+      if groupID == innerID:
+        return True
+      if groupID in seen:
+        continue
+      seen.add(groupID)
+      group = self.store.get("Group", groupID)
+      if group is not None:
+        pending.extend(member["value"] for member in group.get("members", []) if member.get("type") == "Group")
+    return False
 
   def _create(self, resourceType: ResourceType, parameters: dict[str, str], headers: dict[str, str],
               body: bytes) -> SCIMResponse:
-    self._allow(parameters, ("attributes", "excludedAttributes"))
+    self._allowProjection(resourceType, parameters)
     resource = _readResource(resourceType, self._document(headers, body))
     resourceID = str(uuid.uuid4())
     self._checkResource(resourceType, resource, resourceID)
@@ -1145,7 +1277,7 @@ class SCIMService:
 
   def _replace(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
                body: bytes) -> SCIMResponse:
-    self._allow(parameters, ("attributes", "excludedAttributes"))
+    self._allowProjection(resourceType, parameters)
     existing = self._existing(resourceType, resourceID)
     resource = _readResource(resourceType, self._document(headers, body))
     self._checkResource(resourceType, resource, resourceID)
@@ -1155,7 +1287,7 @@ class SCIMService:
 
   def _patch(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
              body: bytes) -> SCIMResponse:
-    self._allow(parameters, ("attributes", "excludedAttributes"))
+    self._allowProjection(resourceType, parameters)
     existing = self._existing(resourceType, resourceID)
     resource = _applyPatch(resourceType, existing, self._document(headers, body))
     self._checkResource(resourceType, resource, resourceID)
