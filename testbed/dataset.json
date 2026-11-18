@@ -1,0 +1,19 @@
+{
+  "comment": "One dataset for every identity provider in the testbed, chosen to break things: names in several scripts, a user name that is not ASCII, a disabled account, nested groups, an account in many groups.",
+  "groups": [
+    {"name": "field", "subGroups": [{"name": "team-a"}, {"name": "team-b"}]},
+    {"name": "analysts"},
+    {"name": "trial-admins"}
+  ],
+  "manyGroupsPrefix": "project-",
+  "manyGroupsCount": 40,
+  "users": [
+    {"userName": "ana", "firstName": "Ana", "lastName": "Lima", "email": "ana@example.org", "enabled": true, "groups": ["/field/team-a"]},
+    {"userName": "jose", "firstName": "José", "lastName": "Núñez", "email": "jose@example.org", "enabled": true, "groups": ["/field/team-b", "/analysts"]},
+    {"userName": "layla", "firstName": "ليلى", "lastName": "حداد", "email": "layla@example.org", "enabled": true, "groups": ["/analysts"]},
+    {"userName": "wei", "firstName": "伟", "lastName": "王", "email": "wei@example.org", "enabled": true, "groups": ["/trial-admins"]},
+    {"userName": "مريم", "firstName": "مريم", "lastName": "الحسن", "email": "maryam@example.org", "enabled": true, "groups": ["/field/team-a"]},
+    {"userName": "manygroups", "firstName": "Many", "lastName": "Groups", "email": "many@example.org", "enabled": true, "groups": "many"},
+    {"userName": "disabled", "firstName": "Dis", "lastName": "Abled", "email": "disabled@example.org", "enabled": false, "groups": ["/field"]}
+  ]
+}
