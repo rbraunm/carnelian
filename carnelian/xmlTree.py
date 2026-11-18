@@ -22,14 +22,15 @@ text, refusing child elements and processing instructions.
 
 `canonical` implements http://www.w3.org/2001/10/xml-exc-c14n# (without comments), with
 an optional InclusiveNamespaces prefix list and an element to leave out (the enveloped
-signature).
+signature). `DocumentStream` reads a document too large for a tree (a federation's
+aggregate) one child of its document element at a time and canonicalizes it as it goes.
 """
 
 from __future__ import annotations
 
 import collections
 import xml.parsers.expat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import NoReturn
 
@@ -187,20 +188,57 @@ def _declaration(attributeName: str, value: str) -> tuple[str, str]:
   return prefix, value
 
 
-def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
-  """The document element of a document with no DTD, well-formed namespaces and within the budgets."""
-  if len(data) > maximumBytes:
-    raise XMLRefused(f"the XML is larger than {maximumBytes} bytes")
+def _expatParser() -> xml.parsers.expat.XMLParserType:
   parser = xml.parsers.expat.ParserCreate()
   parser.ordered_attributes = True
   parser.buffer_text = True
   parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
-  stack: list[Element] = []
-  roots: list[Element] = []
-  elementCount = [0]
 
   def refuse(*_: object) -> NoReturn:
     raise XMLRefused("a DOCTYPE, entity or external reference is refused")
+
+  parser.StartDoctypeDeclHandler = refuse
+  parser.EntityDeclHandler = refuse
+  parser.UnparsedEntityDeclHandler = refuse
+  parser.ExternalEntityRefHandler = refuse
+  return parser
+
+
+def _element(name: str, attributes: list[str], parent: Element | None) -> Element:
+  pairs = list(zip(attributes[0::2], attributes[1::2]))
+  declarationNames = [attributeName for attributeName, _ in pairs if _isDeclaration(attributeName)]
+  if len(declarationNames) > maximumDeclarations:
+    raise XMLRefused(f"an element has more than {maximumDeclarations} namespace declarations")
+  if len(pairs) - len(declarationNames) > maximumAttributes:
+    raise XMLRefused(f"an element has more than {maximumAttributes} attributes")
+  _checkedQualifiedName(name)
+  if name.startswith("xmlns:"):
+    raise XMLRefused("an element cannot use the xmlns prefix")
+  declarations = {}
+  for attributeName, value in pairs:
+    _checkedQualifiedName(attributeName)
+    if _isDeclaration(attributeName):
+      prefix, uri = _declaration(attributeName, value)
+      declarations[prefix] = uri
+  element = Element(name, pairs, parent, declarations=declarations)
+  if ":" in name and element.namespaceFor(element.prefix) is None:
+    raise XMLRefused(f"prefix '{element.prefix}' is not declared")
+  seen = set()
+  for uri, local, _, _ in element.plainAttributes():
+    if (uri, local) in seen:
+      raise XMLRefused(f"attribute {local!r} appears twice")
+    seen.add((uri, local))
+  return element
+
+
+def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
+  """The document element of a document with no DTD, well-formed namespaces and within the budgets."""
+  if len(data) > maximumBytes:
+    raise XMLRefused(f"the XML is larger than {maximumBytes} bytes")
+  parser = _expatParser()
+  stack: list[Element] = []
+  roots: list[Element] = []
+  elementCount = [0]
 
   def start(name: str, attributes: list[str]) -> None:
     if len(stack) >= maximumDepth:
@@ -208,30 +246,8 @@ def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
     elementCount[0] += 1
     if elementCount[0] > maximumElements:
       raise XMLRefused(f"the XML has more than {maximumElements} elements")
-    pairs = list(zip(attributes[0::2], attributes[1::2]))
-    declarationNames = [attributeName for attributeName, _ in pairs if _isDeclaration(attributeName)]
-    if len(declarationNames) > maximumDeclarations:
-      raise XMLRefused(f"an element has more than {maximumDeclarations} namespace declarations")
-    if len(pairs) - len(declarationNames) > maximumAttributes:
-      raise XMLRefused(f"an element has more than {maximumAttributes} attributes")
-    _checkedQualifiedName(name)
-    if name.startswith("xmlns:"):
-      raise XMLRefused("an element cannot use the xmlns prefix")
-    declarations = {}
-    for attributeName, value in pairs:
-      _checkedQualifiedName(attributeName)
-      if _isDeclaration(attributeName):
-        prefix, uri = _declaration(attributeName, value)
-        declarations[prefix] = uri
     parent = stack[-1] if stack else None
-    element = Element(name, pairs, parent, declarations=declarations)
-    if ":" in name and element.namespaceFor(element.prefix) is None:
-      raise XMLRefused(f"prefix '{element.prefix}' is not declared")
-    seen = set()
-    for uri, local, _, _ in element.plainAttributes():
-      if (uri, local) in seen:
-        raise XMLRefused(f"attribute {local!r} appears twice")
-      seen.add((uri, local))
+    element = _element(name, attributes, parent)
     (parent.children if parent else roots).append(element)
     stack.append(element)
 
@@ -252,10 +268,6 @@ def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
     if stack:
       stack[-1].children.append(Instruction(target, data))
 
-  parser.StartDoctypeDeclHandler = refuse
-  parser.EntityDeclHandler = refuse
-  parser.UnparsedEntityDeclHandler = refuse
-  parser.ExternalEntityRefHandler = refuse
   parser.StartElementHandler = start
   parser.EndElementHandler = end
   parser.CharacterDataHandler = characters
@@ -268,6 +280,133 @@ def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
   if len(roots) != 1:
     raise XMLRefused("a document has one document element")
   return roots[0]
+
+
+class DocumentStream:
+  """A document read in chunks that holds one child of its document element at a time.
+
+  The document element keeps no children. Each of its child elements is built as a tree,
+  under the budgets of `parse` with `maximumElements` counted per child, handed to `onChild`
+  when it closes, and dropped. Once `canonicalize` names a sink, the document element's
+  exclusive canonical form goes to it piece by piece (the children that closed before
+  included), the same bytes `canonical` gives for the whole tree. A processing instruction
+  outside the document element is refused, so that form is also the whole document's.
+  """
+
+  def __init__(self, onRoot: Callable[[Element], None], onChild: Callable[[Element], None], maximumBytes: int) -> None:
+    self.onRoot, self.onChild, self.maximumBytes = onRoot, onChild, maximumBytes
+    self.root: Element | None = None
+    self._bytes = 0
+    self._stack: list[Element] = []
+    self._elementCount = 0
+    self._pending: list[Element | Text | Instruction] = []
+    self._ended = False
+    self._sink: Callable[[bytes], None] | None = None
+    self._rendered: collections.ChainMap[str, str] = collections.ChainMap({"": ""})
+    self._inclusive: set[str] = set()
+    self._leaveOut: Element | None = None
+    self._parser = _expatParser()
+    self._parser.StartElementHandler = self._start
+    self._parser.EndElementHandler = self._end
+    self._parser.CharacterDataHandler = self._characters
+    self._parser.CommentHandler = self._comment
+    self._parser.ProcessingInstructionHandler = self._instruction
+
+  def feed(self, chunk: bytes) -> None:
+    self._bytes += len(chunk)
+    if self._bytes > self.maximumBytes:
+      raise XMLRefused(f"the XML is larger than {self.maximumBytes} bytes")
+    self._parse(chunk, False)
+
+  def close(self) -> None:
+    self._parse(b"", True)
+    if self.root is None:
+      raise XMLRefused("a document has one document element")
+
+  def canonicalize(self, sink: Callable[[bytes], None], inclusivePrefixes: tuple[str, ...] = (),
+                   leaveOut: Element | None = None) -> None:
+    if self.root is None or self._sink is not None:
+      raise ValueError("canonicalize is called once, after the document element has started")
+    self._inclusive, self._leaveOut = set(inclusivePrefixes), leaveOut
+    tag, self._rendered = _openTag(self.root, self._rendered, self._inclusive)
+    sink(tag.encode("utf-8"))
+    self._sink = sink
+    for node in self._pending:
+      self._emit(node)
+    self._pending.clear()
+    if self._ended:
+      sink(f"</{self.root.qualifiedName}>".encode("utf-8"))
+
+  def _parse(self, chunk: bytes, final: bool) -> None:
+    try:
+      self._parser.Parse(chunk, final)
+    except xml.parsers.expat.ExpatError as error:
+      raise XMLRefused(f"not well-formed XML: {error}") from None
+
+  def _node(self, node: Element | Text | Instruction) -> None:
+    if self._sink is None:
+      self._pending.append(node)
+    else:
+      self._emit(node)
+
+  def _emit(self, node: Element | Text | Instruction) -> None:
+    assert self._sink is not None
+    if isinstance(node, Text):
+      self._sink(_escapedText(node.data).encode("utf-8"))
+    elif isinstance(node, Instruction):
+      self._sink(_instructionText(node).encode("utf-8"))
+    elif node is not self._leaveOut:
+      output: list[str] = []
+      _render(node, self._rendered, self._inclusive, self._leaveOut, output)
+      self._sink("".join(output).encode("utf-8"))
+
+  def _start(self, name: str, attributes: list[str]) -> None:
+    if len(self._stack) >= maximumDepth:
+      raise XMLRefused(f"the XML is nested deeper than {maximumDepth} elements")
+    if len(self._stack) == 1:
+      self._elementCount = 0
+    self._elementCount += 1
+    if self._elementCount > maximumElements:
+      raise XMLRefused(f"a child of the document element has more than {maximumElements} elements")
+    parent = self._stack[-1] if self._stack else None
+    element = _element(name, attributes, parent)
+    if parent is None:
+      self.root = element
+      self.onRoot(element)
+    elif len(self._stack) > 1:
+      parent.children.append(element)
+    self._stack.append(element)
+
+  def _end(self, name: str) -> None:
+    element = self._stack.pop()
+    if not self._stack:
+      self._ended = True
+      if self._sink is not None:
+        self._sink(f"</{element.qualifiedName}>".encode("utf-8"))
+    elif len(self._stack) == 1:
+      self.onChild(element)
+      self._node(element)
+
+  def _characters(self, data: str) -> None:
+    if not self._stack:
+      if data.strip():
+        raise XMLRefused("text outside the document element")
+    elif len(self._stack) == 1:
+      self._node(Text(data))
+    else:
+      self._stack[-1].children.append(Text(data))
+
+  def _comment(self, data: str) -> None:
+    if len(self._stack) > 1:
+      self._stack[-1].children.append(Comment(data))
+
+  def _instruction(self, target: str, data: str) -> None:
+    if not self._stack:
+      raise XMLRefused("a processing instruction outside the document element is refused")
+    if len(self._stack) == 1:
+      self._node(Instruction(target, data))
+    else:
+      self._stack[-1].children.append(Instruction(target, data))
 
 
 def _escapedText(data: str) -> str:
@@ -286,8 +425,12 @@ def canonical(element: Element, inclusivePrefixes: tuple[str, ...] = (), leaveOu
   return "".join(output).encode("utf-8")
 
 
-def _render(element: Element, rendered: collections.ChainMap[str, str], inclusive: set[str],
-            leaveOut: Element | None, output: list[str]) -> None:
+def _instructionText(instruction: Instruction) -> str:
+  return f"<?{instruction.target}{' ' + instruction.data if instruction.data else ''}?>"
+
+
+def _openTag(element: Element, rendered: collections.ChainMap[str, str],
+             inclusive: set[str]) -> tuple[str, collections.ChainMap[str, str]]:
   used = {element.prefix}
   for _, _, qualifiedName, _ in element.plainAttributes():
     if ":" in qualifiedName:
@@ -302,12 +445,16 @@ def _render(element: Element, rendered: collections.ChainMap[str, str], inclusiv
       continue
     declarations.append(f' xmlns="{_escapedAttribute(uri)}"' if prefix == "" else f' xmlns:{prefix}="{_escapedAttribute(uri)}"')
     added[prefix] = uri
-  nowRendered = rendered.new_child(added) if added else rendered
   attributes = sorted(element.plainAttributes(), key=lambda attribute: (attribute[0], attribute[1]))
-  output.append(f"<{element.qualifiedName}")
-  output.extend(declarations)
-  output.extend(f' {qualifiedName}="{_escapedAttribute(value)}"' for _, _, qualifiedName, value in attributes)
-  output.append(">")
+  tag = "".join([f"<{element.qualifiedName}", *declarations,
+                 *(f' {qualifiedName}="{_escapedAttribute(value)}"' for _, _, qualifiedName, value in attributes), ">"])
+  return tag, rendered.new_child(added) if added else rendered
+
+
+def _render(element: Element, rendered: collections.ChainMap[str, str], inclusive: set[str],
+            leaveOut: Element | None, output: list[str]) -> None:
+  tag, nowRendered = _openTag(element, rendered, inclusive)
+  output.append(tag)
   for child in element.children:
     if isinstance(child, Text):
       output.append(_escapedText(child.data))
@@ -315,5 +462,5 @@ def _render(element: Element, rendered: collections.ChainMap[str, str], inclusiv
       if child is not leaveOut:
         _render(child, nowRendered, inclusive, leaveOut, output)
     elif isinstance(child, Instruction):
-      output.append(f"<?{child.target}{' ' + child.data if child.data else ''}?>")
+      output.append(_instructionText(child))
   output.append(f"</{element.qualifiedName}>")

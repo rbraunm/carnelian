@@ -6,7 +6,8 @@ metadata is fetched by the Metadata Query protocol (MDQ: one small signed docume
 entity, as InCommon serves its own and eduGAIN's), its signature checked against the
 federation's signing certificate, and its validUntil required and honoured. What is read:
 the identity provider (its single sign-on address and signing keys), its display names, the
-federation that registered it, its entity categories, and its scopes.
+federation that registered it, its entity categories, and its scopes. A whole federation's
+aggregate, every member in one document, is read by `carnelian.aggregate`.
 
 A federation's identity is a scoped identifier, `value@scope`: SAML's subject-id or
 pairwise-id (the SAML V2.0 Subject Identifier Attributes profile) or eduPersonPrincipalName.
@@ -82,9 +83,8 @@ class Institution:
     return hideFromDiscovery in self.entityCategories
 
 
-def _institution(root: Element, signedBy: str) -> Institution:
+def _institution(root: Element, signedBy: str, validUntil: float) -> Institution:
   identityProvider = identityProviderFromDescriptor(root)
-  validUntil = _time(root.attribute("validUntil"), "the metadata's validUntil")
   descriptor = root.only(metadataNamespace, "IDPSSODescriptor")
   scopes: list[str] = []
   names: dict[str, str] = {}
@@ -152,7 +152,7 @@ class Federation:
     if root.attribute("entityID") != entityID:
       raise SAMLRefused(f"{self.name} answered for {root.attribute('entityID')!r}, not {entityID!r}")
     try:
-      institution = _institution(root, self.name)
+      institution = _institution(root, self.name, _time(root.attribute("validUntil"), "the metadata's validUntil"))
     except XMLRefused as error:
       raise SAMLRefused(f"{self.name}'s metadata for {entityID} is refused: {error}") from None
     if institution.validUntil <= self.clock():

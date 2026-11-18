@@ -8,9 +8,9 @@ Sign-in for Python applications on the standard library alone:
   canonicalization, protection against signature wrapping; with the `keys` extra, encrypted
   assertions, signed requests and single logout);
 - **Research and education federations** (InCommon, the national federations, eduGAIN):
-  institutions' signed metadata by the Metadata Query protocol, their scopes, scoped
-  identifiers (subject-id, pairwise-id, eduPersonPrincipalName), and the service provider's
-  own metadata to register;
+  institutions' signed metadata by the Metadata Query protocol or a whole federation's
+  aggregate read as a stream, their scopes, scoped identifiers (subject-id, pairwise-id,
+  eduPersonPrincipalName), and the service provider's own metadata to register;
 - **CAS** client (Apereo CAS protocol 3.0), the sign-in many universities in France, Spain
   and Latin America run;
 - **LDAP** client for Active Directory and other directories (bind and search over TLS);
@@ -38,8 +38,9 @@ One per protocol, each with a complete sign-in example, what it checks and what 
 What Carnelian promises and what it leaves to you: [SECURITY.md](SECURITY.md).
 
 The supported interface is what each of the modules `carnelian.oidc`, `carnelian.saml`,
-`carnelian.federation`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim`, `carnelian.workload`,
-`carnelian.fetching` and `carnelian.keys` lists in its `__all__`. Everything else is internal and may change
+`carnelian.federation`, `carnelian.aggregate`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim`,
+`carnelian.workload`, `carnelian.fetching` and `carnelian.keys` lists in its `__all__`. Everything else is
+internal and may change
 in any release.
 
 ## Install

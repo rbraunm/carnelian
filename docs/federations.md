@@ -47,6 +47,52 @@ attributes are whatever the institution says, so never recognise a person by the
 service, better for privacy), `subjectID` for one identifier across services, and
 `eduPersonPrincipalName` where neither is released.
 
+## Every institution at once: the aggregate
+
+To offer "choose your institution" across a whole federation, read its aggregate: one
+signed document holding every member. eduGAIN's
+(`https://mds.edugain.org/edugain-v2.xml`) is about 95 MB with about 6,600 identity
+providers, so it is read as a stream: each entity is built as a small tree, read and
+dropped, and the document's canonical form is hashed as it goes by. Memory follows the
+largest entity, not the document (about 20 MB traced for eduGAIN's), and reading it takes
+under a minute.
+
+```python
+from carnelian.aggregate import fetchAggregate
+from carnelian.fetching import Fetcher, secureContext
+
+fetcher = Fetcher(secureContext(), timeoutSeconds=600, maximumBytes=256 * 1024 * 1024)
+eduGAIN = fetchAggregate("https://mds.edugain.org/edugain-v2.xml", open("mds-v2.cer").read(), fetcher, "eduGAIN")
+
+choices = sorted((institution.displayName("en"), entityID) for entityID, institution in eduGAIN.institutions.items()
+                 if not institution.hiddenFromDiscovery)
+for entityID, reason in eduGAIN.skipped:
+  log.warning("eduGAIN entity %s left out: %s", entityID, reason)
+
+institution = eduGAIN.institution(chosenEntityID)     # refused if absent or past its validUntil
+# ... sign in exactly as above, with institution.identityProvider ...
+```
+
+eduGAIN's signing certificate is `https://technical.edugain.org/mds-v2.cer`; check its
+SHA-256 fingerprint against the one published at `https://technical.edugain.org/metadata`
+before trusting it. `readAggregate` takes the document's bytes, or an iterable of chunks,
+instead of an address. Refetch on a schedule (eduGAIN asks for every few hours, its
+`cacheDuration`) and keep the previous aggregate until the next one verifies.
+
+Nothing is returned until the signature has verified over the whole document. The
+aggregate must be an `md:EntitiesDescriptor` whose first child is its signature, with one
+reference to its `ID` (or to the whole document), the transforms enveloped-signature then
+exclusive canonicalization, and a `validUntil` that has not passed. Refused by name: another
+key's signature, any changed byte, a second signature, a nested or wrapping
+`EntitiesDescriptor`, any element but `Extensions` and `EntityDescriptor` under it, another
+element carrying its `ID`, and a document over `maximumBytes` (256 MB) or with more than
+`maximumEntities` (100,000) entities, or an entity over the XML reader's budgets.
+
+Each identity provider is read with the same checks as one from MDQ. One that fails them
+(no scope, a scope written as a regular expression, no usable sign-on address), whose own
+`validUntil` has passed, or that appears twice is left out and listed in `skipped` with the
+reason; log those. Entities with no identity provider (services) are passed over.
+
 ## What is refused
 
 Metadata not signed by the federation's key, or whose signature does not cover the whole
