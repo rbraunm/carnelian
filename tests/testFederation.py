@@ -191,6 +191,19 @@ def testTheServiceProvidersMetadataIsWhatAFederationRegisters():
     serviceProviderMetadata("x", "http://openfurrow.example.org/back", {}, "https://a", "https://b", "o", "a@b")
 
 
+def testFederationMetadataCarriesTheServiceProvidersKeysAndLogout():
+  certificate = x509.load_pem_x509_certificate(federationCertificate.encode("ascii")).public_bytes(serialization.Encoding.DER)
+  document = etree.fromstring(serviceProviderMetadata(
+    "https://openfurrow.example.org/saml", "https://openfurrow.example.org/signin/with/incommon/return", {"en": "OpenFurrow"},
+    "https://openfurrow.example.org/about", "https://openfurrow.example.org/privacy", "Example Station", "it@example.org",
+    signingCertificate=certificate, encryptionCertificates=(certificate,),
+    singleLogoutURL="https://openfurrow.example.org/signout/saml"))
+  names = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
+  assert [key.get("use") for key in document.findall("md:SPSSODescriptor/md:KeyDescriptor", names)] == ["signing", "encryption"]
+  assert {service.get("Location") for service in document.findall("md:SPSSODescriptor/md:SingleLogoutService", names)} == {
+    "https://openfurrow.example.org/signout/saml"}
+  assert document.find("md:SPSSODescriptor", names).get("AuthnRequestsSigned") == "true"
+
 # ---- InCommon's real MDQ service, which also serves eduGAIN's institutions ----
 
 @pytest.mark.parametrize("entityID, scope, authority", [

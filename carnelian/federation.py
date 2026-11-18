@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 from carnelian.der import publicKeyFromCertificate
 from carnelian.fetching import DocumentFetcher
-from carnelian.saml import (IdentityProvider, SAMLIdentity, SAMLRefused, _time, assertionNamespace, entityAttributeNamespace,
+from carnelian.saml import (EncryptionPolicy, IdentityProvider, SAMLIdentity, SAMLRefused, _time, assertionNamespace, entityAttributeNamespace,
                             entityCategoryName, identityProviderFromDescriptor, metadataNamespace, uiNamespace)
 from carnelian.saml import serviceProviderMetadata as samlServiceProviderMetadata
 from carnelian.xmldsig import SignatureRefused, verifyEnveloped
@@ -183,7 +183,11 @@ def scopedIdentifier(identity: SAMLIdentity, institution: Institution, attribute
 def serviceProviderMetadata(entityID: str, assertionConsumerURL: str, displayNames: dict[str, str],
                             informationURL: str, privacyStatementURL: str, organizationName: str,
                             technicalContact: str, securityContact: str | None = None,
-                            entityCategories: tuple[str, ...] = (researchAndScholarship,)) -> bytes:
+                            entityCategories: tuple[str, ...] = (researchAndScholarship,),
+                            signingCertificate: bytes | None = None, encryptionCertificates: tuple[bytes, ...] = (),
+                            encryptionPolicy: EncryptionPolicy = EncryptionPolicy(),
+                            singleLogoutURL: str | None = None) -> bytes:
   """The service provider's metadata for its federation to register, with everything federations ask for."""
   return samlServiceProviderMetadata(entityID, assertionConsumerURL, displayNames, informationURL, privacyStatementURL,
-                                     organizationName, technicalContact, securityContact, entityCategories)
+                                     organizationName, technicalContact, securityContact, entityCategories,
+                                     signingCertificate, encryptionCertificates, encryptionPolicy, singleLogoutURL)
