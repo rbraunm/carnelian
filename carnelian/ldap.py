@@ -1,26 +1,43 @@
 # SPDX-License-Identifier: MIT
-"""An LDAPv3 client for signing in against Active Directory and other directories (RFC 4511).
+"""An LDAPv3 client for signing in against Active Directory (RFC 4511).
 
 Only what sign-in needs: simple bind, search, StartTLS, unbind, always over TLS (LDAPS, or
-StartTLS before anything else is said), with certificate and hostname checks. Filters are
-built as values, never parsed from text, so a user name cannot inject filter syntax. A
-bind with an empty password is refused before it is sent: LDAP treats it as an anonymous
-bind that succeeds (RFC 4513 section 5.1.2), the classic way past a directory check.
+StartTLS before anything else is said), with certificate and hostname checks; a TLS context
+that does not require them is refused. Filters are built as values, never parsed from text,
+so a user name cannot inject filter syntax. A bind with an empty password or an empty name
+is refused before it is sent: LDAP treats it as an anonymous bind that succeeds (RFC 4513
+section 5.1), the classic way past a directory check.
 
-Sign-in: the service account finds the one entry with the user name, the person's password
-is checked by binding as that entry on a fresh connection, a disabled Active Directory
-account is refused, and the groups are those the entry belongs to, nested ones included
-(Active Directory's LDAP_MATCHING_RULE_IN_CHAIN).
+Every answer is read strictly: an LDAPResult must carry its ENUMERATED result code and its
+two OCTET STRINGs, and search entries their DN and attribute list, or the answer is refused.
+Each operation has a deadline (maximumOperationSeconds), a byte budget
+(maximumOperationBytes) and, for a search, a maximum number of entries (maximumEntries),
+all enforced here whatever the directory does with the limits it is sent. A search
+reference (a pointer to another server) is refused: sign-in does not follow referrals, and
+ignoring one would let a partial answer stand for the whole.
+
+Sign-in: the service account finds the one person (objectCategory person, objectClass user;
+computer accounts never match) with the user name, the account must carry
+userAccountControl and not be disabled, the person's password is checked by binding as that
+entry on a fresh connection, and the groups are those the entry belongs to, nested ones
+included (Active Directory's LDAP_MATCHING_RULE_IN_CHAIN), named by sAMAccountName, which
+Active Directory keeps unique in the domain (a cn is unique only within its container).
 """
 
 from __future__ import annotations
 
+import re
 import socket
 import ssl
+import time
 from dataclasses import dataclass
-from typing import Self
 
 __all__ = ["DirectoryRefused", "Directory", "DirectoryIdentity"]
+
+maximumMessageBytes = 4_000_000
+maximumOperationBytes = 16_000_000
+maximumOperationSeconds = 30.0
+maximumEntries = 1000
 
 
 class DirectoryRefused(ValueError):
@@ -85,7 +102,20 @@ def readAll(data: bytes) -> list[tuple[int, bytes]]:
 
 
 def readInteger(content: bytes) -> int:
+  if not content:
+    raise DirectoryRefused("an LDAP integer without content")
   return int.from_bytes(content, "big", signed=True)
+
+
+def _text(content: bytes, what: str) -> str:
+  try:
+    return content.decode("utf-8")
+  except UnicodeDecodeError:
+    raise DirectoryRefused(f"{what} that is not UTF-8") from None
+
+
+def _tags(parts: list[tuple[int, bytes]]) -> list[int]:
+  return [tag for tag, _ in parts]
 
 
 # ---- filters, as values -----------------------------------------------------
@@ -127,50 +157,132 @@ class All:
     return sequence(*(part.encoded() for part in self.filters), tag=0xA0)
 
 
-Filter = Equal | Present | InChain | All
+type Filter = Equal | Present | InChain | All
 
 
-# ---- the connection ---------------------------------------------------------
+# ---- answers ----------------------------------------------------------------
 
-resultNames = {0: "success", 32: "noSuchObject", 34: "invalidDNSyntax", 48: "inappropriateAuthentication",
-               49: "invalidCredentials", 50: "insufficientAccessRights", 53: "unwillingToPerform"}
+resultNames = {0: "success", 3: "timeLimitExceeded", 4: "sizeLimitExceeded", 10: "referral",
+               11: "adminLimitExceeded", 14: "saslBindInProgress", 32: "noSuchObject", 34: "invalidDNSyntax",
+               48: "inappropriateAuthentication", 49: "invalidCredentials", 50: "insufficientAccessRights",
+               53: "unwillingToPerform"}
+
+
+def checkResult(result: bytes, what: str, extraTags: frozenset[int] = frozenset()) -> None:
+  """Refuse an LDAPResult that is malformed or not success; `extraTags` are the operation's own trailing parts."""
+  parts = readAll(result)
+  if _tags(parts[:3]) != [0x0A, 0x04, 0x04]:
+    raise DirectoryRefused(f"{what}: an LDAPResult without its result code, matched DN and diagnostic message")
+  code = readInteger(parts[0][1])
+  trailing = _tags(parts[3:])
+  if len(set(trailing)) != len(trailing) or not set(trailing) <= extraTags | {0xA3}:
+    raise DirectoryRefused(f"{what}: an LDAPResult with unexpected parts {[f'0x{tag:02x}' for tag in trailing]}")
+  if code != 0:
+    message = parts[2][1].decode("utf-8", "replace")
+    raise DirectoryRefused(f"{what}: {resultNames.get(code, code)} {message}".rstrip())
+  if 0xA3 in trailing:
+    raise DirectoryRefused(f"{what}: a success that carries a referral")
 
 
 @dataclass(frozen=True)
 class Entry:
+  """A search entry; attribute names are in lower case, as LDAP compares them without case."""
+
   dn: str
   attributes: dict[str, tuple[str, ...]]
 
+  def values(self, name: str) -> tuple[str, ...] | None:
+    return self.attributes.get(name.lower())
+
+
+def readEntry(content: bytes) -> Entry:
+  """A SearchResultEntry's content: the DN, then attributes that each hold a name and a set of values."""
+  parts = readAll(content)
+  if _tags(parts) != [0x04, 0x30]:
+    raise DirectoryRefused("a search entry that is not a DN and an attribute list")
+  attributes: dict[str, tuple[str, ...]] = {}
+  for tag, attribute in readAll(parts[1][1]):
+    pieces = readAll(attribute)
+    if tag != 0x30 or _tags(pieces) != [0x04, 0x31]:
+      raise DirectoryRefused("a search entry attribute that is not a name and a set of values")
+    name = _text(pieces[0][1], "an attribute name").lower()
+    if not name or name in attributes:
+      raise DirectoryRefused(f"a search entry with the attribute name {name!r} empty or twice")
+    values = readAll(pieces[1][1])
+    if any(valueTag != 0x04 for valueTag in _tags(values)):
+      raise DirectoryRefused(f"a search entry whose {name} holds something other than OCTET STRINGs")
+    attributes[name] = tuple(_text(value, f"a value of {name}") for _, value in values)
+  return Entry(dn=_text(parts[0][1], "a DN"), attributes=attributes)
+
+
+def _requireVerification(context: ssl.SSLContext) -> None:
+  if (context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname
+      or context.minimum_version < ssl.TLSVersion.TLSv1_2):
+    raise DirectoryRefused("a TLS context that does not require a verified certificate, the host name and TLS 1.2 "
+                           "or newer is refused")
+
+
+# ---- the connection ---------------------------------------------------------
 
 class Connection:
-  """One TLS-protected LDAP connection; use as a context manager so it is unbound and closed."""
+  """One LDAP connection over a socket; Connection.open makes it TLS-protected. Use it as a context manager."""
 
-  def __init__(self, host: str, port: int, context: ssl.SSLContext, startTLS: bool, timeoutSeconds: float = 10.0,
-               maximumBytes: int = 4_000_000) -> None:
-    self.maximumBytes = maximumBytes
+  def __init__(self, transport: socket.socket):
+    self._socket = transport
+    self._idleSeconds = transport.gettimeout()
     self._nextID = 1
-    raw = socket.create_connection((host, port), timeout=timeoutSeconds)
+    self._deadline = 0.0
+    self._bytesLeft = 0
+
+  @classmethod
+  def open(cls, host: str, port: int, context: ssl.SSLContext, startTLS: bool, timeoutSeconds: float) -> Connection:
+    """LDAPS, or StartTLS before anything else; the certificate and host name are checked."""
+    _requireVerification(context)
     try:
+      raw = socket.create_connection((host, port), timeout=timeoutSeconds)
+    except OSError as error:
+      raise DirectoryRefused(f"cannot reach the directory at {host}:{port}: {error}") from None
+    try:
+      connection = cls(raw)
       if startTLS:
-        self._socket = raw
-        tag, result = self._request(sequence(octets("1.3.6.1.4.1.1466.20037", 0x80), tag=0x77))
+        tag, result = connection._request(sequence(octets("1.3.6.1.4.1.1466.20037", 0x80), tag=0x77))
         if tag != 0x78:
           raise DirectoryRefused("the directory did not answer StartTLS")
-        self._check(result, "StartTLS")
-      self._socket = context.wrap_socket(raw, server_hostname=host)
+        checkResult(result, "StartTLS", frozenset({0x8A, 0x8B}))
+      try:
+        connection._socket = context.wrap_socket(raw, server_hostname=host)
+      except OSError as error:
+        raise DirectoryRefused(f"no TLS with the directory at {host}:{port}: {error}") from None
     except BaseException:
       raw.close()
       raise
+    return connection
 
-  def __enter__(self) -> Self:
+  def __enter__(self) -> Connection:
     return self
 
   def __exit__(self, *exception: object) -> None:
     try:
+      self._begin()
       self._send(self._message(tlv(0x42, b"")))
-    except OSError:
+    except DirectoryRefused:
       pass
     self._socket.close()
+
+  def _begin(self) -> None:
+    self._deadline = time.monotonic() + maximumOperationSeconds
+    self._bytesLeft = maximumOperationBytes
+
+  def _timeout(self) -> float:
+    remaining = self._deadline - time.monotonic()
+    if remaining <= 0:
+      raise DirectoryRefused(f"the directory did not finish within {maximumOperationSeconds} seconds")
+    return remaining if self._idleSeconds is None else min(self._idleSeconds, remaining)
+
+  def _timedOut(self, seconds: float) -> DirectoryRefused:
+    if self._idleSeconds is not None and seconds >= self._idleSeconds:
+      return DirectoryRefused(f"the directory was silent for {self._idleSeconds} seconds")
+    return DirectoryRefused(f"the directory did not finish within {maximumOperationSeconds} seconds")
 
   def _message(self, operation: bytes) -> bytes:
     message = sequence(integer(self._nextID), operation)
@@ -178,7 +290,35 @@ class Connection:
     return message
 
   def _send(self, data: bytes) -> None:
-    self._socket.sendall(data)
+    seconds = self._timeout()
+    self._socket.settimeout(seconds)
+    try:
+      self._socket.sendall(data)
+    except TimeoutError:
+      raise self._timedOut(seconds) from None
+    except OSError as error:
+      raise DirectoryRefused(f"the connection to the directory failed: {error}") from None
+
+  def _exactly(self, count: int) -> bytes:
+    if count > self._bytesLeft:
+      raise DirectoryRefused(f"the directory sent more than {maximumOperationBytes} bytes for one operation")
+    self._bytesLeft -= count
+    buffer = bytearray(count)
+    view = memoryview(buffer)
+    received = 0
+    while received < count:
+      seconds = self._timeout()
+      self._socket.settimeout(seconds)
+      try:
+        size = self._socket.recv_into(view[received:])
+      except TimeoutError:
+        raise self._timedOut(seconds) from None
+      except OSError as error:
+        raise DirectoryRefused(f"the connection to the directory failed: {error}") from None
+      if size == 0:
+        raise DirectoryRefused("the directory closed the connection")
+      received += size
+    return bytes(buffer)
 
   def _receive(self) -> tuple[int, tuple[int, bytes]]:
     """One LDAPMessage: its message ID and the protocol operation's (tag, content) inside."""
@@ -186,30 +326,21 @@ class Connection:
     if head[0] != 0x30:
       raise DirectoryRefused("the directory sent something that is not an LDAP message")
     if head[1] < 0x80:
-      length, lengthBytes = head[1], b""
+      length = head[1]
     else:
       count = head[1] & 0x7F
       if count == 0 or count > 4:
         raise DirectoryRefused("an LDAP length that is indefinite or out of range")
-      lengthBytes = self._exactly(count)
-      length = int.from_bytes(lengthBytes, "big")
-    if length > self.maximumBytes:
-      raise DirectoryRefused(f"the directory sent a message of more than {self.maximumBytes} bytes")
+      length = int.from_bytes(self._exactly(count), "big")
+    if length > maximumMessageBytes:
+      raise DirectoryRefused(f"the directory sent a message of more than {maximumMessageBytes} bytes")
     parts = readAll(self._exactly(length))
-    if len(parts) < 2 or parts[0][0] != 0x02:
-      raise DirectoryRefused("an LDAP message without its ID and operation")
+    if len(parts) not in (2, 3) or parts[0][0] != 0x02 or (len(parts) == 3 and parts[2][0] != 0xA0):
+      raise DirectoryRefused("an LDAP message that is not an ID, an operation and optional controls")
     return readInteger(parts[0][1]), parts[1]
 
-  def _exactly(self, count: int) -> bytes:
-    data = b""
-    while len(data) < count:
-      chunk = self._socket.recv(count - len(data))
-      if not chunk:
-        raise DirectoryRefused("the directory closed the connection")
-      data += chunk
-    return data
-
   def _request(self, operation: bytes) -> tuple[int, bytes]:
+    self._begin()
     messageID = self._nextID
     self._send(self._message(operation))
     answerID, answer = self._receive()
@@ -217,43 +348,37 @@ class Connection:
       raise DirectoryRefused(f"the directory answered message {answerID}, not {messageID}")
     return answer
 
-  @staticmethod
-  def _check(result: bytes, what: str) -> None:
-    parts = readAll(result)
-    code = readInteger(parts[0][1])
-    if code != 0:
-      message = parts[2][1].decode("utf-8", "replace") if len(parts) > 2 else ""
-      raise DirectoryRefused(f"{what}: {resultNames.get(code, code)} {message}".rstrip())
-
   def bind(self, name: str, password: str) -> None:
+    if not name:
+      raise DirectoryRefused("an empty name is refused: LDAP would take it for an anonymous bind")
     if not password:
       raise DirectoryRefused("an empty password is refused: LDAP would take it for an anonymous bind")
     tag, result = self._request(sequence(integer(3), octets(name), octets(password, 0x80), tag=0x60))
     if tag != 0x61:
       raise DirectoryRefused("the directory did not answer the bind")
-    self._check(result, "bind")
+    checkResult(result, "bind", frozenset({0x87}))
 
-  def search(self, base: str, query: Filter, attributes: tuple[str, ...], sizeLimit: int = 1000) -> list[Entry]:
+  def search(self, base: str, query: Filter, attributes: tuple[str, ...]) -> list[Entry]:
+    """Subtree search; refused past maximumEntries entries, at a search reference, or past the budgets."""
+    self._begin()
     messageID = self._nextID
     self._send(self._message(sequence(
-      octets(base), integer(2, 0x0A), integer(0, 0x0A), integer(sizeLimit), integer(10), boolean(False),
-      query.encoded(), sequence(*(octets(attribute) for attribute in attributes)), tag=0x63)))
-    entries = []
+      octets(base), integer(2, 0x0A), integer(0, 0x0A), integer(maximumEntries), integer(int(maximumOperationSeconds)),
+      boolean(False), query.encoded(), sequence(*(octets(attribute) for attribute in attributes)), tag=0x63)))
+    entries: list[Entry] = []
     while True:
       answerID, (tag, content) = self._receive()
       if answerID != messageID:
         raise DirectoryRefused(f"the directory answered message {answerID}, not {messageID}")
       if tag == 0x64:
-        parts = readAll(content)
-        values = {}
-        for _, pair in readAll(parts[1][1]):
-          name, valueSet = readAll(pair)
-          values[name[1].decode("utf-8")] = tuple(value.decode("utf-8") for _, value in readAll(valueSet[1]))
-        entries.append(Entry(dn=parts[0][1].decode("utf-8"), attributes=values))
+        if len(entries) == maximumEntries:
+          raise DirectoryRefused(f"the directory answered a search with more than {maximumEntries} entries")
+        entries.append(readEntry(content))
       elif tag == 0x73:
-        continue
+        raise DirectoryRefused("the directory answered a search with a reference to another server, "
+                               "which sign-in does not follow")
       elif tag == 0x65:
-        self._check(content, "search")
+        checkResult(content, "search")
         return entries
       else:
         raise DirectoryRefused(f"the directory answered a search with operation 0x{tag:02x}")
@@ -261,6 +386,8 @@ class Connection:
 
 @dataclass(frozen=True)
 class DirectoryIdentity:
+  """The person signed in; `groups` are sAMAccountNames, unique in the domain, of every group, nested included."""
+
   dn: str
   userName: str
   displayName: str | None
@@ -268,42 +395,63 @@ class DirectoryIdentity:
   groups: tuple[str, ...]
 
 
+def _single(entry: Entry, name: str) -> str | None:
+  values = entry.values(name)
+  if values is None:
+    return None
+  if len(values) != 1:
+    raise DirectoryRefused(f"the directory sent {len(values)} values of {name}, not one")
+  return values[0]
+
+
+def _required(entry: Entry, name: str, owner: str) -> str:
+  value = _single(entry, name)
+  if value is None:
+    raise DirectoryRefused(f"the directory did not send {name} for {owner}")
+  return value
+
+
 class Directory:
-  """Sign-in against a directory, Active Directory by default."""
+  """Sign-in against Active Directory."""
 
   def __init__(self, host: str, context: ssl.SSLContext, baseDN: str, serviceName: str, servicePassword: str,
                port: int = 636, startTLS: bool = False, userAttribute: str = "sAMAccountName", timeoutSeconds: float = 10.0):
+    _requireVerification(context)
     self.host, self.port, self.context, self.startTLS = host, port, context, startTLS
     self.baseDN, self.userAttribute, self.timeoutSeconds = baseDN, userAttribute, timeoutSeconds
     self._serviceName, self._servicePassword = serviceName, servicePassword
 
   def _connect(self) -> Connection:
-    try:
-      return Connection(self.host, self.port, self.context, self.startTLS, self.timeoutSeconds)
-    except (OSError, ssl.SSLError) as error:
-      raise DirectoryRefused(f"cannot reach the directory at {self.host}:{self.port}: {error}") from None
+    return Connection.open(self.host, self.port, self.context, self.startTLS, self.timeoutSeconds)
 
   def signIn(self, userName: str, password: str) -> DirectoryIdentity:
     if not password:
       raise DirectoryRefused("an empty password is refused: LDAP would take it for an anonymous bind")
     with self._connect() as service:
       service.bind(self._serviceName, self._servicePassword)
-      found = service.search(self.baseDN, All((Equal("objectClass", "user"), Equal(self.userAttribute, userName))),
-                             ("displayName", "mail", "userAccountControl", self.userAttribute))
+      found = service.search(
+        self.baseDN,
+        All((Equal("objectCategory", "person"), Equal("objectClass", "user"), Equal(self.userAttribute, userName))),
+        ("displayName", "mail", "userAccountControl", self.userAttribute))
       if len(found) != 1:
         raise DirectoryRefused("the user name or the password is wrong")
       entry = found[0]
-      control = int(entry.attributes.get("userAccountControl", ("0",))[0])
-      if control & 0x2:
+      if not entry.dn:
+        raise DirectoryRefused("the directory found the user under an empty DN")
+      control = _required(entry, "userAccountControl", "the user")
+      if not re.fullmatch(r"-?[0-9]{1,10}", control):
+        raise DirectoryRefused("the directory sent a userAccountControl that is not a number")
+      if int(control) & 0x2:
         raise DirectoryRefused("the user name or the password is wrong")
       with self._connect() as person:
         try:
           person.bind(entry.dn, password)
         except DirectoryRefused:
           raise DirectoryRefused("the user name or the password is wrong") from None
-      groups = service.search(self.baseDN, All((Equal("objectClass", "group"), InChain("member", entry.dn))), ("cn",))
+      groups = service.search(self.baseDN, All((Equal("objectClass", "group"), InChain("member", entry.dn))),
+                              ("sAMAccountName",))
     return DirectoryIdentity(
-      dn=entry.dn, userName=entry.attributes[self.userAttribute][0],
-      displayName=entry.attributes.get("displayName", (None,))[0], email=entry.attributes.get("mail", (None,))[0],
-      groups=tuple(sorted(group.attributes["cn"][0] for group in groups)),
+      dn=entry.dn, userName=_required(entry, self.userAttribute, "the user"),
+      displayName=_single(entry, "displayName"), email=_single(entry, "mail"),
+      groups=tuple(sorted(_required(group, "sAMAccountName", "a group") for group in groups)),
     )
