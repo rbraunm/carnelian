@@ -17,11 +17,12 @@ import base64
 import binascii
 import math
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from carnelian.fetching import parseJSON
+from carnelian.fetching import HTTPFailure, parseJSON
 from carnelian.signatures import ECPublicKey, RSAPublicKey, SignatureError, curves
 
 
@@ -192,41 +193,80 @@ class KeySet:
     return keyFromJWK(chosen)
 
 
+_earliestNumericDate = -62_135_596_800
+_latestNumericDate = 253_402_300_799
+
+
 def numericDate(claims: JSON, member: str) -> float:
-  """A JWT time claim: a finite number of seconds (never a boolean, a string or 1e999)."""
+  """A JWT time claim: a number of seconds between the years 1 and 9999 (never a boolean, a string or 1e999)."""
   value = claims.get(member)
-  if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+  if not isinstance(value, (int, float)) or isinstance(value, bool) or (isinstance(value, float) and not math.isfinite(value)):
     raise JOSEError(f"'{member}' is not a finite number: {value!r}")
-  return value
+  if not _earliestNumericDate <= value <= _latestNumericDate:
+    raise JOSEError(f"'{member}' is not a time between the years 1 and 9999")
+  return float(value)
 
 
 minimumKeyRefreshSeconds = 60
+maximumKeyRetrySeconds = 15 * 60
 maximumKeyAgeSeconds = 24 * 60 * 60
 
 
 class KeyCache:
-  """An issuer's JWK set, fetched when first needed, again when a day old, and again (at most once a minute) when a
-  token names a key it lacks or fails against the key it names: rotation is followed, and tokens naming unknown keys
-  cannot make every check fetch the issuer's keys."""
+  """An issuer's JWK set, fetched when first needed, again when a day old, and again when a token names a key it
+  lacks or fails against the key it names, so rotation is followed. Fetches are spaced: one at a time, at most one
+  a minute, and after each failed or malformed answer the wait doubles up to maximumKeyRetrySeconds; so tokens naming
+  unknown keys, or an issuer that is down, cannot make every check fetch the keys. Keys are used until a day after
+  the fetch that brought them, however later fetches fare, and never after."""
 
   def __init__(self, fetchKeys: Callable[[], JSON], clock: Callable[[], float]) -> None:
     self._fetch, self._clock = fetchKeys, clock
+    self._lock = threading.Lock()
     self._keys: KeySet | None = None
     self._fetchedAt = float("-inf")
+    self._attemptedAt = float("-inf")
+    self._failures = 0
+    self._lastFailure = ""
 
-  def _fetched(self) -> KeySet:
-    self._keys, self._fetchedAt = KeySet(self._fetch()), self._clock()
+  def _current(self) -> KeySet | None:
+    if self._keys is None or self._clock() - self._fetchedAt >= maximumKeyAgeSeconds:
+      return None
     return self._keys
+
+  def _nextAttempt(self) -> float:
+    return self._attemptedAt + min(minimumKeyRefreshSeconds << min(self._failures, 10), maximumKeyRetrySeconds)
+
+  def _refreshed(self) -> KeySet:
+    now = self._clock()
+    if now < self._nextAttempt():
+      raise JOSEError(f"the issuer's keys {self._lastFailure or 'were fetched moments ago'}; "
+                      f"the next fetch is in {self._nextAttempt() - now:.0f} seconds")
+    self._attemptedAt = now
+    try:
+      keys = KeySet(self._fetch())
+    except (HTTPFailure, JOSEError) as error:
+      self._failures += 1
+      self._lastFailure = f"could not be fetched ({error})"
+      raise JOSEError(f"the issuer's keys {self._lastFailure}") from None
+    self._keys, self._fetchedAt, self._failures, self._lastFailure = keys, now, 0, ""
+    return keys
+
+  def _keysAfter(self, used: KeySet | None) -> KeySet:
+    with self._lock:
+      current = self._current()
+      if current is not None and current is not used:
+        return current
+      return self._refreshed()
 
   def verify(self, token: str, allowedAlgorithms: frozenset[str]) -> VerifiedJWS:
     header = readHeader(token)
     acceptedAlgorithm(header, allowedAlgorithms)
-    keys = self._keys
-    if keys is None or self._clock() - self._fetchedAt >= maximumKeyAgeSeconds:
-      keys = self._fetched()
+    keys = self._current() or self._keysAfter(None)
     try:
       return verifyCompact(token, keys.keyFor(header), allowedAlgorithms)
-    except JOSEError:
-      if self._clock() - self._fetchedAt < minimumKeyRefreshSeconds:
-        raise
-    return verifyCompact(token, self._fetched().keyFor(header), allowedAlgorithms)
+    except JOSEError as refusal:
+      try:
+        newer = self._keysAfter(keys)
+      except JOSEError as again:
+        raise JOSEError(f"{refusal}; {again}") from None
+    return verifyCompact(token, newer.keyFor(header), allowedAlgorithms)

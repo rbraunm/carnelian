@@ -2,10 +2,12 @@
 """The HTTPS fetcher against a local TLS server that answers with scripted bytes."""
 
 import datetime
+import gc
 import socket
 import ssl
 import threading
 import time
+import warnings
 
 import pytest
 from cryptography import x509
@@ -202,3 +204,96 @@ def testABodyThatComesAfterTheHeadersOfAClosingAnswerIsRead(certificates, serve)
   port = serve(headersThenLaterTheBody)
   assert fetcher(certificates).getBytes(f"https://localhost:{port}/entities/x", "application/samlmetadata+xml") == (
     b"<EntityDescriptor/>" * 200)
+
+
+def testAnErrorNamesTheURLWithoutItsQueryValues(certificates, serve):
+  port = serve(answer(200, b"{}"))
+  with pytest.raises(HTTPFailure) as refused:
+    fetcher(certificates).getBytes(
+      f"https://someone:hunter2@127.0.0.1:{port}/validate?ticket=ST-secret&service=https%3A%2F%2Fapp#part", "application/xml")
+  assert str(refused.value).startswith(f"https://127.0.0.1:{port}/validate?ticket=...&service=...: SSLCertVerificationError")
+  assert "ST-secret" not in str(refused.value) and "hunter2" not in str(refused.value)
+
+
+def testResolvingTheNameIsWithinTheDeadline(certificates, serve, monkeypatch):
+  port = serve(answer(200, b"{}"))
+  resolve = socket.getaddrinfo
+
+  def slowResolver(*arguments, **options):
+    time.sleep(3)
+    return resolve(*arguments, **options)
+
+  monkeypatch.setattr(socket, "getaddrinfo", slowResolver)
+  started = time.monotonic()
+  with pytest.raises(HTTPFailure, match="ran past the request's deadline of 0.5 seconds"):
+    fetcher(certificates, timeoutSeconds=0.5).getJSON(f"https://localhost:{port}/x")
+  assert time.monotonic() - started < 1.0
+
+
+def testEveryAddressIsTriedWithinTheOneDeadline(certificates, monkeypatch):
+  closed = socket.create_server(("127.0.0.1", 0))
+  port = closed.getsockname()[1]
+  closed.close()
+  monkeypatch.setattr(socket, "getaddrinfo", lambda *arguments, **options: [
+    (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))] * 3)
+  started = time.monotonic()
+  with pytest.raises(HTTPFailure):
+    fetcher(certificates, timeoutSeconds=1.0).getJSON(f"https://localhost:{port}/x")
+  assert time.monotonic() - started < 1.5
+
+
+def testTheSocketIsClosedWhenTheHandshakeFails(certificates, serve):
+  port = serve(answer(200, b"{}"))
+  with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always", ResourceWarning)
+    with pytest.raises(HTTPFailure, match="CERTIFICATE_VERIFY_FAILED"):
+      fetcher(certificates).getJSON(f"https://127.0.0.1:{port}/x")
+    gc.collect()
+  assert [str(warning.message) for warning in caught if issubclass(warning.category, ResourceWarning)] == []
+
+
+streamed = b"<EntityDescriptor/>" * 20_000
+
+
+def testADocumentIsStreamedInChunksUnderItsOwnSizeLimit(certificates, serve):
+  port = serve(answer(200, streamed))
+  chunks = list(fetcher(certificates, maximumBytes=100).streamBytes(f"https://localhost:{port}/x", "application/xml", len(streamed)))
+  assert b"".join(chunks) == streamed
+  assert len(chunks) > 1 and max(len(chunk) for chunk in chunks) <= 65536
+
+
+def testAStreamIsCutOffAsSoonAsItPassesItsSizeLimit(certificates, serve):
+  port = serve(answer(200, streamed))
+  received = []
+  with pytest.raises(HTTPFailure, match=f"more than {len(streamed) - 1} bytes"):
+    for chunk in fetcher(certificates).streamBytes(f"https://localhost:{port}/x", "application/xml", len(streamed) - 1):
+      received.append(chunk)
+  assert sum(len(chunk) for chunk in received) <= len(streamed) - 1
+
+
+@pytest.mark.parametrize("script, message", [
+  (answer(404, b"gone"), "answered 404, not 200"),
+  (shortThenClosedCleanly, "fewer bytes than its Content-Length"),
+  (lambda tls: tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{}"), "SSLEOFError"),
+], ids=["status", "shortClosedCleanly", "short"])
+def testAStreamThatIsNotAWhole200AnswerIsRefused(certificates, serve, script, message):
+  port = serve(script)
+  with pytest.raises(HTTPFailure, match=message):
+    for _ in fetcher(certificates).streamBytes(f"https://localhost:{port}/x?code=c-secret", "application/xml", 1000):
+      pass
+
+
+def testAStreamEndsAtTheRequestsDeadline(certificates, serve):
+  def trickle(tls):
+    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
+    for _ in range(100):
+      tls.sendall(b"x")
+      time.sleep(0.05)
+
+  port = serve(trickle)
+  started = time.monotonic()
+  received = []
+  with pytest.raises(HTTPFailure, match="ran past the request's deadline of 1.0 seconds"):
+    for chunk in fetcher(certificates, timeoutSeconds=1.0).streamBytes(f"https://localhost:{port}/x", "application/xml", 1000):
+      received.append(chunk)
+  assert time.monotonic() - started < 2.0 and 0 < sum(len(chunk) for chunk in received) < 100

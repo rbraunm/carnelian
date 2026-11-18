@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 from carnelian.jose import base64urlEncode
 from carnelian.jose import maximumKeyAgeSeconds
-from carnelian.oidc import Pending, Provider, RelyingParty, SignInRefused, discover
+from carnelian.oidc import LogoutNotice, Pending, Provider, RelyingParty, SignInRefused, discover
 
 issuer = "https://id.example.org/realms/test"
 
@@ -223,6 +223,32 @@ def testKeysOlderThanTheirMaximumAgeAreFetchedAgain():
   assert network.fetched == 2
 
 
+class UnreachableNetwork(StandInNetwork):
+  """A provider that cannot be reached: a double for the network boundary only."""
+
+  def getJSON(self, url, headers=None):
+    raise HTTPFailure(f"{url}: ConnectionRefusedError")
+
+  def postForm(self, url, fields, headers=None):
+    raise HTTPFailure(f"{url}: ConnectionRefusedError")
+
+
+@pytest.mark.parametrize("call, message", [
+  (lambda: discover(issuer, UnreachableNetwork()), "discovery document cannot be fetched: .*ConnectionRefusedError"),
+  (lambda: party(UnreachableNetwork()).finishSignIn(pendingFor(), {"state": "s", "code": "c"}),
+   "code was not exchanged for tokens: .*ConnectionRefusedError"),
+  (lambda: party(UnreachableNetwork()).checkIDToken(idToken(good), "n-1"), "keys could not be fetched"),
+  (lambda: party(UnreachableNetwork()).checkLogoutToken(idToken(logoutClaims, logoutHeader)), "keys could not be fetched"),
+  (lambda: party(StandInNetwork({"keys": 5})).checkLogoutToken(idToken(logoutClaims, logoutHeader)),
+   "keys could not be fetched .*'keys' list"),
+  (lambda: party().checkIDToken(signedText(json.dumps(good)[:-1] + ', "nbf": 1' + "0" * 400 + "}"), "n-1"),
+   "'nbf' is not a time between the years 1 and 9999"),
+], ids=["discover", "finishSignIn", "checkIDToken", "checkLogoutToken", "malformedKeySet", "hugeTime"])
+def testAProviderThatCannotBeReachedOrAnswersWronglyIsASignInRefusal(call, message):
+  with pytest.raises(SignInRefused, match=message):
+    call()
+
+
 class StandInProvider(StandInNetwork):
   """A provider's discovery document and token endpoint, served without a network."""
 
@@ -367,10 +393,26 @@ logoutHeader = {"alg": "RS256", "kid": "k1", "typ": "logout+jwt"}
 
 def testABackChannelLogoutTokenNamesTheSessionToEnd():
   notice = party().checkLogoutToken(idToken(logoutClaims, logoutHeader))
-  assert (notice.subject, notice.sessionID, notice.tokenID, notice.expiresAt) == ("s-1", "session-1", "j-1", now + 60)
+  assert notice == LogoutNotice(issuer=issuer, clientID="app", subject="s-1", sessionID="session-1", tokenID="j-1",
+                                rememberUntil=now + 60 + 60)
   sessionOnly = {key: value for key, value in logoutClaims.items() if key not in ("sub", "exp")}
   notice = party().checkLogoutToken(idToken(sessionOnly, logoutHeader))
-  assert (notice.subject, notice.sessionID, notice.expiresAt) == (None, "session-1", now - 5 + 120)
+  assert (notice.subject, notice.sessionID, notice.rememberUntil) == (None, "session-1", now - 5 + 120 + 60)
+
+
+def testALogoutTokenIsRememberedForAsLongAsItIsAccepted():
+  claims = logoutClaims | {"exp": now - 59}
+  notice = party().checkLogoutToken(idToken(claims, logoutHeader))
+  assert notice.rememberUntil == now + 1
+  with pytest.raises(SignInRefused, match="has expired"):
+    party(clock=lambda: notice.rememberUntil).checkLogoutToken(idToken(claims, logoutHeader))
+
+
+def testALogoutTokenWithADistantExpiryIsStillRefusedWhenOld():
+  claims = logoutClaims | {"iat": now - 179, "exp": now + 3600}
+  assert party().checkLogoutToken(idToken(claims, logoutHeader)).rememberUntil == now - 179 + 120 + 60
+  with pytest.raises(SignInRefused, match="issued more than 120 seconds ago"):
+    party().checkLogoutToken(idToken(claims | {"iat": now - 180}, logoutHeader))
 
 
 @pytest.mark.parametrize("change, header, message", [

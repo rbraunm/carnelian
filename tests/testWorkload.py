@@ -2,14 +2,15 @@
 """Workload tokens: the required claims that make a token yours, the checks around them, and real tokens from
 GitHub Actions (live discovery with --live; a token the workflow asks GitHub for, when the run provides one)."""
 
+import json
 import os
 
 import pytest
 
-from carnelian.fetching import Fetcher, secureContext
+from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 from carnelian.workload import WorkloadIssuer, WorkloadRefused, WorkloadVerifier, discoverIssuer, githubActions
 
-from testOIDC import idToken, jwks
+from testOIDC import idToken, jwks, signedText
 
 issuer = "https://token.example.org"
 now = 1_800_000_000
@@ -72,6 +73,27 @@ def testATokenSignedWithAKeyTheIssuerDoesNotHaveIsRefused():
     verifier().verify(idToken(good, {"alg": "RS256", "kid": "k9"}))
   with pytest.raises(WorkloadRefused, match="algorithm 'none' is refused"):
     verifier().verify(idToken(good, {"alg": "none", "kid": "k1"}))
+
+
+class UnreachableKeys(StandInIssuer):
+  def getJSON(self, url, headers=None):
+    if url == f"{issuer}/keys":
+      raise HTTPFailure(f"{url}: ConnectionRefusedError")
+    return super().getJSON(url, headers)
+
+
+def testAnIssuerWhoseKeysCannotBeFetchedIsAWorkloadRefusal():
+  network = UnreachableKeys()
+  unreachable = WorkloadVerifier(discoverIssuer(issuer, network), "carnelian-ci", {"repository": "example/app"}, network,
+                                 clock=lambda: now)
+  with pytest.raises(WorkloadRefused, match="keys could not be fetched .*ConnectionRefusedError"):
+    unreachable.verify(idToken(good))
+
+
+def testATimeTooLargeForAFloatIsAWorkloadRefusal():
+  claimsText = json.dumps(good)[:-1] + ', "nbf": 1' + "0" * 400 + "}"
+  with pytest.raises(WorkloadRefused, match="'nbf' is not a time between the years 1 and 9999"):
+    verifier().verify(signedText(claimsText))
 
 
 @pytest.mark.parametrize("requiredClaims, audience, message", [

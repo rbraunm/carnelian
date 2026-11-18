@@ -35,8 +35,11 @@ except WorkloadRefused as refusal:
 ```
 
 Keep one verifier for the life of the process: it caches the issuer's keys, fetching them
-again when they are a day old or when a token names a key it does not have (at most once a
-minute, so unknown keys cannot make every request fetch them).
+again when they are a day old or when a token names a key it does not have. Fetches go one
+at a time, at most once a minute, and after a failed or malformed answer the wait doubles
+up to 15 minutes, so unknown keys or an issuer that is down cannot make every request fetch
+them; keys already fetched stay in use until a day after the fetch that brought them. An
+issuer that cannot be reached is a `WorkloadRefused` like any other refusal.
 
 In the workflow, ask for the token with your audience and send it:
 

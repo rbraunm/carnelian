@@ -77,8 +77,38 @@ out at the provider too (RP-Initiated Logout), when its discovery document names
 signs a person out elsewhere, it can tell you by back-channel logout: it POSTs a
 `logout_token` to an address you register, and `checkLogoutToken` checks it like an ID
 token (signature, issuer, audience, times), requires the logout event and no nonce, and
-returns the subject and session to end and the token's `jti`, which you remember until
-`expiresAt` so a notice is acted on once.
+refuses a token issued more than two minutes ago however distant its `exp`. It returns a
+`LogoutNotice`:
+
+- **Act once.** Before ending anything, claim the key (`issuer`, `clientID`, `tokenID`)
+  atomically in a shared store (an insert that fails on a duplicate, or `SET NX` with an
+  expiry) kept until `rememberUntil`, which already includes the leeway; if the claim is
+  not new, answer 200 and do nothing. A check and a later write is not enough: two copies
+  of the notice arriving together would both pass.
+- **End the right sessions.** When `sessionID` is present, end only the session that
+  provider gave that `sid`, and only if its subject is `subject` when the notice names one.
+  When there is only `subject`, end every session of that subject from this provider.
+
+```python
+@app.post("/signout/backchannel")
+def backChannelLogout():
+  try:
+    notice = relyingParty.checkLogoutToken(request.form["logout_token"])
+  except (KeyError, SignInRefused):
+    abort(400)
+  if not replayStore.claim((notice.issuer, notice.clientID, notice.tokenID), until=notice.rememberUntil):
+    return "", 200
+  if notice.sessionID is not None:
+    sessions.endSession(notice.issuer, notice.sessionID, subject=notice.subject)
+  else:
+    sessions.endSubject(notice.issuer, notice.subject)
+  return "", 200
+```
+
+Every refusal, including a provider that cannot be reached or answers with something
+that is not a key set, is a `SignInRefused`. The provider's keys are fetched again at most
+once a minute, one fetch at a time, and after a failed fetch the wait doubles up to 15
+minutes; keys already fetched stay in use until a day after the fetch that brought them.
 
 ## More than one provider
 

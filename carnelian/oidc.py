@@ -14,7 +14,8 @@ provider error is raised with its own words.
 
 The provider's keys are kept for at most a day; a token whose key is not known, or whose
 signature does not verify with the known key (a key rotated under the same 'kid'), fetches
-them again, at most once a minute.
+them again, at most once a minute and less often while fetching fails. A provider that
+cannot be reached, or answers wrongly, is a SignInRefused like any other refusal.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from carnelian.fetching import JSON, JSONFetcher
+from carnelian.fetching import JSON, HTTPFailure, JSONFetcher
 from carnelian.jose import JOSEError, KeyCache, numericDate, readHeader, readJSON, supportedAlgorithms
 
 __all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty", "LogoutNotice"]
@@ -106,7 +107,10 @@ def discover(issuer: str, fetcher: JSONFetcher) -> Provider:
   """The provider at `issuer`, from its discovery document, which must name exactly that issuer."""
   if not issuer.startswith("https://"):
     raise SignInRefused(f"an issuer is an https URL, not {issuer!r}")
-  document = fetcher.getJSON(issuer.rstrip("/") + "/.well-known/openid-configuration")
+  try:
+    document = fetcher.getJSON(issuer.rstrip("/") + "/.well-known/openid-configuration")
+  except HTTPFailure as error:
+    raise SignInRefused(f"the provider's discovery document cannot be fetched: {error}") from None
   if document.get("issuer") != issuer:
     raise SignInRefused(f"the discovery document names issuer {document.get('issuer')!r}, not {issuer!r}")
   offered = _names(document, "id_token_signing_alg_values_supported")
@@ -141,16 +145,21 @@ class Pending:
 
 @dataclass(frozen=True)
 class LogoutNotice:
-  """A provider's back-channel logout: end the sessions of `subject`, or the one session `sessionID`, or both.
-  `tokenID` (the token's jti) is the application's to remember until `expiresAt`, so a notice is acted on once."""
+  """A provider's back-channel logout. With a `sessionID`, end only that session at this provider, and only if its
+  subject is `subject` when the notice names one; with only a `subject`, end every session of that subject here.
+  Before acting, claim (`issuer`, `clientID`, `tokenID`) atomically in a store kept until `rememberUntil`, and act
+  only if the claim is new, so a notice is acted on once."""
 
+  issuer: str
+  clientID: str
   subject: str | None
   sessionID: str | None
   tokenID: str
-  expiresAt: float
+  rememberUntil: float
 
 
 backchannelLogoutEvent = "http://schemas.openid.net/event/backchannel-logout"
+maximumLogoutTokenAgeSeconds = 2 * 60
 
 
 @dataclass(frozen=True)
@@ -220,10 +229,13 @@ class RelyingParty:
     if not code:
       raise SignInRefused("the provider sent no code")
     credentials = f"{urllib.parse.quote(self.clientID, safe='')}:{urllib.parse.quote(self._clientSecret, safe='')}"
-    tokens = self.fetcher.postForm(self.provider.tokenEndpoint, {
-      "grant_type": "authorization_code", "code": code, "redirect_uri": self.redirectURI,
-      "code_verifier": pending.codeVerifier,
-    }, {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode("ascii")})
+    try:
+      tokens = self.fetcher.postForm(self.provider.tokenEndpoint, {
+        "grant_type": "authorization_code", "code": code, "redirect_uri": self.redirectURI,
+        "code_verifier": pending.codeVerifier,
+      }, {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode("ascii")})
+    except HTTPFailure as error:
+      raise SignInRefused(f"the code was not exchanged for tokens: {error}") from None
     idToken = tokens.get("id_token")
     if not isinstance(idToken, str):
       raise SignInRefused("the token response has no ID token")
@@ -277,11 +289,17 @@ class RelyingParty:
     audiences = [audience] if isinstance(audience, str) else audience
     if not isinstance(audiences, list) or self.clientID not in audiences or not all(isinstance(name, str) for name in audiences):
       raise SignInRefused(f"the logout token is not for client {self.clientID!r}")
-    if _numericDate(claims, "iat") > now + self.leewaySeconds:
+    issuedAt = _numericDate(claims, "iat")
+    if issuedAt > now + self.leewaySeconds:
       raise SignInRefused("the logout token is issued in the future")
-    expiresAt = _numericDate(claims, "exp") if "exp" in claims else _numericDate(claims, "iat") + 2 * 60
-    if expiresAt <= now - self.leewaySeconds:
-      raise SignInRefused("the logout token has expired")
+    if issuedAt + maximumLogoutTokenAgeSeconds <= now - self.leewaySeconds:
+      raise SignInRefused(f"the logout token was issued more than {maximumLogoutTokenAgeSeconds} seconds ago")
+    acceptedUntil = issuedAt + maximumLogoutTokenAgeSeconds
+    if "exp" in claims:
+      expiresAt = _numericDate(claims, "exp")
+      if expiresAt <= now - self.leewaySeconds:
+        raise SignInRefused("the logout token has expired")
+      acceptedUntil = min(acceptedUntil, expiresAt)
     events = claims.get("events")
     if not isinstance(events, dict) or not isinstance(events.get(backchannelLogoutEvent), dict):
       raise SignInRefused("the token does not carry the back-channel logout event")
@@ -296,7 +314,8 @@ class RelyingParty:
         raise SignInRefused(f"the logout token's {name} is not text")
     if subject is None and sessionID is None:
       raise SignInRefused("the logout token names neither a subject nor a session")
-    return LogoutNotice(subject=subject, sessionID=sessionID, tokenID=tokenID, expiresAt=expiresAt)
+    return LogoutNotice(issuer=self.provider.issuer, clientID=self.clientID, subject=subject, sessionID=sessionID,
+                        tokenID=tokenID, rememberUntil=acceptedUntil + self.leewaySeconds)
 
   def checkIDToken(self, idToken: str, nonce: str) -> JSON:
     """The claims of an ID token that passes every check, or SignInRefused saying which failed."""

@@ -97,7 +97,7 @@ class WorkloadVerifier:
         raise WorkloadRefused("the token is issued in the future")
       if "nbf" in claims and numericDate(claims, "nbf") > now + self.leewaySeconds:
         raise WorkloadRefused("the token is not valid yet ('nbf')")
-    except (JOSEError, HTTPFailure) as error:
+    except JOSEError as error:
       raise WorkloadRefused(f"the token is refused: {error}") from None
     if claims.get("iss") != self.issuer.issuer:
       raise WorkloadRefused(f"the token's issuer {claims.get('iss')!r} is not {self.issuer.issuer!r}")
