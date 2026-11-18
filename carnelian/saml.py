@@ -15,8 +15,8 @@ other condition are refused by name) with this service provider in every one, a 
 subject confirmation whose Recipient is this assertion consumer address and whose
 InResponseTo is this request (its Address is not checked), one AuthnStatement whose
 SessionNotOnOrAfter, when given, has not passed, and an assertion ID not seen before from
-this issuer. NameID, Issuer, Audience and AttributeValue must be text only; the NameID must
-not be blank.
+this issuer. NameID, Issuer, Audience and AttributeValue must be text only (an AttributeValue
+may also be one NameID, the form eduPersonTargetedID takes); the NameID must not be blank.
 
 Replay is kept by a ReplayStore: the default ReplayCache holds one process's memory, so a
 deployment with several processes or hosts gives every ServiceProvider the same shared
@@ -284,7 +284,7 @@ class ServiceProvider:
     for attributeStatement in assertion.childrenNamed(assertionNamespace, "AttributeStatement"):
       for attribute in attributeStatement.childrenNamed(assertionNamespace, "Attribute"):
         name = attribute.required("Name")
-        values = tuple(value.simpleText for value in attribute.childrenNamed(assertionNamespace, "AttributeValue"))
+        values = tuple(_attributeValue(value) for value in attribute.childrenNamed(assertionNamespace, "AttributeValue"))
         attributes[name] = attributes.get(name, ()) + values
     self.replayCache.admit(self.identityProvider.entityID, assertionID, notOnOrAfter + leeway, now)
     return SAMLIdentity(
@@ -303,3 +303,11 @@ class ServiceProvider:
 
 def _attribute(text: str) -> str:
   return text.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+
+
+def _attributeValue(value: Element) -> str:
+  """An attribute's value as text; one NameID element is read as its text, the form eduPersonTargetedID takes."""
+  elements = value.elements()
+  if len(elements) == 1 and elements[0].isA(assertionNamespace, "NameID") and not value.text.replace(elements[0].text, "", 1).strip():
+    return elements[0].simpleText
+  return value.simpleText

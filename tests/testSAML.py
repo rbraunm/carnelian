@@ -301,6 +301,23 @@ def testMetadataCertificatesThatCannotBeReadAreRefused(certificateText, message)
     identityProviderFromMetadata(certificateMetadata(certificateText()), idp)
 
 
+@pytest.mark.parametrize("inner, expected", [
+  ('<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">tid-1</saml:NameID>', ("tid-1",)),
+  ('<saml:Subject/>', None),
+  ('text <saml:NameID>tid-1</saml:NameID>', None),
+])
+def testAnAttributeValueIsTextOrEduPersonTargetedIDsNameID(inner, expected):
+  root = response()
+  statement = root.find(f"{{{saml}}}Assertion/{{{saml}}}AttributeStatement")
+  statement.append(etree.fromstring(f'<saml:Attribute xmlns:saml="{saml}" Name="urn:oid:1.3.6.1.4.1.5923.1.1.1.10">'
+                                    f"<saml:AttributeValue>{inner}</saml:AttributeValue></saml:Attribute>"))
+  if expected is None:
+    with pytest.raises(SAMLRefused, match="text only"):
+      provider().finishSignIn(pending, posted(signAssertion(root)))
+  else:
+    identity = provider().finishSignIn(pending, posted(signAssertion(root)))
+    assert identity.attributes["urn:oid:1.3.6.1.4.1.5923.1.1.1.10"] == expected
+
 # ---- against the testbed's Keycloak ----------------------------------------
 
 class _Posted(html.parser.HTMLParser):
