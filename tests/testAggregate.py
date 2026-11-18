@@ -91,7 +91,7 @@ def escaped(text, attribute=False):
   return text.replace('"', "&quot;").replace("\t", "&#9;").replace("\n", "&#10;") if attribute else text
 
 
-characters = st.text(alphabet="ab &<>\"'\t\r\né✓]", max_size=6)
+characters = st.text(alphabet="ab &<>\"'\t\r\n\u00e9\u2713]", max_size=6)
 
 
 @st.composite
