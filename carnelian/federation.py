@@ -12,8 +12,10 @@ A federation's identity is a scoped identifier, `value@scope`: SAML's subject-id
 pairwise-id (the SAML V2.0 Subject Identifier Attributes profile) or eduPersonPrincipalName.
 An institution may only vouch for identifiers in the scopes its federation registered for
 it, so one university cannot sign in another's people; a scope written as a regular
-expression is refused by name. The service provider's own metadata, which the federation
-registers, is written by `serviceProviderMetadata`.
+expression is refused by name. Only `scopedIdentifier` checks a scope: the NameID and every
+other attribute are whatever the institution asserts. Scopes and entity categories must be
+text only. The service provider's own metadata, which the federation registers, is written
+by `serviceProviderMetadata`.
 """
 
 from __future__ import annotations
@@ -86,19 +88,21 @@ def _institution(root: Element, signedBy: str) -> Institution:
   identityProvider = identityProviderFromDescriptor(root)
   validUntil = _time(root.attribute("validUntil"), "the metadata's validUntil")
   descriptor = root.only(metadataNamespace, "IDPSSODescriptor")
-  scopes, names = [], {}
+  scopes: list[str] = []
+  names: dict[str, str] = {}
   extensions = descriptor.optional(metadataNamespace, "Extensions")
   if extensions is not None:
     for scope in extensions.childrenNamed(shibbolethMetadata, "Scope"):
       if scope.attribute("regexp") not in (None, "false", "0"):
         raise SAMLRefused(f"{root.attribute('entityID')} has a scope written as a regular expression, which is refused")
-      if scope.text.strip().lower() not in scopes:
-        scopes.append(scope.text.strip().lower())
+      if scope.simpleText.strip().lower() not in scopes:
+        scopes.append(scope.simpleText.strip().lower())
     information = extensions.optional(uiNamespace, "UIInfo")
     if information is not None:
       for name in information.childrenNamed(uiNamespace, "DisplayName"):
         names[name.attribute("lang", "http://www.w3.org/XML/1998/namespace") or ""] = name.text.strip()
-  authority, categories = None, []
+  authority: str | None = None
+  categories: list[str] = []
   entityExtensions = root.optional(metadataNamespace, "Extensions")
   if entityExtensions is not None:
     registration = entityExtensions.optional(registrationNamespace, "RegistrationInfo")
@@ -107,7 +111,7 @@ def _institution(root: Element, signedBy: str) -> Institution:
     if attributes is not None:
       for attribute in attributes.childrenNamed(assertionNamespace, "Attribute"):
         if attribute.attribute("Name") == entityCategory:
-          categories += [value.text.strip() for value in attribute.childrenNamed(assertionNamespace, "AttributeValue")]
+          categories += [value.simpleText.strip() for value in attribute.childrenNamed(assertionNamespace, "AttributeValue")]
   if not scopes:
     raise SAMLRefused(f"{root.attribute('entityID')} has no scope in {signedBy}'s metadata, so it can vouch for no one")
   return Institution(entityID=root.required("entityID"), displayNames=names, registrationAuthority=authority,
@@ -149,7 +153,10 @@ class Federation:
       raise SAMLRefused(f"{self.name}'s metadata for {entityID} is refused: {error}") from None
     if root.attribute("entityID") != entityID:
       raise SAMLRefused(f"{self.name} answered for {root.attribute('entityID')!r}, not {entityID!r}")
-    institution = _institution(root, self.name)
+    try:
+      institution = _institution(root, self.name)
+    except XMLRefused as error:
+      raise SAMLRefused(f"{self.name}'s metadata for {entityID} is refused: {error}") from None
     if institution.validUntil <= self.clock():
       raise SAMLRefused(f"{self.name}'s metadata for {entityID} expired")
     return institution

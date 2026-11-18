@@ -5,12 +5,22 @@ The identity provider is known from its metadata: its entity ID, its single sign
 address for the Redirect binding, and its signing certificates. Sign-in has two halves, as
 for OpenID Connect: `beginSignIn` gives the address to send the person to and a Pending
 record to keep server-side; `finishSignIn` takes that record and the SAMLResponse posted
-back. The response or its assertion must carry a signature by a trusted key (decided by
+back, refused unread when longer than `maximumResponseLength` characters. The response or
+its assertion must carry a signature by a trusted key (decided by
 `xmldsig.verifyEnveloped`, which returns the element it verified, and only verified
 elements are read). Then: destination, InResponseTo, issuer, status, one plain assertion
-(EncryptedAssertion is refused by name: decrypting needs a secret key), conditions and
-every audience restriction, a bearer subject confirmation for this request and address,
-and an assertion ID not seen before.
+(EncryptedAssertion is refused by name: decrypting needs a secret key), its validity
+window, conditions holding only audience restrictions (OneTimeUse, ProxyRestriction and any
+other condition are refused by name) with this service provider in every one, a bearer
+subject confirmation whose Recipient is this assertion consumer address and whose
+InResponseTo is this request (its Address is not checked), one AuthnStatement whose
+SessionNotOnOrAfter, when given, has not passed, and an assertion ID not seen before from
+this issuer. NameID, Issuer, Audience and AttributeValue must be text only; the NameID must
+not be blank.
+
+Replay is kept by a ReplayStore: the default ReplayCache holds one process's memory, so a
+deployment with several processes or hosts gives every ServiceProvider the same shared
+store, whose `admit` is an atomic claim.
 
 Requests are unsigned (signing needs a secret key); configure the identity provider not to
 require signed requests.
@@ -19,10 +29,10 @@ require signed requests.
 from __future__ import annotations
 
 import base64
-import binascii
 import datetime
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import zlib
@@ -45,6 +55,7 @@ redirectBinding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
 postBinding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
 successStatus = "urn:oasis:names:tc:SAML:2.0:status:Success"
 bearer = "urn:oasis:names:tc:SAML:2.0:cm:bearer"
+maximumResponseLength = 1_400_000
 
 
 class SAMLRefused(ValueError):
@@ -82,19 +93,23 @@ def identityProviderFromDescriptor(root: Element, entityID: str | None = None) -
       raise SAMLRefused("the identity provider does not support SAML 2.0")
     services = [service.required("Location") for service in descriptor.childrenNamed(metadataNamespace, "SingleSignOnService")
                 if service.attribute("Binding") == redirectBinding]
-    if len(services) != 1 or not services[0].startswith("https://"):
+    singleSignOnURL = services[0] if len(services) == 1 else None
+    if singleSignOnURL is None or not singleSignOnURL.startswith("https://"):
       raise SAMLRefused(f"the metadata needs one https SingleSignOnService for the Redirect binding, got {services}")
     keys = []
     for keyDescriptor in descriptor.childrenNamed(metadataNamespace, "KeyDescriptor"):
       if keyDescriptor.attribute("use") not in (None, "signing"):
         continue
       for certificate in keyDescriptor.only(dsig, "KeyInfo").only(dsig, "X509Data").childrenNamed(dsig, "X509Certificate"):
-        keys.append(publicKeyFromCertificate(base64.b64decode("".join(certificate.text.split()), validate=True)))
-  except (XMLRefused, binascii.Error) as error:
+        keys.append(publicKeyFromCertificate(base64.b64decode("".join(certificate.simpleText.split()), validate=True)))
+  except SAMLRefused:
+    raise
+  except ValueError as error:
+    # XMLRefused, DERError, SignatureError and the base64 errors are all ValueErrors.
     raise SAMLRefused(f"the metadata is refused: {error}") from None
   if not keys:
     raise SAMLRefused("the metadata names no signing certificate")
-  return IdentityProvider(entityID=found, singleSignOnURL=services[0], signingKeys=tuple(keys))
+  return IdentityProvider(entityID=found, singleSignOnURL=singleSignOnURL, signingKeys=tuple(keys))
 
 
 @dataclass(frozen=True)
@@ -110,27 +125,31 @@ class SAMLIdentity:
   nameIDFormat: str | None
   sessionIndex: str | None
   attributes: dict[str, tuple[str, ...]] = field(repr=False)
+  sessionNotOnOrAfter: float | None = None
 
 
 class ReplayStore(Protocol):
-  """Where assertion IDs are remembered. Behind several processes, one shared store (a database table with
-  the ID as its unique key, say) so an assertion used on one process is refused on all."""
+  """Where assertion IDs are remembered, per issuer. Behind several processes, one shared store (a database
+  table with (issuer, assertion ID) as its unique key, say) so an assertion used on one process is refused on all."""
 
-  def admit(self, assertionID: str, until: float, now: float) -> None:
-    """Remember the ID until `until`; raise SAMLRefused if it is already remembered."""
+  def admit(self, issuer: str, assertionID: str, until: float, now: float) -> None:
+    """Claim (issuer, assertionID) until `until`, atomically: of concurrent claims of one pair all but one
+    raise SAMLRefused, as does any claim while an earlier one has not expired."""
 
 
 class ReplayCache:
-  """Assertion IDs seen, kept until their assertion could no longer be accepted anyway."""
+  """Assertion IDs seen per issuer in this process, kept until their assertion could no longer be accepted anyway."""
 
   def __init__(self) -> None:
-    self._seen: dict[str, float] = {}
+    self._seen: dict[tuple[str, str], float] = {}
+    self._lock = threading.Lock()
 
-  def admit(self, assertionID: str, until: float, now: float) -> None:
-    self._seen = {key: expiry for key, expiry in self._seen.items() if expiry > now}
-    if assertionID in self._seen:
-      raise SAMLRefused(f"assertion {assertionID!r} was already used")
-    self._seen[assertionID] = until
+  def admit(self, issuer: str, assertionID: str, until: float, now: float) -> None:
+    with self._lock:
+      self._seen = {key: expiry for key, expiry in self._seen.items() if expiry > now}
+      if (issuer, assertionID) in self._seen:
+        raise SAMLRefused(f"assertion {assertionID!r} was already used")
+      self._seen[(issuer, assertionID)] = until
 
 
 _instant = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?Z$")
@@ -141,7 +160,10 @@ def _time(text: str | None, what: str) -> float:
   if not match:
     raise SAMLRefused(f"{what} {text!r} is not a UTC dateTime")
   year, month, day, hour, minute, second = (int(part) for part in match.groups()[:6])
-  whole = datetime.datetime(year, month, day, hour, minute, second, tzinfo=datetime.UTC).timestamp()
+  try:
+    whole = datetime.datetime(year, month, day, hour, minute, second, tzinfo=datetime.UTC).timestamp()
+  except ValueError:
+    raise SAMLRefused(f"{what} {text!r} is not a valid instant") from None
   return whole + (float(match.group(7)) if match.group(7) else 0.0)
 
 
@@ -154,7 +176,7 @@ class ServiceProvider:
     self.identityProvider = identityProvider
     self.leewaySeconds = leewaySeconds
     self.pendingSeconds = pendingSeconds
-    self.replayCache = replayCache if replayCache is not None else ReplayCache()
+    self.replayCache: ReplayStore = replayCache if replayCache is not None else ReplayCache()
     self.clock = clock
 
   def beginSignIn(self, relayState: str | None = None) -> tuple[str, Pending]:
@@ -178,18 +200,21 @@ class ServiceProvider:
     now = self.clock()
     if now - pending.startedAt > self.pendingSeconds:
       raise SAMLRefused("the sign-in took too long; start again")
+    if len(samlResponse) > maximumResponseLength:
+      raise SAMLRefused(f"the SAMLResponse is longer than {maximumResponseLength} characters")
     try:
-      response = parse(base64.b64decode("".join(samlResponse.split()), validate=True))
-      return self._read(response, pending, now)
-    except binascii.Error:
+      document = base64.b64decode("".join(samlResponse.split()), validate=True)
+    except ValueError:
       raise SAMLRefused("the SAMLResponse is not base64") from None
+    try:
+      return self._read(parse(document), pending, now)
     except (XMLRefused, SignatureRefused) as error:
       raise SAMLRefused(str(error)) from None
 
   def _issuer(self, element: Element, required: bool) -> None:
     issuer = element.only(assertionNamespace, "Issuer") if required else element.optional(assertionNamespace, "Issuer")
-    if issuer is not None and issuer.text != self.identityProvider.entityID:
-      raise SAMLRefused(f"issued by {issuer.text!r}, not {self.identityProvider.entityID!r}")
+    if issuer is not None and issuer.simpleText != self.identityProvider.entityID:
+      raise SAMLRefused(f"issued by {issuer.simpleText!r}, not {self.identityProvider.entityID!r}")
 
   def _read(self, response: Element, pending: Pending, now: float) -> SAMLIdentity:
     if not response.isA(protocolNamespace, "Response") or response.attribute("Version") != "2.0":
@@ -218,7 +243,8 @@ class ServiceProvider:
 
   def _readAssertion(self, assertion: Element, pending: Pending, now: float) -> SAMLIdentity:
     leeway = self.leewaySeconds
-    if assertion.attribute("Version") != "2.0" or not assertion.attribute("ID"):
+    assertionID = assertion.attribute("ID")
+    if assertion.attribute("Version") != "2.0" or not assertionID:
       raise SAMLRefused("not a SAML 2.0 Assertion with an ID")
     self._issuer(assertion, required=True)
     conditions = assertion.only(assertionNamespace, "Conditions")
@@ -227,31 +253,43 @@ class ServiceProvider:
     notOnOrAfter = _time(conditions.attribute("NotOnOrAfter"), "Conditions NotOnOrAfter")
     if notOnOrAfter <= now - leeway:
       raise SAMLRefused("the assertion has expired")
-    restrictions = conditions.childrenNamed(assertionNamespace, "AudienceRestriction")
+    restrictions = conditions.elements()
+    for condition in restrictions:
+      if not condition.isA(assertionNamespace, "AudienceRestriction"):
+        raise SAMLRefused(f"the condition <{condition.localName}> is not supported, so the assertion is refused")
     if not restrictions:
       raise SAMLRefused("the assertion has no audience restriction")
     for restriction in restrictions:
-      if self.entityID not in [audience.text for audience in restriction.childrenNamed(assertionNamespace, "Audience")]:
+      if self.entityID not in [audience.simpleText for audience in restriction.childrenNamed(assertionNamespace, "Audience")]:
         raise SAMLRefused(f"the assertion is not for {self.entityID!r}")
     subject = assertion.only(assertionNamespace, "Subject")
     nameID = subject.only(assertionNamespace, "NameID")
+    if not nameID.simpleText.strip():
+      raise SAMLRefused("the assertion's NameID is blank")
     confirmations = [confirmation for confirmation in subject.childrenNamed(assertionNamespace, "SubjectConfirmation")
                      if confirmation.attribute("Method") == bearer]
     if not confirmations:
       raise SAMLRefused("the assertion has no bearer subject confirmation")
     if not any(self._confirms(confirmation, pending, now) for confirmation in confirmations):
       raise SAMLRefused("no subject confirmation is for this sign-in, this address and now")
-    statement = assertion.optional(assertionNamespace, "AuthnStatement")
+    statements = assertion.childrenNamed(assertionNamespace, "AuthnStatement")
+    if len(statements) != 1:
+      raise SAMLRefused(f"the assertion has {len(statements)} AuthnStatements; this profile needs exactly one")
+    statement = statements[0]
+    sessionEnd = statement.attribute("SessionNotOnOrAfter")
+    sessionNotOnOrAfter = _time(sessionEnd, "SessionNotOnOrAfter") if sessionEnd is not None else None
+    if sessionNotOnOrAfter is not None and sessionNotOnOrAfter <= now - leeway:
+      raise SAMLRefused("the identity provider's session has already ended")
     attributes: dict[str, tuple[str, ...]] = {}
     for attributeStatement in assertion.childrenNamed(assertionNamespace, "AttributeStatement"):
       for attribute in attributeStatement.childrenNamed(assertionNamespace, "Attribute"):
         name = attribute.required("Name")
-        values = tuple(value.text for value in attribute.childrenNamed(assertionNamespace, "AttributeValue"))
+        values = tuple(value.simpleText for value in attribute.childrenNamed(assertionNamespace, "AttributeValue"))
         attributes[name] = attributes.get(name, ()) + values
-    self.replayCache.admit(assertion.required("ID"), notOnOrAfter + leeway, now)
+    self.replayCache.admit(self.identityProvider.entityID, assertionID, notOnOrAfter + leeway, now)
     return SAMLIdentity(
-      issuer=self.identityProvider.entityID, nameID=nameID.text, nameIDFormat=nameID.attribute("Format"),
-      sessionIndex=statement.attribute("SessionIndex") if statement is not None else None, attributes=attributes,
+      issuer=self.identityProvider.entityID, nameID=nameID.simpleText, nameIDFormat=nameID.attribute("Format"),
+      sessionIndex=statement.attribute("SessionIndex"), attributes=attributes, sessionNotOnOrAfter=sessionNotOnOrAfter,
     )
 
   def _confirms(self, confirmation: Element, pending: Pending, now: float) -> bool:

@@ -5,9 +5,11 @@ Sign-in has two halves, as for OpenID Connect: `beginSignIn` gives the CAS login
 and a Pending record to keep server-side; `finishSignIn` takes it and the query the browser
 came back with. CAS has no state parameter, so the service address carries one: the ticket
 is only accepted for the sign-in this browser started, and validated against exactly the
-service address it was issued for. The ticket is checked by the CAS server itself
-(`/p3/serviceValidate`, over HTTPS), which answers the user and the attributes it releases.
-Proxy tickets and proxy-granting are not used.
+service address it was issued for. Both the CAS server and the service address must be
+https. The ticket is checked by the CAS server itself (`/p3/serviceValidate`, over HTTPS),
+which answers the user (text only) and the attributes it releases. Only service tickets
+are accepted: a proxy ticket, an answer listing proxies and an answer carrying a
+proxy-granting ticket are refused by name.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from carnelian.xmlTree import Element, XMLRefused, parse
 __all__ = ["CASRefused", "CASServer", "Pending", "CASIdentity"]
 
 casNamespace = "http://www.yale.edu/tp/cas"
-_ticketPattern = re.compile(r"^ST-[A-Za-z0-9.\-_]{1,256}$")
+_ticketPattern = re.compile(r"ST-[A-Za-z0-9.\-_]{1,256}")
 
 
 class CASRefused(ValueError):
@@ -52,6 +54,8 @@ class CASServer:
                clock: Callable[[], float] = time.time) -> None:
     if not serverURL.startswith("https://") or serverURL.endswith("/"):
       raise ValueError("serverURL must be an https address without a trailing slash")
+    if not serviceURL.startswith("https://"):
+      raise ValueError("serviceURL must be an https address")
     if "?" in serviceURL or "#" in serviceURL:
       raise ValueError("serviceURL carries no query or fragment of its own; the sign-in adds its state")
     self.serverURL, self.serviceURL, self.fetcher = serverURL, serviceURL, fetcher
@@ -67,10 +71,10 @@ class CASServer:
   def finishSignIn(self, pending: Pending, query: dict[str, str]) -> CASIdentity:
     if self.clock() - pending.startedAt > self.pendingSeconds:
       raise CASRefused("the sign-in took too long; start again")
-    if not hmac.compare_digest(str(query.get("state", "")), pending.state):
+    if not hmac.compare_digest(str(query.get("state", "")).encode("utf-8", "surrogatepass"), pending.state.encode("utf-8")):
       raise CASRefused("the sign-in's state does not match")
     ticket = query.get("ticket", "")
-    if not _ticketPattern.match(ticket):
+    if not _ticketPattern.fullmatch(ticket):
       raise CASRefused("the CAS server sent no service ticket")
     address = f"{self.serverURL}/p3/serviceValidate?" + urllib.parse.urlencode(
       {"service": self._service(pending.state), "ticket": ticket})
@@ -92,7 +96,9 @@ class CASServer:
     success = root.only(casNamespace, "authenticationSuccess")
     if success.childrenNamed(casNamespace, "proxies"):
       raise CASRefused("the ticket came through a proxy, which is refused")
-    userName = success.only(casNamespace, "user").text.strip()
+    if success.childrenNamed(casNamespace, "proxyGrantingTicket"):
+      raise CASRefused("the answer carries a proxy-granting ticket, which is refused")
+    userName = success.only(casNamespace, "user").simpleText.strip()
     if not userName:
       raise CASRefused("the CAS server named no user")
     attributes: dict[str, tuple[str, ...]] = {}

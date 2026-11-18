@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Reading XML safely, and Exclusive XML Canonicalization against libxml2 (through lxml)."""
 
+import tracemalloc
+
 import pytest
 from lxml import etree
 
+from carnelian import xmlTree
 from carnelian.xmlTree import XMLRefused, canonical, parse
 
 documents = {
@@ -75,3 +78,85 @@ def testTextRunsThroughComments():
   root = parse(b"<NameID>admin@example.org<!---->.evil.example</NameID>")
   assert root.text == "admin@example.org.evil.example"
   assert canonical(root) == b"<NameID>admin@example.org.evil.example</NameID>"
+
+
+def peakParseMemory(data):
+  tracemalloc.start()
+  try:
+    parse(data)
+    return tracemalloc.get_traced_memory()[1]
+  finally:
+    tracemalloc.stop()
+
+
+def testNamespaceDeclarationsAreNotCopiedIntoEveryElement():
+  children = b"<b/>" * 9000
+  declared = b"<r " + b" ".join(b'xmlns:p%d="urn:p%d"' % (index, index) for index in range(64)) + b">" + children + b"</r>"
+  plain = b"<r>" + children + b"</r>"
+  assert peakParseMemory(declared) - peakParseMemory(plain) < 1_000_000
+
+
+def testPrefixesResolveThroughTheAncestors():
+  root = parse(b'<p:a xmlns:p="urn:one"><p:b><p:c xmlns:p="urn:two"><p:d q:x="1" xmlns:q="urn:q"/></p:c></p:b></p:a>')
+  b = root.elements()[0]
+  c = b.elements()[0]
+  d = c.elements()[0]
+  assert (b.namespaceURI, c.namespaceURI, d.namespaceURI) == ("urn:one", "urn:two", "urn:two")
+  assert d.plainAttributes() == [("urn:q", "x", "q:x", "1")]
+
+
+def nested(depth):
+  return b"<a>" * depth + b"</a>" * depth
+
+
+def testDepthUpToTheBudgetIsRead():
+  root = parse(nested(xmlTree.maximumDepth))
+  assert len(list(root.descendants())) == xmlTree.maximumDepth - 1
+  assert canonical(root) == nested(xmlTree.maximumDepth)
+
+
+@pytest.mark.parametrize("data, message", [
+  (nested(xmlTree.maximumDepth + 1), "nested deeper than 64 elements"),
+  (nested(5000), "nested deeper than 64 elements"),
+  (b"<r>" + b"<b/>" * xmlTree.maximumElements + b"</r>", "more than 10000 elements"),
+  (b"<r " + b" ".join(b'a%d="1"' % index for index in range(xmlTree.maximumAttributes + 1)) + b"/>",
+   "more than 64 attributes"),
+  (b"<r " + b" ".join(b'xmlns:p%d="urn:p"' % index for index in range(xmlTree.maximumDeclarations + 1)) + b"/>",
+   "more than 64 namespace declarations"),
+])
+def testParseBudgetsAreRefusedByName(data, message):
+  with pytest.raises(XMLRefused, match=message):
+    parse(data)
+
+
+def testTheXMLPrefixAlwaysMeansTheXMLNamespace():
+  root = parse(b'<xml:a xmlns:xml="http://www.w3.org/XML/1998/namespace" xml:lang="en"/>')
+  assert root.isA("http://www.w3.org/XML/1998/namespace", "a")
+  assert root.attribute("lang", "http://www.w3.org/XML/1998/namespace") == "en"
+  assert parse(b"<xml:a/>").namespaceURI == "http://www.w3.org/XML/1998/namespace"
+
+
+@pytest.mark.parametrize("data, message", [
+  (b'<a xmlns:xml="urn:evil"/>', "the xml prefix cannot be bound to another namespace"),
+  (b'<p:a xmlns:p="http://www.w3.org/XML/1998/namespace"/>', "reserved namespace .* cannot be bound to another prefix"),
+  (b'<a xmlns="http://www.w3.org/XML/1998/namespace"/>', "reserved namespace .* cannot be bound to another prefix"),
+  (b'<a xmlns:p="http://www.w3.org/2000/xmlns/"/>', "reserved namespace .* cannot be bound to another prefix"),
+  (b'<a xmlns:xmlns="urn:x"/>', "the xmlns prefix cannot be declared"),
+  (b"<xmlns:a/>", "an element cannot use the xmlns prefix"),
+  (b'<p:a:b xmlns:p="urn:p"/>', "'p:a:b' is not a well-formed qualified name"),
+  (b'<a p:x:y="1" xmlns:p="urn:p"/>', "'p:x:y' is not a well-formed qualified name"),
+  (b"<:a/>", "':a' is not a well-formed qualified name"),
+  (b'<a: xmlns:a="urn:a"/>', "'a:' is not a well-formed qualified name"),
+  (b'<a xmlns:="urn:a"/>', "'xmlns:' is not a well-formed qualified name"),
+])
+def testReservedPrefixesAndMalformedNamesAreRefused(data, message):
+  with pytest.raises(XMLRefused, match=message):
+    parse(data)
+
+
+def testSimpleTextRefusesChildElementsAndInstructions():
+  assert parse(b"<NameID>ad<!---->min</NameID>").simpleText == "admin"
+  with pytest.raises(XMLRefused, match="<NameID> must hold text only"):
+    parse(b"<NameID>ad<b>m</b>in</NameID>").simpleText
+  with pytest.raises(XMLRefused, match="<NameID> must hold text only"):
+    parse(b"<NameID>ad<?x?>min</NameID>").simpleText

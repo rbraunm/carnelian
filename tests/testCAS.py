@@ -70,6 +70,22 @@ def testATicketForAnotherSignInOrOfAnotherKindIsRefused(query, why):
     client().finishSignIn(Pending(state="s1", startedAt=now - 5), query)
 
 
+@pytest.mark.parametrize("query, why", [
+  ({"state": "é", "ticket": "ST-1-abc"}, "state does not match"),
+  ({"state": "s1\udcff", "ticket": "ST-1-abc"}, "state does not match"),
+  ({"state": "s1", "ticket": "ST-1-abc\n"}, "no service ticket"),
+])
+def testMalformedCallbacksAreRefusedByName(query, why):
+  with pytest.raises(CASRefused, match=why):
+    client().finishSignIn(Pending(state="s1", startedAt=now - 5), query)
+
+
+@pytest.mark.parametrize("serviceURL", ["http://app.example.org/signin/cas/return", "app.example.org/return"])
+def testTheServiceAddressMustBeHTTPS(serviceURL):
+  with pytest.raises(ValueError, match="serviceURL must be an https address"):
+    CASServer(server, serviceURL, Recorded(b""))
+
+
 def testAnOldSignInIsRefused():
   with pytest.raises(CASRefused, match="took too long"):
     client().finishSignIn(Pending(state="s1", startedAt=now - 601), {"state": "s1", "ticket": "ST-1-abc"})
@@ -85,6 +101,12 @@ def testAnOldSignInIsRefused():
           "</cas:attributes></cas:authenticationSuccess>"), "outside the CAS namespace"),
   (b'<!DOCTYPE a [<!ENTITY x "y">]><a/>', "refused"),
   (b"<serviceResponse/>", "not a serviceResponse"),
+  (answer("<cas:authenticationSuccess><cas:user>ana</cas:user><cas:proxyGrantingTicket>PGTIOU-1</cas:proxyGrantingTicket>"
+          "</cas:authenticationSuccess>"), "proxy-granting ticket"),
+  (answer("<cas:authenticationSuccess><cas:user>ad<cas:x/>min</cas:user></cas:authenticationSuccess>"),
+   "<user> must hold text only"),
+  (answer("<cas:authenticationSuccess><cas:user>" + "<a>" * 5000 + "</a>" * 5000 + "</cas:user></cas:authenticationSuccess>"),
+   "nested deeper than 64 elements"),
 ])
 def testAnswersThatAreNotASuccessAreRefused(reply, why):
   with pytest.raises(CASRefused, match=why):

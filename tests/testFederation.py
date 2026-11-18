@@ -120,6 +120,25 @@ def testMetadataThatCannotBeTrustedIsRefused(document, why):
     federation().read(document(), entity)
 
 
+def categoryWithChild():
+  root = metadata()
+  value = root.find(".//{urn:oasis:names:tc:SAML:2.0:assertion}Attribute[@Name='http://macedir.org/entity-category']/"
+                    "{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue")
+  value.text = "http://refeds.org/category/"
+  etree.SubElement(value, "{urn:x}b").tail = "hide-from-discovery"
+  return signed(root)
+
+
+@pytest.mark.parametrize("document, why", [
+  (lambda: signed(metadata(scopes='<shibmd:Scope regexp="false">example<x:b xmlns:x="urn:x"/>.edu</shibmd:Scope>')),
+   "<Scope> must hold text only"),
+  (categoryWithChild, "<AttributeValue> must hold text only"),
+])
+def testSignedMetadataTextFieldsMustBeTextOnly(document, why):
+  with pytest.raises(SAMLRefused, match=why):
+    federation().read(document(), entity)
+
+
 def identity(value, attribute=subjectID, issuer=entity, count=1):
   return SAMLIdentity(issuer=issuer, nameID="transient", nameIDFormat=None, sessionIndex=None,
                       attributes={attribute: (value,) * count})
