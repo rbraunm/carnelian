@@ -3,9 +3,10 @@
 
 The application keeps the resources in its own Store and passes each HTTP request below its
 SCIM base URL to SCIMService.handle, which authorizes, parses, checks and answers it. Users
-(with the enterprise extension) and groups; filters with the whole RFC 7644 grammar; paging;
-attribute selection; POST, GET, PUT, PATCH and DELETE; the discovery endpoints. Not offered:
-bulk, sorting, ETags, /Me and passwords (a request carrying one is refused by name).
+(with the enterprise extension) and groups; filters with the whole RFC 7644 grammar; paging and
+sorting; attribute selection; POST, GET, PUT, PATCH and DELETE; version tags (ETags, with
+If-Match and If-None-Match); bulk requests; the discovery endpoints. Not offered: /Me, /.search
+and passwords (a request carrying one is refused by name, or with discardPasswords dropped).
 
 Strict by default: an unknown attribute, a value of the wrong type (the string "False" for a
 boolean, say), a second primary value, a duplicate key and an unknown query parameter are
@@ -20,6 +21,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import hashlib
 import json
 import math
 import re
@@ -1071,6 +1073,61 @@ def _readBodyNumber(text: str) -> int | float:
 
 
 maximumQueryLength = 16384
+maximumBulkOperations = 1000
+bulkRequestSchema = "urn:ietf:params:scim:api:messages:2.0:BulkRequest"
+bulkResponseSchema = "urn:ietf:params:scim:api:messages:2.0:BulkResponse"
+
+
+def _resolveBulkIDs(value: Any, created: dict[str, str], where: str) -> Any:
+  """Every "bulkId:name" an operation holds, as the ID its earlier POST made; a later or unknown one is refused."""
+  if isinstance(value, str):
+    for name, resourceID in created.items():
+      value = value.replace(f"bulkId:{name}", resourceID)
+    if "bulkId:" in value:
+      raise SCIMRefused(409, f"{where} refers to a bulkId no earlier operation of this request made", "invalidValue")
+    return value
+  if isinstance(value, list):
+    return [_resolveBulkIDs(item, created, where) for item in value]
+  if isinstance(value, dict):
+    return {key: _resolveBulkIDs(item, created, where) for key, item in value.items()}
+  return value
+
+
+def _version(resource: JSON) -> str:
+  """A resource's weak entity tag, derived from what it holds (its timestamps and the tag itself left out)."""
+  content = {key: value for key, value in resource.items() if key != "meta"}
+  digest = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+  return f'W/"{digest[:32]}"'
+
+
+def _matches(header: str | None, version: str) -> bool:
+  if header is None:
+    return False
+  tags = [tag.strip() for tag in header.split(",")]
+  return "*" in tags or version in tags or version.removeprefix("W/") in tags
+
+
+def _sortKey(resourceType: ResourceType, path: str, resource: JSON) -> tuple[Any, ...] | None:
+  """The value a resource sorts by: a multi-valued attribute's primary value, else its first; None when it has none."""
+  target = _resolve(resourceType, path, "invalidValue")
+  if target.attribute.type == "complex" and target.sub is None and not target.attribute.multiValued:
+    raise _invalid(f"sortBy {path} is complex: name one of its sub-attributes")
+  attribute, values = _ResourceScope(resourceType, resource).values(path)
+  if target.attribute.multiValued and target.attribute.type == "complex" and values:
+    container = _container(resource, target.schema, resourceType) or {}
+    elements = container.get(target.attribute.name, [])
+    primary = [element for element in elements if element.get("primary") is True]
+    sub = target.sub.name if target.sub is not None else "value"
+    chosen = (primary or elements)[0]
+    values = [chosen[sub]] if sub in chosen else values
+  if not values:
+    return None
+  value = values[0]
+  if attribute.type == "dateTime":
+    return (_parseTime(value, path).timestamp(),)
+  if isinstance(value, str) and not attribute.caseExact:
+    return (value.casefold(), value)
+  return (value,)
 maximumQueryParameters = 8
 
 
@@ -1134,6 +1191,11 @@ class SCIMService:
     segments = [unquote(segment) for segment in path[1:].split("/")]
     parameters = self._parameters(query)
     head = segments[0]
+    if head == "Bulk" and len(segments) == 1:
+      if method != "POST":
+        raise SCIMRefused(405, f"{method} is not allowed on /Bulk")
+      self._allow(parameters, ())
+      return self._bulk(headers, body)
     if head in ("Bulk", "Me") or segments[-1] == ".search":
       raise SCIMRefused(501, f"/{'/'.join(segments)} is not offered")
     if head in ("ServiceProviderConfig", "ResourceTypes", "Schemas"):
@@ -1154,7 +1216,13 @@ class SCIMService:
     if method == "GET":
       self._allowProjection(resourceType, parameters)
       resource = self._existing(resourceType, resourceID)
-      return self._answer(200, self._render(resourceType, resource, parameters))
+      version = _version(resource)
+      if _matches(headers.get("if-none-match"), version):
+        return self._answer(304, None, {"ETag": version})
+      return self._answer(200, self._render(resourceType, resource, parameters), {"ETag": version})
+    if method in ("PUT", "PATCH", "DELETE") and "if-match" in headers:
+      if not _matches(headers["if-match"], _version(self._existing(resourceType, resourceID))):
+        raise SCIMRefused(412, f"the {resourceType.name} has changed since the version given in If-Match")
     if method == "PUT":
       return self._replace(resourceType, resourceID, parameters, headers, body)
     if method == "PATCH":
@@ -1188,8 +1256,7 @@ class SCIMService:
   def _allow(self, parameters: dict[str, str], allowed: tuple[str, ...]) -> None:
     unknown = sorted(set(parameters) - set(allowed))
     if unknown:
-      why = " (sorting is not offered)" if {"sortBy", "sortOrder"} & set(unknown) else ""
-      raise _invalid(f"unknown query parameters {unknown}{why}")
+      raise _invalid(f"unknown query parameters {unknown}")
 
   def _allowProjection(self, resourceType: ResourceType, parameters: dict[str, str]) -> None:
     """Checked before any write, so a request refused for its projection has changed nothing."""
@@ -1269,7 +1336,7 @@ class SCIMService:
                 **resource}
     self.store.create(resourceType.name, resource)
     rendered = self._render(resourceType, resource, parameters)
-    return self._answer(201, rendered, {"Location": self._location(resourceType, resourceID)})
+    return self._answer(201, rendered, {"Location": self._location(resourceType, resourceID), "ETag": _version(resource)})
 
   def _replace(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
                body: bytes) -> SCIMResponse:
@@ -1279,7 +1346,74 @@ class SCIMService:
     self._checkResource(resourceType, resource, resourceID)
     resource = {"id": resourceID, "meta": {**existing["meta"], "lastModified": _stamp(self.clock())}, **resource}
     self.store.replace(resourceType.name, resource)
-    return self._answer(200, self._render(resourceType, resource, parameters))
+    return self._answer(200, self._render(resourceType, resource, parameters), {"ETag": _version(resource)})
+
+  def _bulk(self, headers: dict[str, str], body: bytes) -> SCIMResponse:
+    document = self._document(headers, body)
+    if not isinstance(document, dict) or document.get("schemas") != [bulkRequestSchema]:
+      raise _invalid(f"a bulk request names exactly the schema {bulkRequestSchema}", "invalidSyntax")
+    unknown = sorted(set(document) - {"schemas", "Operations", "failOnErrors"})
+    if unknown:
+      raise _invalid(f"a bulk request has unknown members {unknown}", "invalidSyntax")
+    operations = document.get("Operations")
+    if not isinstance(operations, list) or not operations:
+      raise _invalid("a bulk request needs a list of Operations", "invalidSyntax")
+    if len(operations) > maximumBulkOperations:
+      raise SCIMRefused(413, f"a bulk request may hold at most {maximumBulkOperations} operations")
+    failOnErrors = document.get("failOnErrors")
+    if failOnErrors is not None and (type(failOnErrors) is not int or failOnErrors < 1):
+      raise _invalid("failOnErrors is a whole number of at least 1", "invalidSyntax")
+    created: dict[str, str] = {}
+    answers: list[JSON] = []
+    errors = 0
+    for index, operation in enumerate(operations):
+      if failOnErrors is not None and errors >= failOnErrors:
+        break
+      answers.append(self._bulkOperation(index, operation, created))
+      errors += int(answers[-1]["status"]) >= 400
+    return self._answer(200, {"schemas": [bulkResponseSchema], "Operations": answers})
+
+  def _bulkOperation(self, index: int, operation: object, created: dict[str, str]) -> JSON:
+    where = f"Operations[{index}]"
+    if not isinstance(operation, dict):
+      raise _invalid(f"{where} must be an object", "invalidSyntax")
+    unknown = sorted(set(operation) - {"method", "bulkId", "version", "path", "data"})
+    if unknown:
+      raise _invalid(f"{where} has unknown members {unknown}", "invalidSyntax")
+    method, path, bulkId = operation.get("method"), operation.get("path"), operation.get("bulkId")
+    if method not in ("POST", "PUT", "PATCH", "DELETE") or not isinstance(path, str):
+      raise _invalid(f"{where} needs a method (POST, PUT, PATCH or DELETE) and a path", "invalidSyntax")
+    if method == "POST" and (not isinstance(bulkId, str) or not bulkId or bulkId in created):
+      raise _invalid(f"{where}: a POST needs a bulkId of its own", "invalidSyntax")
+    if not re.fullmatch(r"/(Users|Groups)(/[^/]+)?", path) or (method == "POST") != ("/" not in path[1:]):
+      raise _invalid(f"{where}: {method} {path} is not a resource operation", "invalidPath")
+    answer: JSON = {"method": method, "status": "0"}
+    if bulkId is not None:
+      answer["bulkId"] = bulkId
+    headers = {"content-type": mediaType}
+    if isinstance(operation.get("version"), str):
+      headers["if-match"] = operation["version"]
+    try:
+      path = _resolveBulkIDs(path, created, where)
+      data = _resolveBulkIDs(operation.get("data"), created, where)
+      body = b"" if method == "DELETE" else json.dumps(data, ensure_ascii=False).encode("utf-8")
+      response = self._route(method, path, "", headers, body)
+    except SCIMRefused as refused:
+      error: JSON = {"schemas": [errorSchema], "status": str(refused.status), "detail": refused.detail}
+      if refused.scimType is not None:
+        error["scimType"] = refused.scimType
+      answer.update(status=str(refused.status), response=error)
+      return answer
+    answer["status"] = str(response.status)
+    if "ETag" in response.headers:
+      answer["version"] = response.headers["ETag"]
+    if method == "POST":
+      resourceID = cast(str, json.loads(response.body)["id"])
+      created[cast(str, bulkId)] = resourceID
+      answer["location"] = response.headers["Location"]
+    elif method != "DELETE":
+      answer["location"] = f"{self.baseURL}{path}"
+    return answer
 
   def _withoutPasswords(self, document: object) -> object:
     """With discardPasswords, the request without its password (Okta sends one even when it syncs none)."""
@@ -1315,8 +1449,8 @@ class SCIMService:
     self.store.replace(resourceType.name, resource)
     # A group's member list can be long, so its PATCH answers without a body, as Entra asks.
     if resourceType is groupType and not parameters:
-      return self._answer(204, None)
-    return self._answer(200, self._render(resourceType, resource, parameters))
+      return self._answer(204, None, {"ETag": _version(resource)})
+    return self._answer(200, self._render(resourceType, resource, parameters), {"ETag": _version(resource)})
 
   def _delete(self, resourceType: ResourceType, resourceID: str) -> SCIMResponse:
     self._existing(resourceType, resourceID)
@@ -1332,8 +1466,13 @@ class SCIMService:
     return self._answer(204, None)
 
   def _list(self, resourceType: ResourceType, parameters: dict[str, str]) -> SCIMResponse:
-    self._allow(parameters, ("filter", "startIndex", "count", "attributes", "excludedAttributes"))
+    self._allow(parameters, ("filter", "startIndex", "count", "attributes", "excludedAttributes", "sortBy", "sortOrder"))
     self._projection(resourceType, parameters)
+    order = parameters.get("sortOrder", "ascending")
+    if order not in ("ascending", "descending") or ("sortOrder" in parameters and "sortBy" not in parameters):
+      raise _invalid("sortOrder is ascending or descending, and only with sortBy")
+    if "sortBy" in parameters:
+      _sortKey(resourceType, parameters["sortBy"], {"id": "", "meta": {}})
     query = None
     if "filter" in parameters:
       query = parseFilter(parameters["filter"])
@@ -1345,6 +1484,12 @@ class SCIMService:
     if count > self.maximumResults:
       raise _invalid(f"count may be at most {self.maximumResults}", "tooMany")
     found = sorted(self.store.search(resourceType.name, query), key=lambda item: (item["meta"]["created"], item["id"]))
+    if "sortBy" in parameters:
+      present = [item for item in found if _sortKey(resourceType, parameters["sortBy"], item) is not None]
+      absent = [item for item in found if _sortKey(resourceType, parameters["sortBy"], item) is None]
+      present.sort(key=lambda item: cast(tuple[Any, ...], _sortKey(resourceType, parameters["sortBy"], item)),
+                   reverse=order == "descending")
+      found = present + absent
     page = found[startIndex - 1:startIndex - 1 + count]
     return self._answer(200, {
       "schemas": [listResponseSchema], "totalResults": len(found), "itemsPerPage": len(page), "startIndex": startIndex,
@@ -1398,7 +1543,7 @@ class SCIMService:
     rendered = {"schemas": _schemasOf(resourceType, resource), "id": resource["id"]}
     core = resourceType.schema
     stored = dict(resource)
-    stored["meta"] = {**resource["meta"], "location": self._location(resourceType, resource["id"])}
+    stored["meta"] = {**resource["meta"], "location": self._location(resourceType, resource["id"]), "version": _version(resource)}
     if resourceType is userType and wanted(core, cast(Attribute, _named(core.attributes, "groups"))):
       groups = self.store.search("Group", ValuePath("members", Compare("value", "eq", resource["id"])))
       if groups:
@@ -1438,9 +1583,10 @@ class SCIMService:
         raise SCIMRefused(404, "no such endpoint")
       return self._answer(200, {
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
-        "patch": {"supported": True}, "bulk": {"supported": False, "maxOperations": 0, "maxPayloadSize": 0},
+        "patch": {"supported": True},
+        "bulk": {"supported": True, "maxOperations": maximumBulkOperations, "maxPayloadSize": self.maximumBytes},
         "filter": {"supported": True, "maxResults": self.maximumResults}, "changePassword": {"supported": False},
-        "sort": {"supported": False}, "etag": {"supported": False},
+        "sort": {"supported": True}, "etag": {"supported": True},
         "authenticationSchemes": [{"type": "oauthbearertoken", "name": "OAuth Bearer Token",
                                    "description": "A bearer token in the Authorization header", "primary": True}],
         "meta": {"resourceType": "ServiceProviderConfig", "location": f"{self.baseURL}/ServiceProviderConfig"}})

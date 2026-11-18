@@ -415,13 +415,15 @@ def testRequestsWithoutTheTokenAreRefused(service, headers):
 
 
 @pytest.mark.parametrize("method, path, query, status, scimType", [
-  ("GET", "/Users", "sortBy=userName", 400, "invalidValue"),
+  ("GET", "/Users", "sortOrder=descending", 400, "invalidValue"),
+  ("GET", "/Users", "sortBy=name", 400, "invalidValue"),
   ("GET", "/Users", "count=51", 400, "tooMany"),
   ("GET", "/Users", "startIndex=0", 400, "invalidValue"),
   ("GET", "/Users", "count=-1", 400, "invalidValue"),
   ("GET", "/Users", "count=1&count=2", 400, "invalidValue"),
   ("GET", "/Users", "attributes=userName&excludedAttributes=title", 400, "invalidValue"),
-  ("POST", "/Bulk", "", 501, None),
+  ("GET", "/Bulk", "", 405, None),
+  ("POST", "/Bulk/x", "", 501, None),
   ("GET", "/Me", "", 501, None),
   ("POST", "/Users/.search", "", 501, None),
   ("GET", "/Widgets", "", 404, None),
@@ -483,8 +485,9 @@ def testAttributesSelectWhatIsReturned(service):
 
 def testDiscoveryDescribesWhatIsOffered(service):
   status, document, _ = call(service, "GET", "/ServiceProviderConfig")
-  assert document["patch"] == {"supported": True} and document["bulk"]["supported"] is False
-  assert document["filter"] == {"supported": True, "maxResults": 50} and document["sort"] == {"supported": False}
+  assert document["patch"] == {"supported": True} and document["etag"] == {"supported": True}
+  assert document["filter"] == {"supported": True, "maxResults": 50} and document["sort"] == {"supported": True}
+  assert document["bulk"] == {"supported": True, "maxOperations": 1000, "maxPayloadSize": 1_000_000}
   status, document, _ = call(service, "GET", "/ResourceTypes/User")
   assert (document["endpoint"], document["schema"]) == ("/Users", coreUser)
   assert document["schemaExtensions"] == [{"schema": enterpriseUserSchema, "required": False}]
@@ -752,3 +755,82 @@ def testTheOktaSequence():
 def testPasswordsAreRefusedUnlessTheServiceDiscardsThem(service):
   status, document, _ = call(service, "POST", "/Users", oktaUser("test.user@okta.local"))
   assert status == 400 and "password is refused" in refused(400, document, "invalidValue")
+
+
+# ---- sorting, version tags and bulk -----------------------------------------------
+
+def testListsSortByAnAttributeWithTheUnsetLast(service):
+  for userName, title, email in (("cara", "b", "z@x.org"), ("ana", None, "m@x.org"), ("bea", "A", None)):
+    body = {"schemas": [coreUser], "userName": userName}
+    if title:
+      body["title"] = title
+    if email:
+      body["emails"] = [{"value": "first@x.org"}, {"value": email, "primary": True}]
+    created(service, "/Users", body)
+  def names(query):
+    return [user["userName"] for user in call(service, "GET", "/Users", query=query)[1]["Resources"]]
+  assert names("sortBy=userName") == ["ana", "bea", "cara"]
+  assert names("sortBy=userName&sortOrder=descending") == ["cara", "bea", "ana"]
+  assert names("sortBy=title") == ["bea", "cara", "ana"]
+  assert names("sortBy=emails") == ["ana", "cara", "bea"]
+  assert names("sortBy=meta.created&sortOrder=descending&count=2") == ["bea", "ana"]
+
+
+def testVersionTagsGuardChangesAndAnswerUnchangedReads(service):
+  user = created(service, "/Users", {"schemas": [coreUser], "userName": "ana"})
+  version = user["meta"]["version"]
+  status, document, headers = call(service, "GET", f"/Users/{user['id']}")
+  assert headers["ETag"] == version and version.startswith('W/"')
+  assert call(service, "GET", f"/Users/{user['id']}", headers={"Authorization": f"Bearer {token}", "If-None-Match": version})[0] == 304
+  stale = {"Authorization": f"Bearer {token}", "Content-Type": "application/scim+json", "If-Match": 'W/"0"'}
+  answer = service.handle("PATCH", f"/Users/{user['id']}", "", stale,
+                          json.dumps({"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "title", "value": "x"}]}).encode())
+  assert answer.status == 412
+  fresh = {**stale, "If-Match": version}
+  answer = service.handle("PATCH", f"/Users/{user['id']}", "", fresh,
+                          json.dumps({"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "title", "value": "x"}]}).encode())
+  assert answer.status == 200 and answer.headers["ETag"] != version
+  assert service.handle("DELETE", f"/Users/{user['id']}", "", fresh, b"").status == 412
+
+
+def testABulkRequestRunsInOrderWithEarlierIDsAvailableToLaterOperations(service):
+  status, document, _ = call(service, "POST", "/Bulk", {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+    "Operations": [
+      {"method": "POST", "path": "/Users", "bulkId": "ana", "data": {"schemas": [coreUser], "userName": "ana"}},
+      {"method": "POST", "path": "/Groups", "bulkId": "team",
+       "data": {"schemas": [coreGroup], "displayName": "Team", "members": [{"value": "bulkId:ana"}]}},
+      {"method": "PATCH", "path": "/Users/bulkId:ana",
+       "data": {"schemas": [patchOpSchema], "Operations": [{"op": "replace", "path": "title", "value": "Lead"}]}},
+      {"method": "POST", "path": "/Users", "bulkId": "dup", "data": {"schemas": [coreUser], "userName": "ana"}},
+      {"method": "POST", "path": "/Groups", "bulkId": "late", "data": {"schemas": [coreGroup], "displayName": "Late",
+                                                                         "members": [{"value": "bulkId:later"}]}},
+    ]})
+  assert status == 200
+  answers = document["Operations"]
+  assert [answer["status"] for answer in answers] == ["201", "201", "200", "409", "409"]
+  userID = answers[0]["location"].rsplit("/", 1)[1]
+  group = call(service, "GET", answers[1]["location"].removeprefix(baseURL))[1]
+  assert [member["value"] for member in group["members"]] == [userID]
+  assert call(service, "GET", f"/Users/{userID}")[1]["title"] == "Lead"
+  assert answers[3]["response"]["scimType"] == "uniqueness" and "bulkId" in answers[4]["response"]["detail"]
+
+
+def testABulkRequestStopsAfterFailOnErrors(service):
+  operations = [{"method": "POST", "path": "/Users", "bulkId": f"u{number}", "data": {"schemas": [coreUser], "userName": "same"}}
+                for number in range(4)]
+  status, document, _ = call(service, "POST", "/Bulk", {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"], "failOnErrors": 2, "Operations": operations})
+  assert [answer["status"] for answer in document["Operations"]] == ["201", "409", "409"]
+
+
+@pytest.mark.parametrize("operation, why", [
+  ({"method": "GET", "path": "/Users"}, "needs a method"),
+  ({"method": "POST", "path": "/Users", "data": {}}, "needs a bulkId"),
+  ({"method": "POST", "path": "/Bulk", "bulkId": "x", "data": {}}, "not a resource operation"),
+  ({"method": "DELETE", "path": "/Users"}, "not a resource operation"),
+])
+def testBulkOperationsThatAreNotResourceOperationsAreRefused(service, operation, why):
+  status, document, _ = call(service, "POST", "/Bulk", {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"], "Operations": [operation]})
+  assert status == 400 and why in refused(400, document, document.get("scimType"))
