@@ -31,8 +31,14 @@ except DirectoryRefused as refusal:
 print(person.userName, person.displayName, person.email, person.groups)
 ```
 
-`groups` holds the common names of every group the person is in, directly or through other
-groups (Active Directory's in-chain matching rule).
+`groups` holds the `sAMAccountName` of every group the person is in, directly or through
+other groups (Active Directory's in-chain matching rule). It is unique in the domain, unlike
+a group's common name, which anyone allowed to create groups in some OU could copy.
+
+Only people are found (`objectCategory=person`), not computer accounts; searches ask Active
+Directory to stay in the domain (its domain-scope control), and any referral that still
+arrives is refused rather than followed or ignored. Every operation is bounded in time,
+bytes and entries.
 
 ## What is refused
 

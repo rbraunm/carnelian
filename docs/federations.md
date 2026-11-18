@@ -42,7 +42,8 @@ person = scopedIdentifier(identity, institution, subjectID)              # e.g. 
 
 `scopedIdentifier` refuses an identifier whose scope (the part after `@`) is not one the
 federation registered for that institution, so one university cannot sign in another's
-people. Use `pairwiseID` where the institution releases it (a different identifier for each
+people. Only the scoped identifier is checked this way: the NameID, `mail` and other
+attributes are whatever the institution says, so never recognise a person by them. Use `pairwiseID` where the institution releases it (a different identifier for each
 service, better for privacy), `subjectID` for one identifier across services, and
 `eduPersonPrincipalName` where neither is released.
 

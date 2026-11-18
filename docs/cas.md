@@ -10,7 +10,7 @@ whose ticket it is (`/p3/serviceValidate`) and what attributes it releases.
 | Setting | Example |
 |---|---|
 | The CAS server's address | `https://cas.example.edu/cas` (where `/login` lives) |
-| Your service address | `https://app.example.org/signin/cas`, registered in the CAS service registry |
+| Your service address | `https://app.example.org/signin/cas` (https only), registered in the CAS service registry |
 
 Register the service address in CAS with an attribute release policy for what you need
 (for example `mail`, `displayName`, `memberOf`). Carnelian adds a `state` parameter to it

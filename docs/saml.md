@@ -73,10 +73,20 @@ changes at every sign-in; use a persistent one, or an attribute, to recognise a 
 
 A response for another destination or request, from another issuer, or with a failure
 status; an assertion that is unsigned, signed by a key not in the metadata, outside its
-time window, for another audience, without a bearer confirmation for this request and
-address, or seen before (the replay cache); the signature-wrapping attacks (anything read
-must be the element the signature covers); a DTD or entity in the XML; an encrypted
-assertion while the `keys` extra is not in use.
+time window, for another audience, without a bearer confirmation whose Recipient is your
+assertion consumer address and whose InResponseTo is this request, without exactly one
+AuthnStatement, past its SessionNotOnOrAfter, with any condition other than an audience
+restriction (OneTimeUse, ProxyRestriction), or seen before from this issuer; the
+signature-wrapping attacks (anything read must be the element the signature covers);
+element content where text is expected (an AttributeValue may be one NameID, the form
+eduPersonTargetedID takes); a DTD or entity in the XML, a document nested too deep or too
+large; an encrypted assertion (until the `keys` extra exists). The confirmation's Address
+is not checked: behind proxies and NAT it rarely matches.
 
-`ReplayCache` is kept in memory. Behind several processes, use one shared store for it, so
-an assertion used on one process is refused on the others.
+`SAMLIdentity.sessionNotOnOrAfter` is the time the provider wants the session to end, if it
+said; honour it in your session.
+
+`ReplayCache` is kept in memory, in one process. Behind several processes, give
+`ServiceProvider` a `ReplayStore` of your own: its `admit(issuer, assertionID, until, now)`
+must claim the pair atomically (a database table with the pair as its unique key) and raise
+`SAMLRefused` when it is already claimed.

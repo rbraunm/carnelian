@@ -6,11 +6,13 @@ are refused or read exactly as before."""
 import base64
 import json
 import os
+import time
 
 from hypothesis import HealthCheck, given, settings, strategies as strategies
 
-from carnelian.cas import CASRefused, CASServer
+from carnelian.cas import CASRefused, CASServer, Pending as CASPending
 from carnelian.der import DERError, publicKeyFromCertificate, readOne
+from carnelian.oidc import Pending as OpenIDConnectPending, SignInRefused
 from carnelian.jose import JOSEError, KeySet, readHeader, verifyCompact
 from carnelian.ldap import DirectoryRefused, readAll, readTLV
 from carnelian.saml import SAMLRefused
@@ -19,7 +21,7 @@ from carnelian.signatures import SignatureError
 from carnelian.xmldsig import SignatureRefused, verifyEnveloped
 from carnelian.xmlTree import XMLRefused, parse
 
-from testOIDC import idToken, jwks, good
+from testOIDC import good, idToken, jwks, now, party
 from testSAML import pending, posted, provider, response, signAssertion
 from testSCIM import MemoryStore
 
@@ -173,3 +175,31 @@ def testASignedResponseWithOneByteChangedIsRefusedOrReadTheSame(position, value)
   except SAMLRefused:
     return
   assert (identity.issuer, identity.nameID, identity.attributes) == (expected.issuer, expected.nameID, expected.attributes)
+
+
+# The pending state is one no generated query can hold, so no case reaches the provider's token or validation endpoint.
+unguessable = "0123456789abcdef" * 4
+callbackQuery = strategies.dictionaries(strategies.sampled_from(["state", "code", "ticket", "iss", "error", "error_description"]),
+                                        strategies.text(max_size=40), max_size=6)
+
+
+@fuzzed
+@given(callbackQuery)
+def testOpenIDConnectCallbacksRefuseByName(query):
+  relyingParty = party()
+  pending = OpenIDConnectPending(issuer=relyingParty.provider.issuer, clientID="app", state=unguessable, nonce="n-1",
+                                 codeVerifier="v", startedAt=now)
+  try:
+    relyingParty.finishSignIn(pending, query)
+  except SignInRefused:
+    pass
+
+
+@fuzzed
+@given(callbackQuery)
+def testCASCallbacksRefuseByName(query):
+  cas = CASServer("https://cas.example.org/cas", "https://app.example.org/cas", None)
+  try:
+    cas.finishSignIn(CASPending(state=unguessable, startedAt=time.time()), query)
+  except CASRefused:
+    pass

@@ -60,8 +60,22 @@ navigation from another site; your own session cookie can stay `Strict`.
 ## What you get
 
 `Identity` carries `issuer` and `subject` (together, the person's permanent identity at
-this provider), and `userName` (`preferred_username`), `email`, `displayName` (`name`) and
-`groups` when the provider sends them, plus every claim in `claims`.
+this provider), and `userName` (`preferred_username`), `email`, `emailVerified`,
+`displayName` (`name`) and `groups` when the provider sends them, plus every claim in
+`claims`.
+
+Recognise a person by `issuer` and `subject`, never by e-mail or user name alone: in a
+multi-tenant provider anyone can create an account with someone else's address. If you
+must link to an existing account by e-mail, do it only when `emailVerified` is true and the
+provider is one you trust for that domain.
+
+## More than one provider
+
+The `Pending` record names the issuer and client it was made for, and `finishSignIn`
+refuses a record from another provider before sending any code anywhere. When the provider
+sends `iss` with its answer (RFC 9207), it must match; when its discovery document says it
+always does, it is required. Give each provider its own redirect URI all the same, so an
+answer can only arrive where it belongs.
 
 ## Provider notes
 
