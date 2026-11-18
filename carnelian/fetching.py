@@ -12,6 +12,21 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any, Protocol
+
+__all__ = ["Fetcher", "DocumentFetcher", "JSONFetcher", "HTTPFailure", "secureContext"]
+
+JSON = dict[str, Any]
+
+
+class DocumentFetcher(Protocol):
+  def getBytes(self, url: str, accept: str) -> bytes: ...
+
+
+class JSONFetcher(Protocol):
+  def getJSON(self, url: str, headers: dict[str, str] | None = None) -> JSON: ...
+
+  def postForm(self, url: str, fields: dict[str, str], headers: dict[str, str] | None = None) -> JSON: ...
 
 
 class HTTPFailure(ValueError):
@@ -26,18 +41,18 @@ def secureContext(certificateAuthority: str | None = None) -> ssl.SSLContext:
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
-  def redirect_request(self, *arguments):
+  def redirect_request(self, *arguments: object) -> None:
     return None
 
 
 class Fetcher:
-  def __init__(self, context: ssl.SSLContext, timeoutSeconds: float = 10.0, maximumBytes: int = 1_000_000):
+  def __init__(self, context: ssl.SSLContext, timeoutSeconds: float = 10.0, maximumBytes: int = 1_000_000) -> None:
     self.context = context
     self.timeoutSeconds = timeoutSeconds
     self.maximumBytes = maximumBytes
     self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), _NoRedirects())
 
-  def _send(self, request: urllib.request.Request) -> dict:
+  def _send(self, request: urllib.request.Request) -> JSON:
     if urllib.parse.urlsplit(request.full_url).scheme != "https":
       raise HTTPFailure(f"only https is fetched, not {request.full_url}")
     try:
@@ -67,17 +82,17 @@ class Fetcher:
       raise HTTPFailure(f"only https is fetched, not {url}")
     try:
       with self._opener.open(urllib.request.Request(url, headers={"Accept": accept}), timeout=self.timeoutSeconds) as response:
-        body = response.read(self.maximumBytes + 1)
+        body: bytes = response.read(self.maximumBytes + 1)
     except (urllib.error.URLError, OSError) as error:
       raise HTTPFailure(f"{url}: {error}") from None
     if len(body) > self.maximumBytes:
       raise HTTPFailure(f"{url} answered with more than {self.maximumBytes} bytes")
     return body
 
-  def getJSON(self, url: str, headers: dict[str, str] | None = None) -> dict:
+  def getJSON(self, url: str, headers: dict[str, str] | None = None) -> JSON:
     return self._send(urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})}))
 
-  def postForm(self, url: str, fields: dict[str, str], headers: dict[str, str] | None = None) -> dict:
+  def postForm(self, url: str, fields: dict[str, str], headers: dict[str, str] | None = None) -> JSON:
     body = urllib.parse.urlencode(fields).encode("ascii")
     return self._send(urllib.request.Request(url, data=body, method="POST", headers={
       "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded", **(headers or {})}))

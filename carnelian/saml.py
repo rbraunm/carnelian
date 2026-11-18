@@ -26,12 +26,16 @@ import secrets
 import time
 import urllib.parse
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from carnelian.der import publicKeyFromCertificate
 from carnelian.signatures import ECPublicKey, RSAPublicKey
 from carnelian.xmldsig import SignatureRefused, dsig, verifyEnveloped
 from carnelian.xmlTree import Element, XMLRefused, parse
+
+__all__ = ["SAMLRefused", "IdentityProvider", "identityProviderFromMetadata", "Pending", "SAMLIdentity",
+           "ReplayCache", "ServiceProvider"]
 
 assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
 protocolNamespace = "urn:oasis:names:tc:SAML:2.0:protocol"
@@ -65,14 +69,17 @@ def identityProviderFromMetadata(metadata: bytes, entityID: str | None = None) -
 def identityProviderFromDescriptor(root: Element, entityID: str | None = None) -> IdentityProvider:
   if not root.isA(metadataNamespace, "EntityDescriptor"):
     raise SAMLRefused("the metadata is not an EntityDescriptor")
-  found = root.attribute("entityID")
+  try:
+    found = root.required("entityID")
+  except XMLRefused as error:
+    raise SAMLRefused(f"the metadata is refused: {error}") from None
   if entityID is not None and found != entityID:
     raise SAMLRefused(f"the metadata is for {found!r}, not {entityID!r}")
   try:
     descriptor = root.only(metadataNamespace, "IDPSSODescriptor")
     if "urn:oasis:names:tc:SAML:2.0:protocol" not in (descriptor.attribute("protocolSupportEnumeration") or "").split():
       raise SAMLRefused("the identity provider does not support SAML 2.0")
-    services = [service.attribute("Location") for service in descriptor.childrenNamed(metadataNamespace, "SingleSignOnService")
+    services = [service.required("Location") for service in descriptor.childrenNamed(metadataNamespace, "SingleSignOnService")
                 if service.attribute("Binding") == redirectBinding]
     if len(services) != 1 or not services[0].startswith("https://"):
       raise SAMLRefused(f"the metadata needs one https SingleSignOnService for the Redirect binding, got {services}")
@@ -107,7 +114,7 @@ class SAMLIdentity:
 class ReplayCache:
   """Assertion IDs seen, kept until their assertion could no longer be accepted anyway."""
 
-  def __init__(self):
+  def __init__(self) -> None:
     self._seen: dict[str, float] = {}
 
   def admit(self, assertionID: str, until: float, now: float) -> None:
@@ -124,13 +131,15 @@ def _time(text: str | None, what: str) -> float:
   match = _instant.match(text or "")
   if not match:
     raise SAMLRefused(f"{what} {text!r} is not a UTC dateTime")
-  whole = datetime.datetime(*(int(part) for part in match.groups()[:6]), tzinfo=datetime.UTC).timestamp()
+  year, month, day, hour, minute, second = (int(part) for part in match.groups()[:6])
+  whole = datetime.datetime(year, month, day, hour, minute, second, tzinfo=datetime.UTC).timestamp()
   return whole + (float(match.group(7)) if match.group(7) else 0.0)
 
 
 class ServiceProvider:
   def __init__(self, entityID: str, assertionConsumerURL: str, identityProvider: IdentityProvider,
-               leewaySeconds: int = 60, pendingSeconds: int = 600, replayCache: ReplayCache | None = None, clock=time.time):
+               leewaySeconds: int = 60, pendingSeconds: int = 600, replayCache: ReplayCache | None = None,
+               clock: Callable[[], float] = time.time) -> None:
     self.entityID = entityID
     self.assertionConsumerURL = assertionConsumerURL
     self.identityProvider = identityProvider
@@ -169,7 +178,7 @@ class ServiceProvider:
       raise SAMLRefused(str(error)) from None
 
   def _issuer(self, element: Element, required: bool) -> None:
-    issuer = element.only(assertionNamespace, "Issuer", required=required)
+    issuer = element.only(assertionNamespace, "Issuer") if required else element.optional(assertionNamespace, "Issuer")
     if issuer is not None and issuer.text != self.identityProvider.entityID:
       raise SAMLRefused(f"issued by {issuer.text!r}, not {self.identityProvider.entityID!r}")
 
@@ -183,7 +192,7 @@ class ServiceProvider:
     self._issuer(response, required=False)
     status = response.only(protocolNamespace, "Status").only(protocolNamespace, "StatusCode")
     if status.attribute("Value") != successStatus:
-      message = response.only(protocolNamespace, "Status").only(protocolNamespace, "StatusMessage", required=False)
+      message = response.only(protocolNamespace, "Status").optional(protocolNamespace, "StatusMessage")
       raise SAMLRefused(f"the identity provider answered {status.attribute('Value')}: {message.text if message else ''}".rstrip(": "))
     if response.childrenNamed(assertionNamespace, "EncryptedAssertion"):
       raise SAMLRefused("encrypted assertions are refused: decrypting needs a secret key; configure the provider not to encrypt")
@@ -223,14 +232,14 @@ class ServiceProvider:
       raise SAMLRefused("the assertion has no bearer subject confirmation")
     if not any(self._confirms(confirmation, pending, now) for confirmation in confirmations):
       raise SAMLRefused("no subject confirmation is for this sign-in, this address and now")
-    statement = assertion.only(assertionNamespace, "AuthnStatement", required=False)
+    statement = assertion.optional(assertionNamespace, "AuthnStatement")
     attributes: dict[str, tuple[str, ...]] = {}
     for attributeStatement in assertion.childrenNamed(assertionNamespace, "AttributeStatement"):
       for attribute in attributeStatement.childrenNamed(assertionNamespace, "Attribute"):
-        name = attribute.attribute("Name")
+        name = attribute.required("Name")
         values = tuple(value.text for value in attribute.childrenNamed(assertionNamespace, "AttributeValue"))
         attributes[name] = attributes.get(name, ()) + values
-    self.replayCache.admit(assertion.attribute("ID"), notOnOrAfter + leeway, now)
+    self.replayCache.admit(assertion.required("ID"), notOnOrAfter + leeway, now)
     return SAMLIdentity(
       issuer=self.identityProvider.entityID, nameID=nameID.text, nameIDFormat=nameID.attribute("Format"),
       sessionIndex=statement.attribute("SessionIndex") if statement is not None else None, attributes=attributes,

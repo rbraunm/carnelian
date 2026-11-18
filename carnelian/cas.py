@@ -17,10 +17,13 @@ import re
 import secrets
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from carnelian.fetching import Fetcher
-from carnelian.xmlTree import XMLRefused, parse
+from carnelian.fetching import DocumentFetcher
+from carnelian.xmlTree import Element, XMLRefused, parse
+
+__all__ = ["CASRefused", "CASServer", "Pending", "CASIdentity"]
 
 casNamespace = "http://www.yale.edu/tp/cas"
 _ticketPattern = re.compile(r"^ST-[A-Za-z0-9.\-_]{1,256}$")
@@ -45,7 +48,8 @@ class CASIdentity:
 class CASServer:
   """One CAS server (its address ends in /cas or wherever /login lives) and this service's return address."""
 
-  def __init__(self, serverURL: str, serviceURL: str, fetcher: Fetcher, pendingSeconds: int = 600, clock=time.time):
+  def __init__(self, serverURL: str, serviceURL: str, fetcher: DocumentFetcher, pendingSeconds: int = 600,
+               clock: Callable[[], float] = time.time) -> None:
     if not serverURL.startswith("https://") or serverURL.endswith("/"):
       raise ValueError("serverURL must be an https address without a trailing slash")
     if "?" in serviceURL or "#" in serviceURL:
@@ -79,10 +83,10 @@ class CASServer:
     except XMLRefused as error:
       raise CASRefused(f"the CAS server's answer is refused: {error}") from None
 
-  def _read(self, root) -> CASIdentity:
+  def _read(self, root: Element) -> CASIdentity:
     if not root.isA(casNamespace, "serviceResponse"):
       raise CASRefused("the CAS server's answer is not a serviceResponse")
-    failure = root.only(casNamespace, "authenticationFailure", required=False)
+    failure = root.optional(casNamespace, "authenticationFailure")
     if failure is not None:
       raise CASRefused(f"the CAS server refused the ticket: {failure.attribute('code')} {failure.text.strip()}".rstrip())
     success = root.only(casNamespace, "authenticationSuccess")
@@ -92,7 +96,7 @@ class CASServer:
     if not userName:
       raise CASRefused("the CAS server named no user")
     attributes: dict[str, tuple[str, ...]] = {}
-    released = success.only(casNamespace, "attributes", required=False)
+    released = success.optional(casNamespace, "attributes")
     if released is not None:
       for attribute in released.elements():
         if attribute.namespaceURI != casNamespace:

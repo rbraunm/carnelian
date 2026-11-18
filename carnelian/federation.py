@@ -21,13 +21,18 @@ from __future__ import annotations
 import re
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from carnelian.der import publicKeyFromCertificate
-from carnelian.fetching import Fetcher
+from carnelian.fetching import DocumentFetcher
 from carnelian.saml import IdentityProvider, SAMLIdentity, SAMLRefused, _attribute, _time, identityProviderFromDescriptor, metadataNamespace
 from carnelian.xmldsig import SignatureRefused, verifyEnveloped
-from carnelian.xmlTree import XMLRefused, parse
+from carnelian.xmlTree import Element, XMLRefused, parse
+
+__all__ = ["Federation", "Institution", "scopedIdentifier", "serviceProviderMetadata", "subjectID", "pairwiseID",
+           "eduPersonPrincipalName", "mail", "displayName", "givenName", "surname", "researchAndScholarship",
+           "hideFromDiscovery"]
 
 shibbolethMetadata = "urn:mace:shibboleth:metadata:1.0"
 uiNamespace = "urn:oasis:names:tc:SAML:metadata:ui"
@@ -77,35 +82,35 @@ class Institution:
     return hideFromDiscovery in self.entityCategories
 
 
-def _institution(root, signedBy: str) -> Institution:
+def _institution(root: Element, signedBy: str) -> Institution:
   identityProvider = identityProviderFromDescriptor(root)
   validUntil = _time(root.attribute("validUntil"), "the metadata's validUntil")
   descriptor = root.only(metadataNamespace, "IDPSSODescriptor")
   scopes, names = [], {}
-  extensions = descriptor.only(metadataNamespace, "Extensions", required=False)
+  extensions = descriptor.optional(metadataNamespace, "Extensions")
   if extensions is not None:
     for scope in extensions.childrenNamed(shibbolethMetadata, "Scope"):
       if scope.attribute("regexp") not in (None, "false", "0"):
         raise SAMLRefused(f"{root.attribute('entityID')} has a scope written as a regular expression, which is refused")
       if scope.text.strip().lower() not in scopes:
         scopes.append(scope.text.strip().lower())
-    information = extensions.only(uiNamespace, "UIInfo", required=False)
+    information = extensions.optional(uiNamespace, "UIInfo")
     if information is not None:
       for name in information.childrenNamed(uiNamespace, "DisplayName"):
         names[name.attribute("lang", "http://www.w3.org/XML/1998/namespace") or ""] = name.text.strip()
   authority, categories = None, []
-  entityExtensions = root.only(metadataNamespace, "Extensions", required=False)
+  entityExtensions = root.optional(metadataNamespace, "Extensions")
   if entityExtensions is not None:
-    registration = entityExtensions.only(registrationNamespace, "RegistrationInfo", required=False)
+    registration = entityExtensions.optional(registrationNamespace, "RegistrationInfo")
     authority = registration.attribute("registrationAuthority") if registration is not None else None
-    attributes = entityExtensions.only(entityAttributeNamespace, "EntityAttributes", required=False)
+    attributes = entityExtensions.optional(entityAttributeNamespace, "EntityAttributes")
     if attributes is not None:
       for attribute in attributes.childrenNamed(assertionNamespace, "Attribute"):
         if attribute.attribute("Name") == entityCategory:
           categories += [value.text.strip() for value in attribute.childrenNamed(assertionNamespace, "AttributeValue")]
   if not scopes:
     raise SAMLRefused(f"{root.attribute('entityID')} has no scope in {signedBy}'s metadata, so it can vouch for no one")
-  return Institution(entityID=root.attribute("entityID"), displayNames=names, registrationAuthority=authority,
+  return Institution(entityID=root.required("entityID"), displayNames=names, registrationAuthority=authority,
                      entityCategories=tuple(categories), scopes=tuple(scopes), identityProvider=identityProvider,
                      validUntil=validUntil)
 
@@ -113,8 +118,8 @@ def _institution(root, signedBy: str) -> Institution:
 class Federation:
   """A federation's institutions, fetched one by one from its MDQ service and checked against its signing certificate."""
 
-  def __init__(self, name: str, mdqURL: str, signingCertificate: str | bytes, fetcher: Fetcher,
-               maximumCacheSeconds: float = 6 * 3600, clock=time.time):
+  def __init__(self, name: str, mdqURL: str, signingCertificate: str | bytes, fetcher: DocumentFetcher,
+               maximumCacheSeconds: float = 6 * 3600, clock: Callable[[], float] = time.time) -> None:
     if not mdqURL.startswith("https://") or mdqURL.endswith("/"):
       raise ValueError("mdqURL must be an https address without a trailing slash")
     self.name, self.mdqURL, self.fetcher = name, mdqURL, fetcher

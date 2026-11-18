@@ -25,8 +25,13 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Mapping, Protocol
+from collections.abc import Iterable
+from typing import Any, Callable, Mapping, NoReturn, Protocol, cast
 from urllib.parse import parse_qsl, unquote
+
+__all__ = ["SCIMRefused", "SCIMService", "SCIMResponse", "Store", "Filter", "ResourceType", "userType", "groupType",
+           "resourceTypes", "parseFilter", "matches", "Compare", "Present", "And", "Or", "Not", "ValuePath",
+           "coreUserSchema", "coreGroupSchema", "enterpriseUserSchema"]
 
 coreUserSchema = "urn:ietf:params:scim:schemas:core:2.0:User"
 coreGroupSchema = "urn:ietf:params:scim:schemas:core:2.0:Group"
@@ -37,11 +42,13 @@ patchOpSchema = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
 errorSchema = "urn:ietf:params:scim:api:messages:2.0:Error"
 mediaType = "application/scim+json"
 
+JSON = dict[str, Any]
+
 
 class SCIMRefused(ValueError):
   """A request refused, with its HTTP status, the RFC 7644 scimType when one fits, and why."""
 
-  def __init__(self, status: int, detail: str, scimType: str | None = None):
+  def __init__(self, status: int, detail: str, scimType: str | None = None) -> None:
     super().__init__(detail)
     self.status, self.detail, self.scimType = status, detail, scimType
 
@@ -70,7 +77,7 @@ class Attribute:
   def sub(self, name: str) -> Attribute | None:
     return _named(self.subAttributes, name)
 
-  def definition(self) -> dict:
+  def definition(self) -> dict[str, object]:
     described = {"name": self.name, "type": self.type, "multiValued": self.multiValued, "required": self.required,
                  "caseExact": self.caseExact, "mutability": self.mutability, "returned": self.returned,
                  "uniqueness": self.uniqueness}
@@ -83,7 +90,7 @@ class Attribute:
     return described
 
 
-def _named(attributes, name: str):
+def _named(attributes: Iterable[Attribute], name: str) -> Attribute | None:
   lowered = name.lower()
   for attribute in attributes:
     if attribute.name.lower() == lowered:
@@ -99,7 +106,8 @@ class Schema:
   attributes: tuple[Attribute, ...]
 
 
-def _plural(name: str, valueType: str = "string", types: tuple[str, ...] = (), referenceTypes: tuple[str, ...] = ()):
+def _plural(name: str, valueType: str = "string", types: tuple[str, ...] = (),
+            referenceTypes: tuple[str, ...] = ()) -> Attribute:
   return Attribute(name, "complex", multiValued=True, subAttributes=(
     Attribute("value", valueType, referenceTypes=referenceTypes), Attribute("display"),
     Attribute("type", canonicalValues=types), Attribute("primary", "boolean")))
@@ -221,12 +229,13 @@ def _resolve(resourceType: ResourceType, text: str, scimType: str) -> _Target:
   return _Target(schema, attribute, sub)
 
 
-def _container(resource: dict, schema: Schema, resourceType: ResourceType, create: bool = False) -> dict | None:
-  if schema is resourceType.schema:
-    return resource
-  if create:
-    return resource.setdefault(schema.id, {})
-  return resource.get(schema.id)
+def _container(resource: JSON, schema: Schema, resourceType: ResourceType) -> JSON | None:
+  """Where a schema's attributes are kept: the resource itself for the core schema, else its extension's object."""
+  return resource if schema is resourceType.schema else resource.get(schema.id)
+
+
+def _writableContainer(resource: JSON, schema: Schema, resourceType: ResourceType) -> JSON:
+  return resource if schema is resourceType.schema else resource.setdefault(schema.id, {})
 
 
 # ---- values -----------------------------------------------------------------
@@ -248,7 +257,7 @@ def _parseTime(text: str, where: str, scimType: str = "invalidValue") -> datetim
   return moment
 
 
-def _readSingle(attribute: Attribute, value, where: str, patching: bool):
+def _readSingle(attribute: Attribute, value: object, where: str, patching: bool) -> Any:
   if value is None:
     return _absent
   if attribute.type == "complex":
@@ -302,7 +311,7 @@ def _readSingle(attribute: Attribute, value, where: str, patching: bool):
   return value
 
 
-def _readValue(attribute: Attribute, value, where: str, patching: bool):
+def _readValue(attribute: Attribute, value: object, where: str, patching: bool) -> Any:
   if value is None:
     return _absent
   if not attribute.multiValued:
@@ -315,16 +324,17 @@ def _readValue(attribute: Attribute, value, where: str, patching: bool):
   return items or _absent
 
 
-def _checkPrimary(attribute: Attribute, items: list, where: str) -> None:
+def _checkPrimary(attribute: Attribute, items: list[Any], where: str) -> None:
   if attribute.type == "complex" and sum(1 for item in items if item.get("primary") is True) > 1:
     raise _invalid(f"{where} has more than one primary value")
 
 
-def _readResource(resourceType: ResourceType, document) -> dict:
+def _readResource(resourceType: ResourceType, document: object) -> JSON:
   if not isinstance(document, dict):
     raise _invalid("the resource must be a JSON object", "invalidSyntax")
   declared = _declaredSchemas(resourceType, document)
-  resource, seen = {}, set()
+  resource: JSON = {}
+  seen: set[tuple[str, str]] = set()
   for key, value in document.items():
     if key.lower() == "schemas":
       continue
@@ -353,7 +363,7 @@ def _readResource(resourceType: ResourceType, document) -> dict:
   return resource
 
 
-def _declaredSchemas(resourceType: ResourceType, document: dict) -> set[str]:
+def _declaredSchemas(resourceType: ResourceType, document: JSON) -> set[str]:
   schemas = [value for key, value in document.items() if key.lower() == "schemas"]
   if len(schemas) != 1 or not isinstance(schemas[0], list) or not all(isinstance(uri, str) for uri in schemas[0]):
     raise _invalid("schemas must be a list of schema URIs", "invalidSyntax")
@@ -369,7 +379,8 @@ def _declaredSchemas(resourceType: ResourceType, document: dict) -> set[str]:
   return declared
 
 
-def _putRead(resource: dict, resourceType: ResourceType, target: _Target, value, seen: set) -> None:
+def _putRead(resource: JSON, resourceType: ResourceType, target: _Target, value: object,
+             seen: set[tuple[str, str]]) -> None:
   key = (target.schema.id, target.attribute.name)
   if key in seen:
     raise _invalid(f"{target.attribute.name} appears twice", "invalidSyntax")
@@ -378,10 +389,10 @@ def _putRead(resource: dict, resourceType: ResourceType, target: _Target, value,
     return
   read = _readValue(target.attribute, value, target.attribute.name, patching=False)
   if read is not _absent:
-    _container(resource, target.schema, resourceType, create=True)[target.attribute.name] = read
+    _writableContainer(resource, target.schema, resourceType)[target.attribute.name] = read
 
 
-def _checkRequired(resourceType: ResourceType, resource: dict) -> None:
+def _checkRequired(resourceType: ResourceType, resource: JSON) -> None:
   for schema in (resourceType.schema,) + resourceType.extensions:
     container = _container(resource, schema, resourceType)
     if container is None:
@@ -409,19 +420,19 @@ class Present:
 
 @dataclass(frozen=True)
 class And:
-  left: object
-  right: object
+  left: Filter
+  right: Filter
 
 
 @dataclass(frozen=True)
 class Or:
-  left: object
-  right: object
+  left: Filter
+  right: Filter
 
 
 @dataclass(frozen=True)
 class Not:
-  inner: object
+  inner: Filter
 
 
 @dataclass(frozen=True)
@@ -429,7 +440,11 @@ class ValuePath:
   """attribute[filter]: some value of a multi-valued complex attribute matches the inner filter."""
 
   path: str
-  inner: object
+  inner: Filter
+
+
+Filter = Compare | Present | And | Or | Not | ValuePath
+_token = tuple[str, str, int, int]
 
 
 comparisonOperators = ("eq", "ne", "co", "sw", "ew", "gt", "lt", "ge", "le")
@@ -440,10 +455,11 @@ maximumFilterDepth = 32
 
 
 class _FilterParser:
-  def __init__(self, text: str):
+  def __init__(self, text: str) -> None:
     if len(text) > maximumFilterLength:
       raise _invalid(f"a filter longer than {maximumFilterLength} characters", "invalidFilter")
-    self.tokens, position = [], 0
+    self.tokens: list[_token] = []
+    position = 0
     while position < len(text):
       if not text[position:].strip():
         break
@@ -451,17 +467,19 @@ class _FilterParser:
       if found is None:
         raise _invalid(f"the filter cannot be read at character {position}", "invalidFilter")
       kind = found.lastgroup
+      if kind is None:
+        raise _invalid(f"the filter cannot be read at character {position}", "invalidFilter")
       self.tokens.append((kind, found.group(kind), found.start(kind), found.end(kind)))
       position = found.end()
     self.index, self.depth, self.inValuePath = 0, 0, False
 
-  def fail(self, why: str):
+  def fail(self, why: str) -> NoReturn:
     raise _invalid(f"the filter {why}", "invalidFilter")
 
-  def peek(self):
+  def peek(self) -> _token | tuple[None, None, None, None]:
     return self.tokens[self.index] if self.index < len(self.tokens) else (None, None, None, None)
 
-  def take(self):
+  def take(self) -> _token:
     token = self.peek()
     if token[0] is None:
       self.fail("ends too early")
@@ -470,20 +488,20 @@ class _FilterParser:
 
   def isWord(self, word: str) -> bool:
     kind, text, _, _ = self.peek()
-    return kind == "word" and text.lower() == word
+    return kind == "word" and cast(str, text).lower() == word
 
   def expectMark(self, mark: str) -> None:
     kind, text, _, _ = self.take()
     if kind != "mark" or text != mark:
       self.fail(f"needs {mark!r} where it has {text!r}")
 
-  def parse(self):
+  def parse(self) -> Filter:
     node = self.orExpression()
     if self.index != len(self.tokens):
       self.fail(f"has {self.peek()[1]!r} left over")
     return node
 
-  def orExpression(self):
+  def orExpression(self) -> Filter:
     self.depth += 1
     if self.depth > maximumFilterDepth:
       self.fail(f"nests deeper than {maximumFilterDepth}")
@@ -494,14 +512,14 @@ class _FilterParser:
     self.depth -= 1
     return node
 
-  def andExpression(self):
+  def andExpression(self) -> Filter:
     node = self.notExpression()
     while self.isWord("and"):
       self.take()
       node = And(node, self.notExpression())
     return node
 
-  def notExpression(self):
+  def notExpression(self) -> Filter:
     if self.isWord("not"):
       self.take()
       self.expectMark("(")
@@ -510,7 +528,7 @@ class _FilterParser:
       return Not(inner)
     return self.primary()
 
-  def primary(self):
+  def primary(self) -> Filter:
     kind, text, _, _ = self.peek()
     if kind == "mark" and text == "(":
       self.take()
@@ -531,13 +549,13 @@ class _FilterParser:
       if (kind, text) != ("mark", "]"):
         self.fail(f"needs ']' where it has {text!r}")
       nextKind, nextText, nextStart, _ = self.peek()
-      if nextKind == "word" and nextText.startswith(".") and nextStart == closed:
+      if nextKind == "word" and cast(str, nextText).startswith(".") and nextStart == closed:
         self.take()
-        inner = And(inner, self.comparison(nextText[1:]))
+        inner = And(inner, self.comparison(cast(str, nextText)[1:]))
       return ValuePath(path, inner)
     return self.comparison(path)
 
-  def comparison(self, path: str):
+  def comparison(self, path: str) -> Compare | Present:
     kind, operator, _, _ = self.take()
     operator = (operator or "").lower()
     if kind != "word":
@@ -561,12 +579,12 @@ class _FilterParser:
     return Compare(path, operator, value)
 
 
-def parseFilter(text: str):
+def parseFilter(text: str) -> Filter:
   return _FilterParser(text).parse()
 
 
 class _ResourceScope:
-  def __init__(self, resourceType: ResourceType, resource: dict):
+  def __init__(self, resourceType: ResourceType, resource: JSON) -> None:
     self.resourceType, self.resource = resourceType, resource
 
   def target(self, path: str) -> _Target:
@@ -575,14 +593,14 @@ class _ResourceScope:
       raise _invalid("filter memberships through the members of /Groups, not a user's groups", "invalidFilter")
     return target
 
-  def values(self, path: str):
+  def values(self, path: str) -> tuple[Attribute, list[Any]]:
     if path.lower() == "schemas":
       return schemasAttribute, _schemasOf(self.resourceType, self.resource)
     target = self.target(path)
     container = _container(self.resource, target.schema, self.resourceType) or {}
     return _collect(target.attribute, target.sub, container.get(target.attribute.name))
 
-  def elements(self, path: str):
+  def elements(self, path: str) -> tuple[Attribute, list[Any]]:
     target = self.target(path)
     if target.attribute.type != "complex" or target.sub is not None:
       raise _invalid(f"{path}[...] needs a complex attribute", "invalidFilter")
@@ -592,20 +610,20 @@ class _ResourceScope:
 
 
 class _ElementScope:
-  def __init__(self, attribute: Attribute, element: dict):
+  def __init__(self, attribute: Attribute, element: JSON) -> None:
     self.attribute, self.element = attribute, element
 
-  def values(self, path: str):
+  def values(self, path: str) -> tuple[Attribute, list[Any]]:
     sub = self.attribute.sub(path)
     if sub is None:
       raise _invalid(f"{self.attribute.name} has no sub-attribute {path}", "invalidFilter")
     return sub, ([self.element[sub.name]] if sub.name in self.element else [])
 
-  def elements(self, path: str):
+  def elements(self, path: str) -> NoReturn:
     raise _invalid("a [] filter cannot hold another", "invalidFilter")
 
 
-def _collect(attribute: Attribute, sub: Attribute | None, raw):
+def _collect(attribute: Attribute, sub: Attribute | None, raw: Any) -> tuple[Attribute, list[Any]]:
   items = raw if isinstance(raw, list) else [] if raw is None else [raw]
   if attribute.type != "complex":
     return attribute, items
@@ -616,7 +634,7 @@ def _collect(attribute: Attribute, sub: Attribute | None, raw):
   return sub, [item[sub.name] for item in items if sub.name in item]
 
 
-def _evaluate(node, scope) -> bool:
+def _evaluate(node: Filter, scope: _ResourceScope | _ElementScope) -> bool:
   if isinstance(node, And):
     return _evaluate(node.left, scope) and _evaluate(node.right, scope)
   if isinstance(node, Or):
@@ -635,7 +653,7 @@ def _evaluate(node, scope) -> bool:
   raise TypeError(f"not a filter: {node!r}")
 
 
-def _compare(attribute: Attribute, values: list, operator: str, operand, path: str) -> bool:
+def _compare(attribute: Attribute, values: list[Any], operator: str, operand: object, path: str) -> bool:
   if operand is None:
     if operator == "eq":
       return not values
@@ -648,7 +666,7 @@ def _compare(attribute: Attribute, values: list, operator: str, operand, path: s
   if kind == "boolean":
     if type(operand) is not bool or operator not in ("eq", "ne"):
       raise _invalid(f"{path} is a boolean: compare it with eq or ne and true or false", "invalidFilter")
-    key = lambda value: value
+    key: Callable[[Any], Any] = lambda value: value
   elif kind in ("integer", "decimal"):
     if type(operand) not in (int, float) or operator in ("co", "sw", "ew"):
       raise _invalid(f"{path} is a number: compare it with a number", "invalidFilter")
@@ -673,18 +691,19 @@ def _compare(attribute: Attribute, values: list, operator: str, operand, path: s
     return operand in keys
   if operator == "ne":
     return operand not in keys
-  tests = {"co": lambda value: operand in value, "sw": lambda value: value.startswith(operand),
-           "ew": lambda value: value.endswith(operand), "gt": lambda value: value > operand,
-           "ge": lambda value: value >= operand, "lt": lambda value: value < operand, "le": lambda value: value <= operand}
+  tests: dict[str, Callable[[Any], bool]] = {
+    "co": lambda value: operand in value, "sw": lambda value: value.startswith(operand),
+    "ew": lambda value: value.endswith(operand), "gt": lambda value: value > operand,
+    "ge": lambda value: value >= operand, "lt": lambda value: value < operand, "le": lambda value: value <= operand}
   return any(tests[operator](value) for value in keys)
 
 
-def matches(resourceType: ResourceType, query, resource: dict) -> bool:
+def matches(resourceType: ResourceType, query: Filter, resource: JSON) -> bool:
   """Whether a stored resource matches a parsed filter; for stores that filter in memory."""
   return _evaluate(query, _ResourceScope(resourceType, resource))
 
 
-def _walk(node, scope) -> None:
+def _walk(node: Filter, scope: _ResourceScope | _ElementScope) -> None:
   """Every attribute a filter names exists and every value fits its type, before any store sees it."""
   if isinstance(node, (And, Or)):
     _walk(node.left, scope)
@@ -703,15 +722,15 @@ def _walk(node, scope) -> None:
     raise TypeError(f"not a filter: {node!r}")
 
 
-def _checkFilter(resourceType: ResourceType, query) -> None:
+def _checkFilter(resourceType: ResourceType, query: Filter) -> None:
   _walk(query, _ResourceScope(resourceType, {}))
 
 
-def _checkElementFilter(attribute: Attribute, query) -> None:
+def _checkElementFilter(attribute: Attribute, query: Filter) -> None:
   _walk(query, _ElementScope(attribute, {}))
 
 
-def _schemasOf(resourceType: ResourceType, resource: dict) -> list[str]:
+def _schemasOf(resourceType: ResourceType, resource: JSON) -> list[str]:
   return [resourceType.schema.id] + [schema.id for schema in resourceType.extensions if schema.id in resource]
 
 
@@ -720,7 +739,7 @@ def _schemasOf(resourceType: ResourceType, resource: dict) -> list[str]:
 _patchPathPattern = re.compile(r"([^\[\]]+)(?:\[(.*)\](?:\.([A-Za-z0-9_$-]+))?)?", re.DOTALL)
 
 
-def _patchPath(resourceType: ResourceType, text: str):
+def _patchPath(resourceType: ResourceType, text: str) -> tuple[_Target, Filter | None]:
   found = _patchPathPattern.fullmatch(text)
   if found is None:
     raise _invalid(f"the path {text!r} cannot be read", "invalidPath")
@@ -740,14 +759,14 @@ def _patchPath(resourceType: ResourceType, text: str):
   return _Target(target.schema, target.attribute, sub), query
 
 
-def _field(document: dict, name: str, where: str):
+def _field(document: JSON, name: str, where: str) -> Any:
   found = [value for key, value in document.items() if key.lower() == name.lower()]
   if len(found) > 1:
     raise _invalid(f"{where} names {name} twice", "invalidSyntax")
   return found[0] if found else _absent
 
 
-def _applyPatch(resourceType: ResourceType, resource: dict, document) -> dict:
+def _applyPatch(resourceType: ResourceType, resource: JSON, document: object) -> JSON:
   if not isinstance(document, dict):
     raise _invalid("a PATCH body must be a JSON object", "invalidSyntax")
   schemas = _field(document, "schemas", "the PATCH body")
@@ -806,11 +825,13 @@ def _applyPatch(resourceType: ResourceType, resource: dict, document) -> dict:
   return work
 
 
-def _apply(work: dict, resourceType: ResourceType, op: str, target: _Target, query, value, where: str) -> None:
+def _apply(work: JSON, resourceType: ResourceType, op: str, target: _Target, query: Filter | None, value: object,
+           where: str) -> None:
   attribute, sub = target.attribute, target.sub
   if attribute.mutability == "readOnly" or (sub is not None and sub.mutability == "readOnly"):
     raise _invalid(f"{attribute.name} is read-only", "mutability")
-  container = _container(work, target.schema, resourceType, create=op != "remove")
+  container = (_container(work, target.schema, resourceType) if op == "remove"
+               else _writableContainer(work, target.schema, resourceType))
   if container is None:
     return
   name = attribute.name
@@ -820,7 +841,8 @@ def _apply(work: dict, resourceType: ResourceType, op: str, target: _Target, que
   elif value is _absent:
     raise _invalid(f"{where}: {op} needs a value", "invalidSyntax")
   elif query is not None:
-    found = [element for element in current or [] if _evaluate(query, _ElementScope(attribute, element))]
+    values = current or []
+    found = [element for element in values if _evaluate(query, _ElementScope(attribute, element))]
     if not found:
       raise _invalid(f"{where}: the filter matches no value of {name}", "noTarget")
     if sub is None:
@@ -828,7 +850,7 @@ def _apply(work: dict, resourceType: ResourceType, op: str, target: _Target, que
         raise _invalid(f"{where}: add to a filtered value needs a sub-attribute", "invalidPath")
       replacement = _readSingle(attribute, value, where, True)
       rebuilt = []
-      for element in current:
+      for element in values:
         if not any(element is match for match in found):
           rebuilt.append(element)
         elif replacement is not _absent:
@@ -837,7 +859,7 @@ def _apply(work: dict, resourceType: ResourceType, op: str, target: _Target, que
     else:
       read = _readSingle(sub, value, where, True)
       if read is not _absent and sub.name == "primary" and read is True:
-        for element in current:
+        for element in values:
           element.pop("primary", None)
       for element in found:
         if read is _absent:
@@ -880,16 +902,19 @@ def _apply(work: dict, resourceType: ResourceType, op: str, target: _Target, que
     _checkPrimary(attribute, container[name], name)
 
 
-def _sameValue(attribute: Attribute, left, right) -> bool:
+def _sameValue(attribute: Attribute, left: Any, right: Any) -> bool:
   if attribute.type == "complex" and "value" in left and "value" in right:
     valueAttribute = attribute.sub("value")
+    if valueAttribute is None:
+      raise TypeError(f"{attribute.name} has no value sub-attribute")
     if valueAttribute.caseExact or not isinstance(left["value"], str):
-      return left["value"] == right["value"]
-    return left["value"].casefold() == right["value"].casefold()
-  return left == right
+      return cast(bool, left["value"] == right["value"])
+    return cast(bool, left["value"].casefold() == right["value"].casefold())
+  return cast(bool, left == right)
 
 
-def _remove(container: dict, attribute: Attribute, sub, query, value, where: str) -> None:
+def _remove(container: JSON, attribute: Attribute, sub: Attribute | None, query: Filter | None, value: object,
+            where: str) -> None:
   name = attribute.name
   current = container.get(name)
   if value is not _absent and not (attribute.multiValued and query is None and sub is None):
@@ -909,8 +934,9 @@ def _remove(container: dict, attribute: Attribute, sub, query, value, where: str
                        if not any(_sameValue(attribute, element, item) for item in listed)]
   elif query is None:
     if attribute.multiValued:
-      raise _invalid(f"{where}: name which {name} value with a filter, as {name}[...].{sub.name}", "invalidPath")
-    current.pop(sub.name, None)
+      raise _invalid(f"{where}: name which {name} value with a filter, as {name}[...].{cast(Attribute, sub).name}",
+                     "invalidPath")
+    current.pop(cast(Attribute, sub).name, None)
   else:
     found = [element for element in current if _evaluate(query, _ElementScope(attribute, element))]
     if sub is None:
@@ -930,15 +956,15 @@ class Store(Protocol):
   `matches` evaluates one in memory. create and replace raise SCIMRefused(409, ..., "uniqueness")
   when the store's own unique constraints refuse the resource."""
 
-  def create(self, resourceType: str, resource: dict) -> None: ...
+  def create(self, resourceType: str, resource: JSON) -> None: ...
 
-  def get(self, resourceType: str, resourceID: str) -> dict | None: ...
+  def get(self, resourceType: str, resourceID: str) -> JSON | None: ...
 
-  def replace(self, resourceType: str, resource: dict) -> None: ...
+  def replace(self, resourceType: str, resource: JSON) -> None: ...
 
   def delete(self, resourceType: str, resourceID: str) -> None: ...
 
-  def search(self, resourceType: str, query) -> list[dict]: ...
+  def search(self, resourceType: str, query: Filter | None) -> list[JSON]: ...
 
 
 # ---- the service ------------------------------------------------------------
@@ -957,7 +983,7 @@ def _stamp(moment: datetime) -> str:
   return f"{moment:%Y-%m-%dT%H:%M:%S}.{moment.microsecond // 1000:03d}Z"
 
 
-def _refuseDuplicates(pairs):
+def _refuseDuplicates(pairs: list[tuple[str, Any]]) -> JSON:
   result = {}
   for key, value in pairs:
     if key in result:
@@ -966,7 +992,7 @@ def _refuseDuplicates(pairs):
   return result
 
 
-def _refuseConstant(name):
+def _refuseConstant(name: str) -> NoReturn:
   raise _invalid(f"the body holds {name}, which is not JSON", "invalidSyntax")
 
 
@@ -975,7 +1001,7 @@ class SCIMService:
 
   def __init__(self, store: Store, baseURL: str, isAuthorized: Callable[[str], bool], pageSize: int = 100,
                maximumResults: int = 200, maximumBytes: int = 1_000_000,
-               clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+               clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
     if not baseURL.startswith("https://") or baseURL.endswith("/"):
       raise ValueError("baseURL must be an https URL without a trailing slash")
     if not 0 < pageSize <= maximumResults:
@@ -1002,14 +1028,14 @@ class SCIMService:
     if scheme.lower() != "bearer" or not token.strip() or not self.isAuthorized(token.strip()):
       raise SCIMRefused(401, "the bearer token is not accepted")
 
-  def _answer(self, status: int, document: dict | None, extra: dict | None = None) -> SCIMResponse:
+  def _answer(self, status: int, document: JSON | None, extra: dict[str, str] | None = None) -> SCIMResponse:
     headers = dict(extra or {})
     if document is None:
       return SCIMResponse(status, headers, b"")
     headers["Content-Type"] = mediaType
     return SCIMResponse(status, headers, json.dumps(document, ensure_ascii=False).encode("utf-8"))
 
-  def _route(self, method: str, path: str, query: str, headers: dict, body: bytes) -> SCIMResponse:
+  def _route(self, method: str, path: str, query: str, headers: dict[str, str], body: bytes) -> SCIMResponse:
     if not path.startswith("/"):
       raise SCIMRefused(404, f"no endpoint {path}")
     segments = [unquote(segment) for segment in path[1:].split("/")]
@@ -1061,13 +1087,13 @@ class SCIMService:
       parameters[key] = value
     return parameters
 
-  def _allow(self, parameters: dict, allowed: tuple[str, ...]) -> None:
+  def _allow(self, parameters: dict[str, str], allowed: tuple[str, ...]) -> None:
     unknown = sorted(set(parameters) - set(allowed))
     if unknown:
       why = " (sorting is not offered)" if {"sortBy", "sortOrder"} & set(unknown) else ""
       raise _invalid(f"unknown query parameters {unknown}{why}")
 
-  def _document(self, headers: dict, body: bytes):
+  def _document(self, headers: dict[str, str], body: bytes) -> object:
     contentType = headers.get("content-type", "").split(";")[0].strip().lower()
     if contentType not in (mediaType, "application/json"):
       raise SCIMRefused(415, f"the body must be {mediaType}")
@@ -1078,7 +1104,7 @@ class SCIMService:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
       raise _invalid(f"the body is not JSON: {error}", "invalidSyntax") from None
 
-  def _existing(self, resourceType: ResourceType, resourceID: str) -> dict:
+  def _existing(self, resourceType: ResourceType, resourceID: str) -> JSON:
     resource = self.store.get(resourceType.name, resourceID)
     if resource is None:
       raise SCIMRefused(404, f"no {resourceType.name} {resourceID}")
@@ -1086,7 +1112,7 @@ class SCIMService:
 
   # -- checks shared by create, replace and patch
 
-  def _checkResource(self, resourceType: ResourceType, resource: dict, resourceID: str | None) -> None:
+  def _checkResource(self, resourceType: ResourceType, resource: JSON, resourceID: str | None) -> None:
     _checkRequired(resourceType, resource)
     unique = resourceType.uniqueAttribute
     others = [found for found in self.store.search(resourceType.name, Compare(unique, "eq", resource[unique]))
@@ -1104,7 +1130,8 @@ class SCIMService:
           raise _invalid(f"member {member['value']} is a {found[0]}, not a {member['type']}")
         member["type"] = found[0]
 
-  def _create(self, resourceType: ResourceType, parameters: dict, headers: dict, body: bytes) -> SCIMResponse:
+  def _create(self, resourceType: ResourceType, parameters: dict[str, str], headers: dict[str, str],
+              body: bytes) -> SCIMResponse:
     self._allow(parameters, ("attributes", "excludedAttributes"))
     resource = _readResource(resourceType, self._document(headers, body))
     resourceID = str(uuid.uuid4())
@@ -1116,7 +1143,8 @@ class SCIMService:
     rendered = self._render(resourceType, resource, parameters)
     return self._answer(201, rendered, {"Location": self._location(resourceType, resourceID)})
 
-  def _replace(self, resourceType: ResourceType, resourceID: str, parameters: dict, headers: dict, body: bytes):
+  def _replace(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
+               body: bytes) -> SCIMResponse:
     self._allow(parameters, ("attributes", "excludedAttributes"))
     existing = self._existing(resourceType, resourceID)
     resource = _readResource(resourceType, self._document(headers, body))
@@ -1125,7 +1153,8 @@ class SCIMService:
     self.store.replace(resourceType.name, resource)
     return self._answer(200, self._render(resourceType, resource, parameters))
 
-  def _patch(self, resourceType: ResourceType, resourceID: str, parameters: dict, headers: dict, body: bytes):
+  def _patch(self, resourceType: ResourceType, resourceID: str, parameters: dict[str, str], headers: dict[str, str],
+             body: bytes) -> SCIMResponse:
     self._allow(parameters, ("attributes", "excludedAttributes"))
     existing = self._existing(resourceType, resourceID)
     resource = _applyPatch(resourceType, existing, self._document(headers, body))
@@ -1150,7 +1179,7 @@ class SCIMService:
       self.store.replace("Group", group)
     return self._answer(204, None)
 
-  def _list(self, resourceType: ResourceType, parameters: dict) -> SCIMResponse:
+  def _list(self, resourceType: ResourceType, parameters: dict[str, str]) -> SCIMResponse:
     self._allow(parameters, ("filter", "startIndex", "count", "attributes", "excludedAttributes"))
     self._projection(resourceType, parameters)
     query = None
@@ -1170,7 +1199,7 @@ class SCIMService:
       "Resources": [self._render(resourceType, resource, parameters) for resource in page]})
 
   @staticmethod
-  def _whole(parameters: dict, name: str, default: int) -> int:
+  def _whole(parameters: dict[str, str], name: str, default: int) -> int:
     if name not in parameters:
       return default
     text = parameters[name]
@@ -1183,10 +1212,11 @@ class SCIMService:
   def _location(self, resourceType: ResourceType, resourceID: str) -> str:
     return f"{self.baseURL}{resourceType.endpoint}/{resourceID}"
 
-  def _projection(self, resourceType: ResourceType, parameters: dict):
+  def _projection(self, resourceType: ResourceType, parameters: dict[str, str]
+                  ) -> tuple[set[tuple[str, str, str | None]] | None, set[tuple[str, str, str | None]]]:
     if "attributes" in parameters and "excludedAttributes" in parameters:
       raise _invalid("give attributes or excludedAttributes, not both")
-    def keys(text):
+    def keys(text: str) -> set[tuple[str, str, str | None]]:
       found = set()
       for path in text.split(","):
         target = _resolve(resourceType, path.strip(), "invalidValue")
@@ -1198,7 +1228,7 @@ class SCIMService:
       return None, keys(parameters["excludedAttributes"])
     return None, set()
 
-  def _render(self, resourceType: ResourceType, resource: dict, parameters: dict) -> dict:
+  def _render(self, resourceType: ResourceType, resource: JSON, parameters: dict[str, str]) -> JSON:
     include, exclude = self._projection(resourceType, parameters)
 
     def wanted(schema: Schema, attribute: Attribute, sub: Attribute | None = None) -> bool:
@@ -1217,7 +1247,7 @@ class SCIMService:
     core = resourceType.schema
     stored = dict(resource)
     stored["meta"] = {**resource["meta"], "location": self._location(resourceType, resource["id"])}
-    if resourceType is userType and wanted(core, _named(core.attributes, "groups")):
+    if resourceType is userType and wanted(core, cast(Attribute, _named(core.attributes, "groups"))):
       groups = self.store.search("Group", ValuePath("members", Compare("value", "eq", resource["id"])))
       if groups:
         stored["groups"] = [{"value": group["id"], "display": group["displayName"], "type": "direct"}
@@ -1236,10 +1266,11 @@ class SCIMService:
         rendered[schema.id] = output
     return rendered
 
-  def _renderValue(self, schema: Schema, attribute: Attribute, value, wanted):
+  def _renderValue(self, schema: Schema, attribute: Attribute, value: Any,
+                   wanted: Callable[[Schema, Attribute, Attribute | None], bool]) -> object:
     if attribute.type != "complex":
       return value
-    def one(item: dict) -> dict:
+    def one(item: JSON) -> JSON:
       item = dict(item)
       if attribute.sub("$ref") is not None and "value" in item:
         endpoint = "/Groups" if item.get("type") == "Group" or attribute.name == "groups" else "/Users"

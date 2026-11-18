@@ -41,7 +41,7 @@ class RSAPublicKey:
   modulus: int
   exponent: int
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.modulus.bit_length() < minimumRSABits:
       raise SignatureError(f"an RSA key of {self.modulus.bit_length()} bits is refused; {minimumRSABits} or more")
     if self.exponent < 3 or self.exponent % 2 == 0:
@@ -157,7 +157,7 @@ curves = {
 }
 
 
-def _add(curve: Curve, first, second):
+def _add(curve: Curve, first: tuple[int, int] | None, second: tuple[int, int] | None) -> tuple[int, int] | None:
   if first is None:
     return second
   if second is None:
@@ -174,9 +174,9 @@ def _add(curve: Curve, first, second):
   return x3, (slope * (x1 - x3) - y1) % p
 
 
-def _multiply(curve: Curve, scalar: int, point):
+def _multiply(curve: Curve, scalar: int, point: tuple[int, int]) -> tuple[int, int] | None:
   result = None
-  addend = point
+  addend: tuple[int, int] | None = point
   while scalar:
     if scalar & 1:
       result = _add(curve, result, addend)
@@ -191,7 +191,7 @@ class ECPublicKey:
   x: int
   y: int
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.curveName not in curves:
       raise SignatureError(f"curve '{self.curveName}' is not one of {sorted(curves)}")
     curve = curves[self.curveName]

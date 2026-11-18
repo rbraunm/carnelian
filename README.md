@@ -22,9 +22,22 @@ No third-party packages, so nothing but its own MIT licence governs where it can
 Its cryptography only *verifies* signatures with public keys -- it never signs or decrypts
 with a secret -- and it leaves TLS to Python's own `ssl` module.
 
-Status: being built. It starts life as the sign-in layer of
-[OpenFurrow](https://github.com/rbraunm/openfurrow) and is tested against real identity
-providers.
+It began as the sign-in layer of [OpenFurrow](https://github.com/rbraunm/openfurrow) and is
+tested against real identity providers: Keycloak, Samba Active Directory, Apereo CAS, a
+test federation and InCommon's live metadata.
+
+## Guides
+
+One per protocol, each with a complete sign-in example, what it checks and what it refuses:
+[OpenID Connect](docs/openIDConnect.md), [SAML 2.0](docs/saml.md),
+[research federations](docs/federations.md), [CAS](docs/cas.md),
+[LDAP and Active Directory](docs/ldap.md), [SCIM 2.0](docs/scim.md).
+What Carnelian promises and what it leaves to you: [SECURITY.md](SECURITY.md).
+
+The supported interface is what each of the modules `carnelian.oidc`, `carnelian.saml`,
+`carnelian.federation`, `carnelian.cas`, `carnelian.ldap`, `carnelian.scim` and
+`carnelian.fetching` lists in its `__all__`. Everything else is internal and may change
+in any release.
 
 ## Install
 

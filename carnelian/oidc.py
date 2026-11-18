@@ -19,10 +19,13 @@ import json
 import secrets
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from carnelian.fetching import Fetcher
+from carnelian.fetching import JSON, JSONFetcher
 from carnelian.jose import JOSEError, KeySet, acceptedAlgorithm, readHeader, supportedAlgorithms, verifyCompact
+
+__all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty"]
 
 
 class SignInRefused(ValueError):
@@ -39,32 +42,49 @@ class Provider:
   signingAlgorithms: frozenset[str]
 
 
-def _httpsURL(document: dict, member: str, required: bool = True) -> str | None:
+def _names(document: JSON, member: str) -> list[str]:
   value = document.get(member)
-  if value is None and not required:
-    return None
+  if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+    raise SignInRefused(f"the provider's '{member}' is not a list of names: {value!r}")
+  return value
+
+
+def _optionalText(claims: JSON, name: str) -> str | None:
+  value = claims.get(name)
+  if value is not None and not isinstance(value, str):
+    raise SignInRefused(f"the ID token's '{name}' is not text")
+  return value
+
+
+def _optionalHTTPSURL(document: JSON, member: str) -> str | None:
+  return None if document.get(member) is None else _httpsURL(document, member)
+
+
+def _httpsURL(document: JSON, member: str) -> str:
+  value = document.get(member)
   if not isinstance(value, str) or not value.startswith("https://"):
     raise SignInRefused(f"the provider's '{member}' is not an https URL: {value!r}")
   return value
 
 
-def discover(issuer: str, fetcher: Fetcher) -> Provider:
+def discover(issuer: str, fetcher: JSONFetcher) -> Provider:
   """The provider at `issuer`, from its discovery document, which must name exactly that issuer."""
   if not issuer.startswith("https://"):
     raise SignInRefused(f"an issuer is an https URL, not {issuer!r}")
   document = fetcher.getJSON(issuer.rstrip("/") + "/.well-known/openid-configuration")
   if document.get("issuer") != issuer:
     raise SignInRefused(f"the discovery document names issuer {document.get('issuer')!r}, not {issuer!r}")
-  offered = document.get("id_token_signing_alg_values_supported", ["RS256"])
+  offered = _names(document, "id_token_signing_alg_values_supported")
   accepted = frozenset(offered) & supportedAlgorithms
   if not accepted:
     raise SignInRefused(f"the provider signs ID tokens with {offered}, none of which is accepted")
-  if "S256" not in document.get("code_challenge_methods_supported", ["S256"]):
+  # Some providers (Entra ID among them) support PKCE without announcing it; the challenge is sent either way.
+  if "code_challenge_methods_supported" in document and "S256" not in _names(document, "code_challenge_methods_supported"):
     raise SignInRefused("the provider does not offer PKCE with S256")
   return Provider(
     issuer=issuer, authorizationEndpoint=_httpsURL(document, "authorization_endpoint"),
     tokenEndpoint=_httpsURL(document, "token_endpoint"), jwksURI=_httpsURL(document, "jwks_uri"),
-    userinfoEndpoint=_httpsURL(document, "userinfo_endpoint", required=False), signingAlgorithms=accepted,
+    userinfoEndpoint=_optionalHTTPSURL(document, "userinfo_endpoint"), signingAlgorithms=accepted,
   )
 
 
@@ -86,13 +106,13 @@ class Identity:
   email: str | None
   displayName: str | None
   groups: tuple[str, ...]
-  claims: dict = field(repr=False)
+  claims: JSON = field(repr=False)
 
 
 class RelyingParty:
-  def __init__(self, provider: Provider, clientID: str, clientSecret: str, redirectURI: str, fetcher: Fetcher,
+  def __init__(self, provider: Provider, clientID: str, clientSecret: str, redirectURI: str, fetcher: JSONFetcher,
                scopes: tuple[str, ...] = ("openid", "profile", "email"), leewaySeconds: int = 60,
-               pendingSeconds: int = 600, clock=time.time):
+               pendingSeconds: int = 600, clock: Callable[[], float] = time.time) -> None:
     if "openid" not in scopes:
       raise SignInRefused("the scopes must include 'openid'")
     self.provider = provider
@@ -137,12 +157,16 @@ class RelyingParty:
     if not isinstance(idToken, str):
       raise SignInRefused("the token response has no ID token")
     claims = self.checkIDToken(idToken, pending.nonce)
+    overage = claims.get("_claim_names")
+    if isinstance(overage, dict) and "groups" in overage:
+      raise SignInRefused("the provider left the groups out of the ID token (too many to include); "
+                          "have it send only the groups assigned to this application")
     groups = claims.get("groups", [])
     if not isinstance(groups, list) or not all(isinstance(group, str) for group in groups):
       raise SignInRefused("the ID token's groups are not a list of names")
     return Identity(
-      issuer=claims["iss"], subject=claims["sub"], userName=claims.get("preferred_username"), email=claims.get("email"),
-      displayName=claims.get("name"), groups=tuple(groups), claims=claims,
+      issuer=claims["iss"], subject=claims["sub"], userName=_optionalText(claims, "preferred_username"), email=_optionalText(claims, "email"),
+      displayName=_optionalText(claims, "name"), groups=tuple(groups), claims=claims,
     )
 
   def _keySet(self, refresh: bool) -> KeySet:
@@ -150,7 +174,7 @@ class RelyingParty:
       self._keys = KeySet(self.fetcher.getJSON(self.provider.jwksURI))
     return self._keys
 
-  def checkIDToken(self, idToken: str, nonce: str) -> dict:
+  def checkIDToken(self, idToken: str, nonce: str) -> JSON:
     """The claims of an ID token that passes every check, or SignInRefused saying which failed."""
     try:
       header = readHeader(idToken)

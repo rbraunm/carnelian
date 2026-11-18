@@ -103,3 +103,12 @@ def testKeysAreChosenStrictly():
     keys.keyFor({"kid": "b", "alg": "RS256"})
   with pytest.raises(JOSEError, match=r"private members \['d'\]"):
     keyFromJWK(jwkOf(rsaKey, "a") | {"d": "AQAB"})
+
+
+@pytest.mark.parametrize("jwk, message", [
+  ({"kty": "EC", "crv": "P-256", "x": 5, "y": "AAAA"}, "has no 'x'"),
+  ({"kty": "RSA", "n": ["AQAB"], "e": "AQAB"}, "has no 'n'"),
+])
+def testAJWKMemberOfTheWrongKindIsRefusedByName(jwk, message):
+  with pytest.raises(JOSEError, match=message):
+    keyFromJWK(jwk)

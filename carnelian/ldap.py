@@ -18,6 +18,9 @@ from __future__ import annotations
 import socket
 import ssl
 from dataclasses import dataclass
+from typing import Self
+
+__all__ = ["DirectoryRefused", "Directory", "DirectoryIdentity"]
 
 
 class DirectoryRefused(ValueError):
@@ -118,10 +121,13 @@ class InChain:
 
 @dataclass(frozen=True)
 class All:
-  filters: tuple
+  filters: tuple[Filter, ...]
 
   def encoded(self) -> bytes:
     return sequence(*(part.encoded() for part in self.filters), tag=0xA0)
+
+
+Filter = Equal | Present | InChain | All
 
 
 # ---- the connection ---------------------------------------------------------
@@ -140,7 +146,7 @@ class Connection:
   """One TLS-protected LDAP connection; use as a context manager so it is unbound and closed."""
 
   def __init__(self, host: str, port: int, context: ssl.SSLContext, startTLS: bool, timeoutSeconds: float = 10.0,
-               maximumBytes: int = 4_000_000):
+               maximumBytes: int = 4_000_000) -> None:
     self.maximumBytes = maximumBytes
     self._nextID = 1
     raw = socket.create_connection((host, port), timeout=timeoutSeconds)
@@ -156,10 +162,10 @@ class Connection:
       raw.close()
       raise
 
-  def __enter__(self):
+  def __enter__(self) -> Self:
     return self
 
-  def __exit__(self, *exception):
+  def __exit__(self, *exception: object) -> None:
     try:
       self._send(self._message(tlv(0x42, b"")))
     except OSError:
@@ -174,7 +180,7 @@ class Connection:
   def _send(self, data: bytes) -> None:
     self._socket.sendall(data)
 
-  def _receive(self) -> tuple[int, bytes]:
+  def _receive(self) -> tuple[int, tuple[int, bytes]]:
     """One LDAPMessage: its message ID and the protocol operation's (tag, content) inside."""
     head = self._exactly(2)
     if head[0] != 0x30:
@@ -227,7 +233,7 @@ class Connection:
       raise DirectoryRefused("the directory did not answer the bind")
     self._check(result, "bind")
 
-  def search(self, base: str, query, attributes: tuple[str, ...], sizeLimit: int = 1000) -> list[Entry]:
+  def search(self, base: str, query: Filter, attributes: tuple[str, ...], sizeLimit: int = 1000) -> list[Entry]:
     messageID = self._nextID
     self._send(self._message(sequence(
       octets(base), integer(2, 0x0A), integer(0, 0x0A), integer(sizeLimit), integer(10), boolean(False),

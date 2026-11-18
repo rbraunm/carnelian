@@ -18,6 +18,8 @@ signature).
 from __future__ import annotations
 
 import xml.parsers.expat
+from collections.abc import Iterator
+from typing import NoReturn
 from dataclasses import dataclass, field
 
 xmlNamespace = "http://www.w3.org/XML/1998/namespace"
@@ -48,7 +50,7 @@ class Element:
   qualifiedName: str
   attributes: list[tuple[str, str]]
   parent: Element | None
-  children: list = field(default_factory=list)
+  children: list[Element | Text | Comment | Instruction] = field(default_factory=list)
   scope: dict[str, str] = field(default_factory=dict)
 
   @property
@@ -89,14 +91,28 @@ class Element:
   def childrenNamed(self, namespaceURI: str, localName: str) -> list[Element]:
     return [child for child in self.elements() if child.isA(namespaceURI, localName)]
 
-  def only(self, namespaceURI: str, localName: str, required: bool = True) -> Element | None:
+  def only(self, namespaceURI: str, localName: str) -> Element:
     """The one child of this name; none, or more than one, is refused."""
     found = self.childrenNamed(namespaceURI, localName)
-    if len(found) > 1 or (required and not found):
+    if len(found) != 1:
       raise XMLRefused(f"<{self.localName}> has {len(found)} <{localName}> children; it needs exactly one")
+    return found[0]
+
+  def optional(self, namespaceURI: str, localName: str) -> Element | None:
+    """The child of this name if there is one; more than one is refused."""
+    found = self.childrenNamed(namespaceURI, localName)
+    if len(found) > 1:
+      raise XMLRefused(f"<{self.localName}> has {len(found)} <{localName}> children; it may have one")
     return found[0] if found else None
 
-  def descendants(self):
+  def required(self, localName: str, namespaceURI: str = "") -> str:
+    """An attribute that must be present."""
+    value = self.attribute(localName, namespaceURI)
+    if value is None:
+      raise XMLRefused(f"<{self.localName}> has no {localName} attribute")
+    return value
+
+  def descendants(self) -> Iterator[Element]:
     for child in self.elements():
       yield child
       yield from child.descendants()
@@ -123,10 +139,10 @@ def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
   stack: list[Element] = []
   roots: list[Element] = []
 
-  def refuse(*_):
+  def refuse(*_: object) -> NoReturn:
     raise XMLRefused("a DOCTYPE, entity or external reference is refused")
 
-  def start(name, attributes):
+  def start(name: str, attributes: list[str]) -> None:
     pairs = list(zip(attributes[0::2], attributes[1::2]))
     parent = stack[-1] if stack else None
     scope = dict(parent.scope) if parent else {}
@@ -151,20 +167,20 @@ def parse(data: bytes, maximumBytes: int = 1_000_000) -> Element:
     (parent.children if parent else roots).append(element)
     stack.append(element)
 
-  def end(name):
+  def end(name: str) -> None:
     stack.pop()
 
-  def characters(data):
+  def characters(data: str) -> None:
     if stack:
       stack[-1].children.append(Text(data))
     elif data.strip():
       raise XMLRefused("text outside the document element")
 
-  def comment(data):
+  def comment(data: str) -> None:
     if stack:
       stack[-1].children.append(Comment(data))
 
-  def instruction(target, data):
+  def instruction(target: str, data: str) -> None:
     if stack:
       stack[-1].children.append(Instruction(target, data))
 
@@ -202,7 +218,8 @@ def canonical(element: Element, inclusivePrefixes: tuple[str, ...] = (), leaveOu
   return "".join(output).encode("utf-8")
 
 
-def _render(element: Element, rendered: dict[str, str], inclusive: set[str], leaveOut, output: list[str]) -> None:
+def _render(element: Element, rendered: dict[str, str], inclusive: set[str], leaveOut: Element | None,
+            output: list[str]) -> None:
   used = {element.prefix}
   for _, _, qualifiedName, _ in element.plainAttributes():
     if ":" in qualifiedName:

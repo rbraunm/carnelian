@@ -16,8 +16,12 @@ import binascii
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from carnelian.signatures import ECPublicKey, RSAPublicKey, SignatureError, curves
+
+
+JSON = dict[str, Any]
 
 
 class JOSEError(ValueError):
@@ -43,10 +47,15 @@ def base64urlEncode(data: bytes) -> str:
   return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def _integer(member: str, jwk: dict) -> int:
-  if not isinstance(jwk.get(member), str):
+def _text(member: str, jwk: JSON) -> str:
+  value = jwk.get(member)
+  if not isinstance(value, str):
     raise JOSEError(f"the JWK has no '{member}'")
-  return int.from_bytes(base64urlDecode(jwk[member]), "big")
+  return value
+
+
+def _integer(member: str, jwk: JSON) -> int:
+  return int.from_bytes(base64urlDecode(_text(member, jwk)), "big")
 
 
 _privateMembers = {"d", "p", "q", "dp", "dq", "qi", "oth", "k"}
@@ -55,7 +64,7 @@ _rsaHash = {"RS256": "sha256", "RS384": "sha384", "RS512": "sha512", "PS256": "s
 supportedAlgorithms = frozenset(_rsaHash) | frozenset(_curveOfAlgorithm)
 
 
-def keyFromJWK(jwk: dict) -> RSAPublicKey | ECPublicKey:
+def keyFromJWK(jwk: JSON) -> RSAPublicKey | ECPublicKey:
   """The public key a JWK describes."""
   if not isinstance(jwk, dict):
     raise JOSEError("a JWK is a JSON object")
@@ -71,7 +80,7 @@ def keyFromJWK(jwk: dict) -> RSAPublicKey | ECPublicKey:
       raise JOSEError(f"JWK curve '{curveName}' is not one of {sorted(curves)}")
     size = curves[curveName].length
     for member in ("x", "y"):
-      if len(base64urlDecode(jwk.get(member, ""))) != size:
+      if len(base64urlDecode(_text(member, jwk))) != size:
         raise JOSEError(f"the JWK's '{member}' is not {size} bytes for {curveName}")
     return ECPublicKey(curveName, _integer("x", jwk), _integer("y", jwk))
   raise JOSEError(f"JWK key type '{kind}' is not supported")
@@ -79,11 +88,11 @@ def keyFromJWK(jwk: dict) -> RSAPublicKey | ECPublicKey:
 
 @dataclass(frozen=True)
 class VerifiedJWS:
-  header: dict
+  header: JSON
   payload: bytes
 
 
-def readHeader(token: str) -> dict:
+def readHeader(token: str) -> JSON:
   """The protected header of a compact JWS, before any check of its signature."""
   parts = token.split(".")
   if len(parts) != 3:
@@ -97,9 +106,9 @@ def readHeader(token: str) -> dict:
   return header
 
 
-def acceptedAlgorithm(header: dict, allowedAlgorithms: frozenset[str] = supportedAlgorithms) -> str:
+def acceptedAlgorithm(header: JSON, allowedAlgorithms: frozenset[str] = supportedAlgorithms) -> str:
   """The header's algorithm, if it is accepted; checked before any key is looked for."""
-  algorithm = header.get("alg")
+  algorithm: object = header.get("alg")
   if algorithm == "none" or (isinstance(algorithm, str) and algorithm.startswith("HS")):
     raise JOSEError(f"algorithm '{algorithm}' is refused")
   if algorithm not in supportedAlgorithms or algorithm not in allowedAlgorithms:
@@ -138,12 +147,12 @@ def verifyCompact(token: str, key: RSAPublicKey | ECPublicKey, allowedAlgorithms
 class KeySet:
   """A JWK Set (RFC 7517 section 5). Keys are read when chosen, so keys of types not used here do not stop the rest."""
 
-  def __init__(self, document: dict):
+  def __init__(self, document: JSON) -> None:
     if not isinstance(document, dict) or not isinstance(document.get("keys"), list):
       raise JOSEError("a JWK Set is an object with a 'keys' list")
     self.keys = [key for key in document["keys"] if isinstance(key, dict)]
 
-  def keyFor(self, header: dict) -> RSAPublicKey | ECPublicKey:
+  def keyFor(self, header: JSON) -> RSAPublicKey | ECPublicKey:
     """The one signing key a token's header names by 'kid'."""
     keyID = header.get("kid")
     if not isinstance(keyID, str):

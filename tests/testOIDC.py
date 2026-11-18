@@ -116,6 +116,70 @@ def testTheSignInAddressCarriesPKCEAndTheNonce():
 
 # ---- against the testbed's Keycloak ----------------------------------------
 
+class StandInProvider(StandInNetwork):
+  """A provider's discovery document and token endpoint, served without a network."""
+
+  def __init__(self, document=None, claims=None):
+    super().__init__()
+    self.document, self.claims = document, claims
+
+  def getJSON(self, url, headers=None):
+    if url.endswith("/.well-known/openid-configuration"):
+      return self.document
+    return super().getJSON(url, headers)
+
+  def postForm(self, url, fields, headers=None):
+    assert url == f"{issuer}/token" and fields["code"] == "c"
+    return {"id_token": idToken(self.claims)}
+
+
+discovery = {"issuer": issuer, "authorization_endpoint": f"{issuer}/auth", "token_endpoint": f"{issuer}/token",
+             "jwks_uri": f"{issuer}/keys", "id_token_signing_alg_values_supported": ["RS256"]}
+
+
+@pytest.mark.parametrize("change, message", [
+  ({"id_token_signing_alg_values_supported": None}, "is not a list of names"),
+  ({"id_token_signing_alg_values_supported": "RS256"}, "is not a list of names"),
+  ({"code_challenge_methods_supported": "S256"}, "is not a list of names"),
+  ({"code_challenge_methods_supported": ["plain"]}, "does not offer PKCE"),
+  ({"token_endpoint": "http://id.example.org/token"}, "not an https URL"),
+])
+def testADiscoveryDocumentThatIsNotWhatTheStandardSaysIsRefused(change, message):
+  document = {key: value for key, value in (discovery | change).items() if value is not None}
+  with pytest.raises(SignInRefused, match=message):
+    discover(issuer, StandInProvider(document))
+
+
+def testADiscoveryDocumentWithoutPKCEMethodsStillGetsPKCE():
+  provider = discover(issuer, StandInProvider(discovery))
+  assert provider.signingAlgorithms == frozenset({"RS256"}) and provider.userinfoEndpoint is None
+
+
+def finishedWith(claims):
+  provider = Provider(issuer=issuer, authorizationEndpoint=f"{issuer}/auth", tokenEndpoint=f"{issuer}/token",
+                      jwksURI=f"{issuer}/keys", userinfoEndpoint=None, signingAlgorithms=frozenset({"RS256"}))
+  relyingParty = RelyingParty(provider, "app", "secret", "https://app.example.org/callback", StandInProvider(claims=claims),
+                              clock=lambda: now)
+  return relyingParty.finishSignIn(Pending(state="s", nonce="n-1", codeVerifier="v", startedAt=now), {"state": "s", "code": "c"})
+
+
+def testTheIdentityCarriesTheClaims():
+  identity = finishedWith(good | {"preferred_username": "ana", "email": "ana@example.org", "name": "Ana", "groups": ["/a"]})
+  assert (identity.subject, identity.userName, identity.email, identity.displayName, identity.groups) == (
+    "s-1", "ana", "ana@example.org", "Ana", ("/a",))
+
+
+@pytest.mark.parametrize("change, message", [
+  ({"_claim_names": {"groups": "src1"}, "_claim_sources": {"src1": {"endpoint": "https://graph.example.org"}}},
+   "left the groups out"),
+  ({"name": 5}, "'name' is not text"),
+  ({"preferred_username": ["ana"]}, "'preferred_username' is not text"),
+  ({"groups": "/a"}, "not a list of names"),
+])
+def testAGroupsOverageOrClaimsOfTheWrongKindAreRefused(change, message):
+  with pytest.raises(SignInRefused, match=message):
+    finishedWith(good | change)
+
 class _Form(html.parser.HTMLParser):
   def __init__(self):
     super().__init__()
