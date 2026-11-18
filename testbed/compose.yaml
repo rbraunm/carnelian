@@ -23,3 +23,19 @@ services:
       - ./generated/realm:/opt/keycloak/data/import:ro
     ports:
       - "8443:8443"
+
+  # An Active Directory domain controller. It needs a host whose kernel lets it set
+  # security extended attributes (a VM or the workflow's runner, not an unprivileged
+  # container), so it is a profile of its own: --profile directory.
+  samba:
+    profiles: [directory]
+    build: ./samba
+    privileged: true
+    hostname: dc1
+    env_file: generated/samba.env
+    volumes:
+      - ./generated/certificates:/certificates:ro
+      - ./generated/samba:/seed:ro
+    ports:
+      - "389:389"
+      - "636:636"

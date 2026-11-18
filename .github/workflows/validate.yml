@@ -60,13 +60,13 @@ jobs:
           CARNELIAN_TESTBED_SECRET=$secret python testbed/prepare.py --host localhost
       - name: Start the identity providers
         run: |
-          docker compose --file testbed/compose.yaml --env-file testbed/generated/keycloak.env up --detach
-          python testbed/prepare.py --host localhost --wait
+          docker compose --file testbed/compose.yaml --env-file testbed/generated/keycloak.env --profile directory up --detach --build
+          python testbed/prepare.py --host localhost --wait --directory
       - name: Run the test suite against them
-        run: python -m pytest --testbed=testbed/generated/testbed.json
+        run: python -m pytest --testbed=testbed/generated/testbed.json --directory
       - name: Throw the testbed away
         if: always()
-        run: docker compose --file testbed/compose.yaml --env-file testbed/generated/keycloak.env down --volumes
+        run: docker compose --file testbed/compose.yaml --env-file testbed/generated/keycloak.env --profile directory down --volumes
 
   # The one check main requires: its name stays the same when the matrix changes.
   validated:

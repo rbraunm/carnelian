@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import shlex
+import socket
 import hashlib
 import hmac
 import ipaddress
@@ -36,6 +38,10 @@ redirectURI = "http://127.0.0.1:53682/callback"
 samlConsumerURL = "https://sp.carnelian.test/acs"
 samlEntities = {"response": "https://sp.carnelian.test/signs-response", "assertion": "https://sp.carnelian.test/signs-assertion"}
 keycloakPort = 8443
+directoryRealm = "CARNELIAN.TEST"
+directoryDomain = "CARNELIAN"
+directoryBase = "DC=carnelian,DC=test"
+serviceAccount = "svc-carnelian"
 
 
 def derived(secret: str, label: str) -> str:
@@ -128,11 +134,45 @@ def samlClient(entityID: str, signs: str) -> dict:
   }
 
 
+def sambaSeed(secret: str, accounts: list[dict]) -> str:
+  """samba-tool commands that load the dataset: nested groups, accounts, memberships, the service account."""
+  dataset = json.loads((here / "dataset.json").read_text(encoding="utf-8"))
+  lines = ["set -eu", "samba-tool domain passwordsettings set --complexity=off --min-pwd-length=12 >/dev/null"]
+
+  def groups(tree, parent=None):
+    for group in tree:
+      lines.append(f"samba-tool group add {shlex.quote(group['name'])} >/dev/null")
+      if parent:
+        lines.append(f"samba-tool group addmembers {shlex.quote(parent)} {shlex.quote(group['name'])} >/dev/null")
+      groups(group.get("subGroups", []), group["name"])
+
+  groups(dataset["groups"])
+  for index in range(dataset["manyGroupsCount"]):
+    lines.append(f"samba-tool group add {dataset['manyGroupsPrefix']}{index:02d} >/dev/null")
+  lines.append(f"samba-tool user create {serviceAccount} {shlex.quote(derived(secret, 'directory:service'))} "
+               f"--given-name=Carnelian --surname=Service >/dev/null")
+  for account in accounts:
+    lines.append(
+      f"samba-tool user create {shlex.quote(account['userName'])} {shlex.quote(account['password'])} "
+      f"--given-name={shlex.quote(account['firstName'])} --surname={shlex.quote(account['lastName'])} "
+      f"--mail-address={shlex.quote(account['email'])} >/dev/null")
+    for group in account["groups"]:
+      lines.append(f"samba-tool group addmembers {shlex.quote(group.rsplit('/', 1)[1])} {shlex.quote(account['userName'])} >/dev/null")
+    if not account["enabled"]:
+      lines.append(f"samba-tool user disable {shlex.quote(account['userName'])} >/dev/null")
+  return "\n".join(lines) + "\n"
+
+
 def prepare(host: str, secret: str) -> None:
   makeCertificates(host)
   document, accounts = realm(secret, host)
   (generated / "realm").mkdir(parents=True, exist_ok=True)
   (generated / "realm" / "carnelian.json").write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
+  (generated / "samba").mkdir(parents=True, exist_ok=True)
+  (generated / "samba" / "seed.sh").write_text(sambaSeed(secret, accounts), encoding="utf-8", newline="\n")
+  (generated / "samba.env").write_text(
+    f"CARNELIAN_REALM={directoryRealm}\nCARNELIAN_DOMAIN={directoryDomain}\n"
+    f"CARNELIAN_ADMIN_PASSWORD=Adm-{derived(secret, 'directory:administrator')}\n", encoding="ascii")
   (generated / "keycloak.env").write_text(
     f"KC_BOOTSTRAP_ADMIN_PASSWORD={derived(secret, 'keycloak:admin')}\nCARNELIAN_TESTBED_HOST={host}\n", encoding="ascii")
   issuer = f"https://{host}:{keycloakPort}/realms/{realmName}"
@@ -142,6 +182,9 @@ def prepare(host: str, secret: str) -> None:
                       "redirectURI": redirectURI},
     "saml": {"metadataURL": f"https://{host}:{keycloakPort}/realms/{realmName}/protocol/saml/descriptor",
              "identityProviderEntityID": issuer, "consumerURL": samlConsumerURL, "entities": samlEntities},
+    "directory": {"host": host, "ldapsPort": 636, "ldapPort": 389, "baseDN": directoryBase,
+                  "serviceDN": f"{serviceAccount}@{directoryRealm.lower()}",
+                  "servicePassword": derived(secret, "directory:service")},
     "accounts": accounts,
   }, indent=2, ensure_ascii=False), encoding="utf-8")
   print(f"prepared the testbed for {host} in {generated}")
@@ -163,14 +206,31 @@ def waitForKeycloak(host: str, timeoutSeconds: int) -> None:
     time.sleep(3)
 
 
+def waitForDirectory(host: str, timeoutSeconds: int) -> None:
+  context = ssl.create_default_context(cafile=str(generated / "certificates" / "ca.crt"))
+  deadline = time.monotonic() + timeoutSeconds
+  while True:
+    try:
+      with socket.create_connection((host, 636), timeout=5) as raw, context.wrap_socket(raw, server_hostname=host):
+        print(f"the directory answers LDAPS at {host}:636")
+        return
+    except OSError as error:
+      if time.monotonic() > deadline:
+        raise SystemExit(f"the directory did not answer LDAPS at {host}:636 within {timeoutSeconds} s: {error}")
+    time.sleep(3)
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--host", required=True)
   parser.add_argument("--wait", action="store_true", help="wait for Keycloak instead of preparing")
   parser.add_argument("--timeout", type=int, default=300)
+  parser.add_argument("--directory", action="store_true", help="with --wait, also wait for the directory")
   arguments = parser.parse_args()
   if arguments.wait:
     waitForKeycloak(arguments.host, arguments.timeout)
+    if arguments.directory:
+      waitForDirectory(arguments.host, arguments.timeout)
     return
   secret = os.environ.get("CARNELIAN_TESTBED_SECRET")
   if not secret:
