@@ -18,7 +18,7 @@ from lxml import etree
 from signxml import XMLSigner
 
 from carnelian.aggregate import fetchAggregate, readAggregate
-from carnelian.fetching import Fetcher, secureContext
+from carnelian.fetching import Fetcher, HTTPFailure, secureContext
 from carnelian.saml import SAMLRefused
 from carnelian.xmlTree import DocumentStream, Text, XMLRefused, canonical, parse
 
@@ -364,20 +364,34 @@ def testAServiceProviderSharingAnIdentityProvidersEntityIDLeavesItOut(order):
 
 
 class Recorded:
-  def __init__(self, answer):
-    self.answer, self.asked = answer, []
+  def __init__(self, answer, failure=None):
+    self.answer, self.failure, self.asked, self.chunksGiven = answer, failure, [], 0
 
-  def getBytes(self, address, accept):
-    self.asked.append((address, accept))
-    return self.answer
+  def streamBytes(self, address, accept, maximumBytes):
+    self.asked.append((address, accept, maximumBytes))
+    for chunk in chunked(self.answer, 512):
+      self.chunksGiven += 1
+      yield chunk
+    if self.failure is not None:
+      raise self.failure
 
 
-def testAnAggregateIsFetched():
-  fetcher = Recorded(signed(aggregate(members[:2])))
+def testAnAggregateIsFetchedAsAStream():
+  document = signed(aggregate(members[:2]))
+  fetcher = Recorded(document)
   source = fetchAggregate("https://federation.example.org/aggregate.xml", federationCertificate, fetcher, "Example",
-                          clock=lambda: now)
+                          clock=lambda: now, maximumBytes=1_000_000)
   assert list(source.institutions) == ["https://idp1.example.edu/idp"]
-  assert fetcher.asked == [("https://federation.example.org/aggregate.xml", "application/samlmetadata+xml")]
+  assert fetcher.asked == [("https://federation.example.org/aggregate.xml", "application/samlmetadata+xml", 1_000_000)]
+  assert fetcher.chunksGiven == -(-len(document) // 512) > 1
+
+
+def testAFetchThatFailsMidStreamIsRefusedByName():
+  fetcher = Recorded(signed(aggregate(members[:2]))[:5000],
+                     HTTPFailure("https://federation.example.org/aggregate.xml answered with fewer bytes than its Content-Length"))
+  with pytest.raises(SAMLRefused, match="^Example's aggregate could not be fetched: .*fewer bytes"):
+    fetchAggregate("https://federation.example.org/aggregate.xml", federationCertificate, fetcher, "Example",
+                   clock=lambda: now)
 
 
 # ---- memory follows the largest entity and the entity IDs, not the document -----------
@@ -419,24 +433,28 @@ def eduGAIN(request):
     pytest.skip("live test: run with --live to read eduGAIN's published aggregate")
   certificate = (vectors / "eduGAINMetadataSigning.pem").read_text(encoding="ascii")
   assert x509.load_pem_x509_certificate(certificate.encode()).fingerprint(hashes.SHA256()).hex(":").upper() == eduGAINFingerprint
+  fetcher = Counting(Fetcher(secureContext(), timeoutSeconds=600))
   started = time.perf_counter()
-  source = fetchAggregate(eduGAINAggregate, certificate, Fetcher(secureContext(), timeoutSeconds=600,
-                                                                 maximumBytes=256 * 1024 * 1024), "eduGAIN")
-  fetchedAndRead = time.perf_counter() - started
-  document = Fetcher(secureContext(), timeoutSeconds=600, maximumBytes=256 * 1024 * 1024).getBytes(
-    eduGAINAggregate, "application/samlmetadata+xml")
-  started = time.perf_counter()
-  readAggregate(chunked(document, 1 << 16), certificate, "eduGAIN")
-  readOnly = time.perf_counter() - started
   tracemalloc.start()
   try:
-    readAggregate(chunked(document, 1 << 16), certificate, "eduGAIN")
+    source = fetchAggregate(eduGAINAggregate, certificate, fetcher, "eduGAIN")
     peak = tracemalloc.get_traced_memory()[1]
   finally:
     tracemalloc.stop()
-  print(f"\neduGAIN: {len(document)} bytes, {len(source.institutions)} institutions, {len(source.skipped)} left out; "
-        f"fetched and read in {fetchedAndRead:.1f} s, read in {readOnly:.1f} s, peak {peak / 1e6:.1f} MB traced")
-  return source, len(document), peak
+  fetchedAndRead = time.perf_counter() - started
+  print(f"\neduGAIN: {fetcher.size} bytes, {len(source.institutions)} institutions, {len(source.skipped)} left out; "
+        f"fetched and read in {fetchedAndRead:.1f} s, peak {peak / 1e6:.1f} MB traced")
+  return source, fetcher.size, peak
+
+
+class Counting:
+  def __init__(self, fetcher):
+    self.fetcher, self.size = fetcher, 0
+
+  def streamBytes(self, url, accept, maximumBytes):
+    for chunk in self.fetcher.streamBytes(url, accept, maximumBytes):
+      self.size += len(chunk)
+      yield chunk
 
 
 def testEduGAINsAggregateIsReadInBoundedMemory(eduGAIN):

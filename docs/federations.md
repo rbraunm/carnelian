@@ -60,17 +60,15 @@ To offer "choose your institution" across a whole federation, read its aggregate
 signed document holding every member. eduGAIN's
 (`https://mds.edugain.org/edugain-v2.xml`) is about 95 MB with about 6,600 identity
 providers, so it is read as a stream: each entity is built as a small tree, read and
-dropped, and the document's canonical form is hashed as it goes by. Reading follows the
-largest entity, not the document (about 20 MB traced for eduGAIN's), and takes under a
-minute. `fetchAggregate` holds the downloaded document in memory, up to `maximumBytes`,
-while it is read; give `readAggregate` chunks of your own (from a file, say) to keep memory
-at the reading's.
+dropped, and the document's canonical form is hashed as it goes by, while it downloads.
+Memory follows the largest entity, not the document (about 15 MB traced for eduGAIN's),
+and fetching and reading take about a minute.
 
 ```python
 from carnelian.aggregate import fetchAggregate
 from carnelian.fetching import Fetcher, secureContext
 
-fetcher = Fetcher(secureContext(), timeoutSeconds=600, maximumBytes=256 * 1024 * 1024)
+fetcher = Fetcher(secureContext(), timeoutSeconds=600)   # the whole download within one deadline
 eduGAIN = fetchAggregate("https://mds.edugain.org/edugain-v2.xml", open("mds-v2.cer").read(), fetcher, "eduGAIN")
 
 choices = sorted((institution.displayName("en"), entityID) for entityID, institution in eduGAIN.institutions.items()

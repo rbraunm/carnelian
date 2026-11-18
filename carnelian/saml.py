@@ -737,8 +737,7 @@ def _inheritedPrefixes(root: Element) -> set[str]:
   """The prefixes `root` and its descendants use whose namespace is declared outside `root`."""
   inherited = set()
   for element in (root, *root.descendants()):
-    used = {element.prefix} | {name.partition(":")[0] for name, _ in element.attributes
-                               if ":" in name and not name.startswith("xmlns:")}
+    used = {element.prefix} | {name.partition(":")[0] for _, _, name, _ in element.resolvedAttributes if ":" in name}
     for prefix in used - {"xml"}:
       if not _declaredWithin(element, prefix, root) and root.namespaceFor(prefix):
         inherited.add(prefix)

@@ -4,9 +4,8 @@
 An aggregate (eduGAIN's is about 95 MB, with thousands of identity providers) is too large
 for a tree, so it is read in one pass: each EntityDescriptor is built as a small tree,
 read, and dropped, while the document's exclusive canonical form is hashed as it goes by.
-`readAggregate` takes the document as an iterable of chunks, so its memory follows the
-largest single entity, not the document. `fetchAggregate` downloads the whole body first,
-so its memory follows the document's size.
+`readAggregate` takes the document as an iterable of chunks and `fetchAggregate` reads it
+as it arrives, so memory follows the largest single entity, not the document.
 
 Only one shape is accepted: an md:EntitiesDescriptor whose first child element is its
 enveloped ds:Signature, whose one Reference names the EntitiesDescriptor's ID (or is "",
@@ -32,7 +31,7 @@ from collections.abc import Callable, Iterable
 
 from carnelian.der import publicKeyFromCertificate
 from carnelian.federation import Institution, _institution, metadataMediaType
-from carnelian.fetching import DocumentFetcher
+from carnelian.fetching import DocumentStreamFetcher, HTTPFailure
 from carnelian.saml import SAMLRefused, _time, metadataNamespace
 from carnelian.signatures import ECPublicKey, RSAPublicKey
 from carnelian.xmldsig import (SignatureRefused, SignatureShape, checkDigest, checkSignatureValue, dsig, exclusiveC14N,
@@ -40,8 +39,6 @@ from carnelian.xmldsig import (SignatureRefused, SignatureShape, checkDigest, ch
 from carnelian.xmlTree import DocumentStream, Element, XMLRefused
 
 __all__ = ["Aggregate", "readAggregate", "fetchAggregate"]
-
-_chunkBytes = 1 << 16
 
 
 class Aggregate:
@@ -158,13 +155,12 @@ def readAggregate(chunks: Iterable[bytes], signingCertificate: str | bytes, name
     raise SAMLRefused(f"{name}'s aggregate is refused: {error}") from None
 
 
-def fetchAggregate(url: str, signingCertificate: str | bytes, fetcher: DocumentFetcher, name: str,
+def fetchAggregate(url: str, signingCertificate: str | bytes, fetcher: DocumentStreamFetcher, name: str,
                    clock: Callable[[], float] = time.time, maximumBytes: int = 256 * 1024 * 1024,
                    maximumCanonicalBytes: int = 512 * 1024 * 1024, maximumEntities: int = 100_000) -> Aggregate:
-  """The aggregate at an https address, downloaded whole (held in memory at once) and then read.
-
-  The fetcher's own maximumBytes must allow its size.
-  """
-  document = fetcher.getBytes(url, metadataMediaType)
-  return readAggregate((document[offset:offset + _chunkBytes] for offset in range(0, len(document), _chunkBytes)),
-                       signingCertificate, name, clock, maximumBytes, maximumCanonicalBytes, maximumEntities)
+  """The aggregate at an https address, read as it arrives, within the fetcher's one deadline."""
+  try:
+    return readAggregate(fetcher.streamBytes(url, metadataMediaType, maximumBytes), signingCertificate, name, clock,
+                         maximumBytes, maximumCanonicalBytes, maximumEntities)
+  except HTTPFailure as error:
+    raise SAMLRefused(f"{name}'s aggregate could not be fetched: {error}") from None
