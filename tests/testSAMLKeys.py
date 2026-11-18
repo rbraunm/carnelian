@@ -25,8 +25,8 @@ from lxml import etree
 from carnelian.fetching import Fetcher, secureContext
 from carnelian.keys import DecryptionFailed, LocalDecryptionKey, LocalSigningKey, ecdsaSHA256, rsaSHA256
 from carnelian.saml import (EncryptionPolicy, IdentityProvider, ReplayCache, SAMLRefused, ServiceProvider, SignOutRequest,
-                            aes128CBC, aes128GCM, aes256CBC, aes256GCM, identityProviderFromMetadata, rsaOAEP, rsaOAEPMGF1P,
-                            serviceProviderMetadata)
+                            aes128CBC, aes128GCM, aes256CBC, aes256GCM, claimedIssuer, identityProviderFromMetadata, rsaOAEP,
+                            rsaOAEPMGF1P, serviceProviderMetadata)
 from carnelian.xmlTree import parse
 
 from testOIDC import _Form, _Stop, account
@@ -540,6 +540,37 @@ def testAPostedLogoutRequestIsReadWithItsRelayState():
 def testALogoutRequestOutsideTheProfileIsRefused(document, message):
   with pytest.raises(SAMLRefused, match=message):
     provider().readSignOutRequest(query=redirectQuery(document, "SAMLRequest"))
+
+
+def testTheClaimedIssuerChoosesTheProviderAndIsNotTrusted():
+  query = redirectQuery(logoutRequest(), "SAMLRequest", "relay-9")
+  assert claimedIssuer("SAMLRequest", query=query) == idp
+  assert claimedIssuer("SAMLRequest", posted=posted(signed(etree.fromstring(logoutRequest())))) == idp
+  forged = logoutRequest().replace(f"<saml:Issuer>{idp}</saml:Issuer>", "<saml:Issuer>https://other.example.org/idp</saml:Issuer>")
+  forgedQuery = redirectQuery(forged, "SAMLRequest")
+  assert claimedIssuer("SAMLRequest", query=forgedQuery) == "https://other.example.org/idp"
+  with pytest.raises(SAMLRefused, match="issued by 'https://other.example.org/idp'"):
+    provider().readSignOutRequest(query=forgedQuery)
+
+
+@pytest.mark.parametrize("call, message", [
+  (lambda: claimedIssuer("SAMLRequest", query="SAMLResponse=abc"), "must carry a SAMLRequest"),
+  (lambda: claimedIssuer("SAMLRequest", query="SAMLRequest=abc&Relay%53tate=x"), "only the literal name is read"),
+  (lambda: claimedIssuer("SAMLRequest", posted=base64.b64encode(b"<a/>").decode()), "Issuer"),
+  (lambda: claimedIssuer("SAMLRequest", posted=base64.b64encode(
+    logoutRequest().replace(f"<saml:Issuer>{idp}</saml:Issuer>", "<saml:Issuer> </saml:Issuer>").encode()).decode()),
+   "names a blank Issuer"),
+])
+def testAClaimedIssuerIsReadStrictly(call, message):
+  with pytest.raises(SAMLRefused, match=message):
+    call()
+
+
+def testAClaimedIssuerNeedsExactlyOneSource():
+  with pytest.raises(ValueError, match="one of them"):
+    claimedIssuer("SAMLRequest")
+  with pytest.raises(ValueError, match="a SAMLRequest or a SAMLResponse"):
+    claimedIssuer("RelayState", query="RelayState=x")
 
 
 def testARedirectMessageThatInflatesTooFarIsRefused():
