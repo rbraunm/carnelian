@@ -25,9 +25,10 @@ from dataclasses import dataclass, field
 from carnelian.fetching import DocumentFetcher
 from carnelian.xmlTree import Element, XMLRefused, parse
 
-__all__ = ["CASRefused", "CASServer", "Pending", "CASIdentity"]
+__all__ = ["CASRefused", "CASServer", "Pending", "CASIdentity", "readLogoutRequest"]
 
 casNamespace = "http://www.yale.edu/tp/cas"
+samlProtocolNamespace = "urn:oasis:names:tc:SAML:2.0:protocol"
 _ticketPattern = re.compile(r"ST-[A-Za-z0-9.\-_]{1,256}")
 
 
@@ -80,6 +81,15 @@ class CASServer:
       {"service": self._service(pending.state), "ticket": ticket})
     return self.read(self.fetcher.getBytes(address, "application/xml"))
 
+
+  def logoutAddress(self, returnURL: str | None = None) -> str:
+    """Where to send the person to sign out of CAS too; CAS sends them on to returnURL if its service registry allows."""
+    if returnURL is None:
+      return f"{self.serverURL}/logout"
+    if not returnURL.startswith("https://"):
+      raise ValueError(f"a return address is https, not {returnURL!r}")
+    return f"{self.serverURL}/logout?{urllib.parse.urlencode({'service': returnURL})}"
+
   def read(self, answer: bytes) -> CASIdentity:
     """The CAS server's validation answer: the user and the released attributes, or why it refused."""
     try:
@@ -109,3 +119,20 @@ class CASServer:
           raise CASRefused(f"an attribute outside the CAS namespace: {attribute.localName}")
         attributes[attribute.localName] = attributes.get(attribute.localName, ()) + (attribute.text.strip(),)
     return CASIdentity(userName=userName, attributes=attributes)
+
+
+def readLogoutRequest(logoutRequest: str) -> str:
+  """The service ticket a CAS single-logout notice (the POSTed logoutRequest) names.
+
+  CAS does not sign these notices: end only the session that this ticket started, so a forged
+  notice can do no more than sign out a session whose ticket its sender already knows."""
+  try:
+    root = parse(logoutRequest.encode("utf-8"))
+    if not root.isA(samlProtocolNamespace, "LogoutRequest") or not root.attribute("ID"):
+      raise CASRefused("the notice is not a SAML LogoutRequest with an ID")
+    ticket = root.only(samlProtocolNamespace, "SessionIndex").simpleText.strip()
+  except XMLRefused as error:
+    raise CASRefused(f"the logout notice is refused: {error}") from None
+  if not _ticketPattern.fullmatch(ticket):
+    raise CASRefused("the logout notice names no service ticket")
+  return ticket

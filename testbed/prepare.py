@@ -156,7 +156,7 @@ def realm(secret: str, host: str, realmKey: tuple[str, str]) -> tuple[dict, list
     "clients": [samlClient(entity, signs) for signs, entity in samlEntities.items()] + [{
       "clientId": clientID, "enabled": True, "protocol": "openid-connect", "publicClient": False,
       "secret": derived(secret, "client:oidc"), "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
-      "redirectUris": [redirectURI], "attributes": {"pkce.code.challenge.method": "S256"},
+      "redirectUris": [redirectURI], "attributes": {"pkce.code.challenge.method": "S256", "post.logout.redirect.uris": "+"},
       "protocolMappers": [{
         "name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
         "config": {"full.path": "true", "id.token.claim": "true", "access.token.claim": "false",
@@ -239,7 +239,7 @@ def casFiles(secret: str, host: str, accounts: list[dict]) -> None:
     f"server.port={casPort}", "server.ssl.enabled=true", "server.ssl.key-store=file:/etc/cas/keystore.p12",
     f"server.ssl.key-store-password={storePassword}", f"server.ssl.key-password={storePassword}", "server.ssl.key-store-type=PKCS12", "server.ssl.key-alias=cas",
     f"cas.server.name=https://{host}:{casPort}", "cas.server.prefix=${cas.server.name}/cas",
-    "cas.authn.accept.enabled=true", f"cas.authn.accept.users={users}", "cas.authn.accept.name=Testbed",
+    "cas.authn.accept.enabled=true", "cas.logout.follow-service-redirects=true", f"cas.authn.accept.users={users}", "cas.authn.accept.name=Testbed",
     "cas.service-registry.core.init-from-json=true", "cas.service-registry.json.location=file:/etc/cas/services",
     "cas.authn.attribute-repository.json[0].location=file:/etc/cas/config/attributes.json",
     "cas.authn.attribute-repository.json[0].id=testbed",

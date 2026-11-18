@@ -65,7 +65,8 @@ now = 1_800_000_000
 def makeProvider(**changes):
   return dataclasses.replace(Provider(
     issuer=issuer, authorizationEndpoint=f"{issuer}/auth", tokenEndpoint=f"{issuer}/token", jwksURI=f"{issuer}/keys",
-    userinfoEndpoint=None, signingAlgorithms=frozenset({"RS256"}), issuerInResponseRequired=False), **changes)
+    userinfoEndpoint=None, signingAlgorithms=frozenset({"RS256"}), issuerInResponseRequired=False,
+    endSessionEndpoint=None), **changes)
 
 
 def party(network=None, clock=lambda: now, provider=None):
@@ -335,6 +336,61 @@ def testAGroupsOverageOrClaimsOfTheWrongKindAreRefused(change, message):
 
 # ---- against the testbed's Keycloak ----------------------------------------
 
+# ---- signing out ------------------------------------------------------------------
+
+def testTheLogoutAddressCarriesTheHintAndTheReturn():
+  relyingParty = party()
+  with pytest.raises(SignInRefused, match="no end_session_endpoint"):
+    relyingParty.logoutAddress()
+  relyingParty = RelyingParty(makeProvider(endSessionEndpoint=f"{issuer}/logout"), "app", "secret",
+                              "https://app.example.org/callback", StandInNetwork(), clock=lambda: now)
+  address = relyingParty.logoutAddress("the.id.token", "https://app.example.org/signed-out", "s-9")
+  query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(address).query))
+  assert address.startswith(f"{issuer}/logout?")
+  assert query == {"client_id": "app", "id_token_hint": "the.id.token",
+                   "post_logout_redirect_uri": "https://app.example.org/signed-out", "state": "s-9"}
+  with pytest.raises(SignInRefused, match="post-logout address is https"):
+    relyingParty.logoutAddress(postLogoutRedirectURI="http://app.example.org/signed-out")
+
+
+def testDiscoveryReadsTheEndSessionEndpoint():
+  assert discover(issuer, StandInProvider(discovery | {"end_session_endpoint": f"{issuer}/logout"})).endSessionEndpoint == (
+    f"{issuer}/logout")
+  with pytest.raises(SignInRefused, match="'end_session_endpoint' is not an https URL"):
+    discover(issuer, StandInProvider(discovery | {"end_session_endpoint": "http://id.example.org/logout"}))
+
+
+logoutClaims = {"iss": issuer, "aud": "app", "iat": now - 5, "exp": now + 60, "jti": "j-1", "sub": "s-1", "sid": "session-1",
+                "events": {"http://schemas.openid.net/event/backchannel-logout": {}}}
+logoutHeader = {"alg": "RS256", "kid": "k1", "typ": "logout+jwt"}
+
+
+def testABackChannelLogoutTokenNamesTheSessionToEnd():
+  notice = party().checkLogoutToken(idToken(logoutClaims, logoutHeader))
+  assert (notice.subject, notice.sessionID, notice.tokenID, notice.expiresAt) == ("s-1", "session-1", "j-1", now + 60)
+  sessionOnly = {key: value for key, value in logoutClaims.items() if key not in ("sub", "exp")}
+  notice = party().checkLogoutToken(idToken(sessionOnly, logoutHeader))
+  assert (notice.subject, notice.sessionID, notice.expiresAt) == (None, "session-1", now - 5 + 120)
+
+
+@pytest.mark.parametrize("change, header, message", [
+  ({"nonce": "n-1"}, logoutHeader, "never carries a nonce"),
+  ({"events": {}}, logoutHeader, "back-channel logout event"),
+  ({"events": {"http://schemas.openid.net/event/backchannel-logout": True}}, logoutHeader, "back-channel logout event"),
+  ({"aud": "other"}, logoutHeader, "not for client 'app'"),
+  ({"iss": "https://evil.example.org"}, logoutHeader, "issuer 'https://evil.example.org'"),
+  ({"exp": now - 61}, logoutHeader, "has expired"),
+  ({"iat": now + 61}, logoutHeader, "issued in the future"),
+  ({"jti": None}, logoutHeader, "has no jti"),
+  ({"sub": None, "sid": None}, logoutHeader, "neither a subject nor a session"),
+  ({"sid": 7}, logoutHeader, "'s sid is not text"),
+  ({}, {"alg": "RS256", "kid": "k1", "typ": "JWT"}, "not a logout token"),
+])
+def testALogoutTokenThatIsNotExactlyOneIsRefused(change, header, message):
+  claims = {key: value for key, value in (logoutClaims | change).items() if value is not None}
+  with pytest.raises(SignInRefused, match=message):
+    party().checkLogoutToken(idToken(claims, header))
+
 class _Form(html.parser.HTMLParser):
   def __init__(self):
     super().__init__()
@@ -414,3 +470,18 @@ def testTheDiscoveryDocumentIsTheProvidersOwn(testbed, keycloak):
   assert relyingParty.provider.issuer == testbed["openIDConnect"]["issuer"]
   with pytest.raises(SignInRefused, match="discovery document names issuer"):
     discover(testbed["openIDConnect"]["issuer"] + "/", fetcher)
+
+
+def testSigningOutAtKeycloakReturnsWithTheState(testbed, keycloak):
+  relyingParty, fetcher = keycloak
+  assert relyingParty.provider.endSessionEndpoint == f"{testbed['openIDConnect']['issuer']}/protocol/openid-connect/logout"
+  expected = account(testbed, "ana")
+  address, pending = relyingParty.beginSignIn()
+  query, page = signInAtKeycloak(address, "ana", expected["password"], fetcher.context)
+  identity = relyingParty.finishSignIn(pending, query)
+  logout = relyingParty.logoutAddress(identity.idToken, testbed["openIDConnect"]["redirectURI"], "signed-out-1")
+  opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=fetcher.context), _Stop())
+  with pytest.raises(urllib.error.HTTPError) as redirect:
+    opener.open(logout, timeout=20)
+  assert redirect.value.url.startswith(testbed["openIDConnect"]["redirectURI"])
+  assert dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(redirect.value.url).query)) == {"state": "signed-out-1"}

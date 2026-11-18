@@ -29,9 +29,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from carnelian.fetching import JSON, JSONFetcher
-from carnelian.jose import JOSEError, KeyCache, numericDate, readJSON, supportedAlgorithms
+from carnelian.jose import JOSEError, KeyCache, numericDate, readHeader, readJSON, supportedAlgorithms
 
-__all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty"]
+__all__ = ["SignInRefused", "Provider", "discover", "Pending", "Identity", "RelyingParty", "LogoutNotice"]
 
 
 
@@ -48,6 +48,7 @@ class Provider:
   userinfoEndpoint: str | None
   signingAlgorithms: frozenset[str]
   issuerInResponseRequired: bool
+  endSessionEndpoint: str | None
 
 
 def _names(document: JSON, member: str) -> list[str]:
@@ -66,6 +67,11 @@ def _optionalText(claims: JSON, name: str) -> str | None:
 
 def _optionalHTTPSURL(document: JSON, member: str) -> str | None:
   return None if document.get(member) is None else _httpsURL(document, member)
+
+
+def _isLoopback(value: str) -> bool:
+  parts = urllib.parse.urlsplit(value)
+  return parts.scheme == "http" and parts.hostname in ("127.0.0.1", "::1", "localhost")
 
 
 def _isHTTPSURL(value: object) -> bool:
@@ -117,7 +123,7 @@ def discover(issuer: str, fetcher: JSONFetcher) -> Provider:
     issuer=issuer, authorizationEndpoint=_httpsURL(document, "authorization_endpoint"),
     tokenEndpoint=_httpsURL(document, "token_endpoint"), jwksURI=_httpsURL(document, "jwks_uri"),
     userinfoEndpoint=_optionalHTTPSURL(document, "userinfo_endpoint"), signingAlgorithms=accepted,
-    issuerInResponseRequired=issuerInResponse,
+    issuerInResponseRequired=issuerInResponse, endSessionEndpoint=_optionalHTTPSURL(document, "end_session_endpoint"),
   )
 
 
@@ -134,6 +140,20 @@ class Pending:
 
 
 @dataclass(frozen=True)
+class LogoutNotice:
+  """A provider's back-channel logout: end the sessions of `subject`, or the one session `sessionID`, or both.
+  `tokenID` (the token's jti) is the application's to remember until `expiresAt`, so a notice is acted on once."""
+
+  subject: str | None
+  sessionID: str | None
+  tokenID: str
+  expiresAt: float
+
+
+backchannelLogoutEvent = "http://schemas.openid.net/event/backchannel-logout"
+
+
+@dataclass(frozen=True)
 class Identity:
   issuer: str
   subject: str
@@ -143,6 +163,7 @@ class Identity:
   displayName: str | None
   groups: tuple[str, ...]
   claims: JSON = field(repr=False)
+  idToken: str = field(repr=False)
 
 
 class RelyingParty:
@@ -217,11 +238,65 @@ class RelyingParty:
     return Identity(
       issuer=claims["iss"], subject=claims["sub"], userName=_optionalText(claims, "preferred_username"),
       email=_optionalText(claims, "email"), emailVerified=claims.get("email_verified") is True,
-      displayName=_optionalText(claims, "name"), groups=tuple(groups), claims=claims,
+      displayName=_optionalText(claims, "name"), groups=tuple(groups), claims=claims, idToken=idToken,
     )
 
   def _verifiedPayload(self, idToken: str) -> bytes:
     return self._keys.verify(idToken, self.provider.signingAlgorithms).payload
+
+  def logoutAddress(self, idTokenHint: str | None = None, postLogoutRedirectURI: str | None = None,
+                    state: str | None = None) -> str:
+    """Where to send the person to sign out at the provider too (OpenID Connect RP-Initiated Logout)."""
+    if self.provider.endSessionEndpoint is None:
+      raise SignInRefused("the provider offers no end_session_endpoint to sign out at")
+    if postLogoutRedirectURI is not None and not _isHTTPSURL(postLogoutRedirectURI) and not _isLoopback(postLogoutRedirectURI):
+      raise SignInRefused(f"a post-logout address is https (or http on the loopback), not {postLogoutRedirectURI!r}")
+    fields = {"client_id": self.clientID}
+    for name, value in (("id_token_hint", idTokenHint), ("post_logout_redirect_uri", postLogoutRedirectURI), ("state", state)):
+      if value is not None:
+        fields[name] = value
+    separator = "&" if "?" in self.provider.endSessionEndpoint else "?"
+    return f"{self.provider.endSessionEndpoint}{separator}{urllib.parse.urlencode(fields)}"
+
+  def checkLogoutToken(self, logoutToken: str) -> LogoutNotice:
+    """A back-channel logout token (OpenID Connect Back-Channel Logout 1.0, section 2.6) that passes every check."""
+    try:
+      verified = self._keys.verify(logoutToken, self.provider.signingAlgorithms)
+      header = readHeader(logoutToken)
+      claims = readJSON(verified.payload, "the logout token's claims")
+    except JOSEError as error:
+      raise SignInRefused(f"the logout token is refused: {error}") from None
+    if header.get("typ") not in (None, "logout+jwt", "application/logout+jwt"):
+      raise SignInRefused(f"the token's type is {header.get('typ')!r}, not a logout token")
+    if not isinstance(claims, dict):
+      raise SignInRefused("the logout token's claims are not an object")
+    now = self.clock()
+    if claims.get("iss") != self.provider.issuer:
+      raise SignInRefused(f"the logout token's issuer {claims.get('iss')!r} is not {self.provider.issuer!r}")
+    audience = claims.get("aud")
+    audiences = [audience] if isinstance(audience, str) else audience
+    if not isinstance(audiences, list) or self.clientID not in audiences or not all(isinstance(name, str) for name in audiences):
+      raise SignInRefused(f"the logout token is not for client {self.clientID!r}")
+    if _numericDate(claims, "iat") > now + self.leewaySeconds:
+      raise SignInRefused("the logout token is issued in the future")
+    expiresAt = _numericDate(claims, "exp") if "exp" in claims else _numericDate(claims, "iat") + 2 * 60
+    if expiresAt <= now - self.leewaySeconds:
+      raise SignInRefused("the logout token has expired")
+    events = claims.get("events")
+    if not isinstance(events, dict) or not isinstance(events.get(backchannelLogoutEvent), dict):
+      raise SignInRefused("the token does not carry the back-channel logout event")
+    if "nonce" in claims:
+      raise SignInRefused("a logout token never carries a nonce; this one does, so it is refused")
+    tokenID = claims.get("jti")
+    if not isinstance(tokenID, str) or not tokenID:
+      raise SignInRefused("the logout token has no jti")
+    subject, sessionID = claims.get("sub"), claims.get("sid")
+    for name, value in (("sub", subject), ("sid", sessionID)):
+      if value is not None and (not isinstance(value, str) or not value):
+        raise SignInRefused(f"the logout token's {name} is not text")
+    if subject is None and sessionID is None:
+      raise SignInRefused("the logout token names neither a subject nor a session")
+    return LogoutNotice(subject=subject, sessionID=sessionID, tokenID=tokenID, expiresAt=expiresAt)
 
   def checkIDToken(self, idToken: str, nonce: str) -> JSON:
     """The claims of an ID token that passes every check, or SignInRefused saying which failed."""

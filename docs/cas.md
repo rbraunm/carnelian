@@ -51,6 +51,14 @@ def signInReturn():
   return redirect("/")
 ```
 
+## Signing out
+
+`cas.logoutAddress(returnAddress)` signs the person out of CAS too and, when the CAS server
+follows service redirects and the address is registered, sends them back. When CAS signs a
+person out elsewhere, it POSTs a `logoutRequest` to your service address; `readLogoutRequest`
+reads the service ticket it names. CAS does not sign these notices, so end only the session
+that this ticket started (keep the ticket with the session when you sign the person in).
+
 ## What you get
 
 `CASIdentity` carries `userName` (the CAS user) and `attributes`: each released attribute

@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from carnelian.cas import CASRefused, CASServer, Pending
+from carnelian.cas import CASRefused, CASServer, Pending, readLogoutRequest
 from carnelian.fetching import Fetcher, secureContext
 
 from testOIDC import account
@@ -176,3 +176,42 @@ def testWrongAndDisabledSignInsGetNoTicket(testbed, casServer, userName, passwor
   address, _ = casServer.beginSignIn()
   password = password or account(testbed, userName)["password"]
   assert signInAtCAS(address, userName, password, casServer.fetcher.context) is None
+
+
+# ---- signing out ------------------------------------------------------------------
+
+def testTheLogoutAddressCarriesTheReturn():
+  cas = client()
+  assert cas.logoutAddress() == f"{server}/logout"
+  assert cas.logoutAddress("https://app.example.org/signed-out") == (
+    f"{server}/logout?service=https%3A%2F%2Fapp.example.org%2Fsigned-out")
+  with pytest.raises(ValueError, match="https"):
+    cas.logoutAddress("http://app.example.org/signed-out")
+
+
+notice = ('<samlp:LogoutRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" '
+          'xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="LR-1" Version="2.0" IssueInstant="2026-11-18T07:00:00Z">'
+          "<saml:NameID>@NOT_USED@</saml:NameID><samlp:SessionIndex>{ticket}</samlp:SessionIndex></samlp:LogoutRequest>")
+
+
+def testASingleLogoutNoticeNamesItsTicket():
+  assert readLogoutRequest(notice.format(ticket="ST-12-abcDEF")) == "ST-12-abcDEF"
+
+
+@pytest.mark.parametrize("text, why", [
+  (notice.format(ticket="PT-12-abc"), "names no service ticket"),
+  (notice.format(ticket="ST-1<x/>"), "text only"),
+  (notice.replace("<samlp:SessionIndex>{ticket}</samlp:SessionIndex>", ""), "SessionIndex"),
+  ('<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="x"/>', "not a SAML LogoutRequest"),
+  ('<!DOCTYPE a [<!ENTITY x "y">]><a/>', "refused"),
+])
+def testALogoutNoticeThatIsNotExactlyOneIsRefused(text, why):
+  with pytest.raises(CASRefused, match=why):
+    readLogoutRequest(text)
+
+
+def testSigningOutAtCASReturnsToTheService(testbed, casServer):
+  opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=casServer.fetcher.context), _Stop())
+  with pytest.raises(urllib.error.HTTPError) as redirect:
+    opener.open(casServer.logoutAddress(testbed["cas"]["serviceURL"]), timeout=30)
+  assert redirect.value.code in (301, 302, 303) and redirect.value.url == testbed["cas"]["serviceURL"]

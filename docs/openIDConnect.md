@@ -69,6 +69,17 @@ multi-tenant provider anyone can create an account with someone else's address. 
 must link to an existing account by e-mail, do it only when `emailVerified` is true and the
 provider is one you trust for that domain.
 
+## Signing out
+
+`logoutAddress(identity.idToken, returnAddress, state)` is where to send the person to sign
+out at the provider too (RP-Initiated Logout), when its discovery document names an
+`end_session_endpoint`; register the return address at the provider. When the provider
+signs a person out elsewhere, it can tell you by back-channel logout: it POSTs a
+`logout_token` to an address you register, and `checkLogoutToken` checks it like an ID
+token (signature, issuer, audience, times), requires the logout event and no nonce, and
+returns the subject and session to end and the token's `jti`, which you remember until
+`expiresAt` so a notice is acted on once.
+
 ## More than one provider
 
 The `Pending` record names the issuer and client it was made for, and `finishSignIn`
