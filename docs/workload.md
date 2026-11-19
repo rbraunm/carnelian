@@ -34,6 +34,10 @@ except WorkloadRefused as refusal:
   ...  # answer 401 with the reason
 ```
 
+Write the issuer exactly as its tokens name it. Some end in a slash (Entra ID's
+`https://sts.windows.net/<tenant>/`, Auth0's); the slash is part of the name, and a token
+naming the issuer without it is another issuer's.
+
 Keep one verifier for the life of the process: it caches the issuer's keys, fetching them
 again when they are a day old or when a token names a key it does not have. Fetches go one
 at a time, at most once a minute, and after a failed or malformed answer the wait doubles
