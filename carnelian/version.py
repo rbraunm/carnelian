@@ -1,2 +1,2 @@
 # SPDX-License-Identifier: MIT
-softwareVersion = "0.3.1"
+softwareVersion = "0.4.0"

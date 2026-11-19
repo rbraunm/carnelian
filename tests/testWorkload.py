@@ -121,6 +121,28 @@ def testADiscoveryDocumentThatIsNotTheIssuersIsRefused(document, message):
     discoverIssuer(issuer, StandInIssuer(document))
 
 
+@pytest.mark.parametrize("written", ["http://token.example.org", "https://", "https://token.example.org?x=1",
+                                     "https://token.example.org/#part", "token.example.org", "https://[bad"])
+def testAnIssuerIsAPlainHTTPSAddress(written):
+  with pytest.raises(WorkloadRefused, match="an issuer is an https URL without a query or a fragment"):
+    discoverIssuer(written, StandInIssuer())
+
+
+def testAnIssuerEndingInASlashIsFoundAndMatchedExactly():
+  slashed = "https://sts.example.org/tenant/"
+  network = StandInIssuer({"issuer": slashed, "jwks_uri": f"{issuer}/keys", "id_token_signing_alg_values_supported": ["RS256"]})
+  found = discoverIssuer(slashed, network)
+  assert found.issuer == slashed and network.fetched == ["https://sts.example.org/tenant/.well-known/openid-configuration"]
+  checks = WorkloadVerifier(found, "carnelian-ci", {"repository": "example/app"}, network, clock=lambda: now)
+  assert checks.verify(idToken({**good, "iss": slashed})).issuer == slashed
+  with pytest.raises(WorkloadRefused, match="issuer 'https://sts.example.org/tenant' is not"):
+    checks.verify(idToken({**good, "iss": slashed.removesuffix("/")}))
+  unslashed = StandInIssuer({"issuer": slashed.removesuffix("/"), "jwks_uri": f"{issuer}/keys",
+                             "id_token_signing_alg_values_supported": ["RS256"]})
+  with pytest.raises(WorkloadRefused, match="names issuer 'https://sts.example.org/tenant', not"):
+    discoverIssuer(slashed, unslashed)
+
+
 def testGitHubActionsDiscoveryIsReadLive(request):
   if not request.config.getoption("--live"):
     pytest.skip("live test: run with --live to read GitHub Actions' discovery document")

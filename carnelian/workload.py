@@ -17,6 +17,7 @@ and `workflow_ref` when only one workflow may sign in.
 from __future__ import annotations
 
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
@@ -40,11 +41,18 @@ class WorkloadIssuer:
 
 
 def discoverIssuer(issuer: str, fetcher: JSONFetcher) -> WorkloadIssuer:
-  """The issuer at `issuer`, from its discovery document, which must name exactly that issuer."""
-  if not issuer.startswith("https://") or issuer.endswith("/"):
-    raise WorkloadRefused(f"an issuer is an https URL without a trailing slash, not {issuer!r}")
+  """The issuer at `issuer`, written exactly as its tokens name it (some end in a slash: Entra ID's
+  https://sts.windows.net/<tenant>/, Auth0's), from its discovery document, which must name exactly that issuer."""
   try:
-    document = fetcher.getJSON(issuer + "/.well-known/openid-configuration")
+    parts = urllib.parse.urlsplit(issuer)
+    plain = parts.scheme == "https" and bool(parts.hostname) and "?" not in issuer and "#" not in issuer
+  except ValueError:
+    plain = False
+  if not plain:
+    raise WorkloadRefused(f"an issuer is an https URL without a query or a fragment, not {issuer!r}")
+  try:
+    # OpenID Connect Discovery 1.0, section 4.1: a terminating slash is removed before the well-known path is added.
+    document = fetcher.getJSON(issuer.removesuffix("/") + "/.well-known/openid-configuration")
   except HTTPFailure as error:
     raise WorkloadRefused(f"the issuer's discovery document cannot be fetched: {error}") from None
   if document.get("issuer") != issuer:
